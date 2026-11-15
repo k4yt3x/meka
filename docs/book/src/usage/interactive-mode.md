@@ -105,12 +105,30 @@ runs the empty composer names it: `Steer the agent`, `Queue a followup` or `Inte
 
 **Alt+S** cycles the class for this run;
 [`display.send_class`](../configuration/config-file.md#displaysend_class) sets where it starts. The
-prompt appears in the transcript with its class and reads `waiting` until the agent has read it.
+prompt appears in the transcript with its class and reads `waiting` until the agent has read it, or
+until it is withdrawn or given up on.
 A slash command that would have to wait on the turn is refused while one runs; see
 [Slash commands](#slash-commands).
 
 The steer and interrupt classes are the inbox the HTTP API exposes; see
 [the inbox](./http-api.md#the-inbox) for what each one does inside the turn.
+
+Whatever waits in the session's inbox while no turn runs gets a turn of its own: a steer typed too
+late for the turn's last pause is answered as that turn ends, a [schedule](./scheduling.md)'s fire
+as soon as it is queued, and a message another process wrote into the inbox within a
+[`[schedule].poll_interval`](../configuration/config-file.md#schedule). A fire is a stage direction
+where the model read it, above the reply of the turn it opened or, read by a running turn, below the
+tool calls of the round it followed:
+
+```
+• Schedule d06b0911 fired 3s late, replacing 2 missed occurrences: Check the deploy and report
+```
+
+The lateness is said as it happens, and a resume says `Schedule d06b0911 fired: Check the deploy
+and report` in the same place. When a turn opened on what waited fails in a way waiting can change,
+a row says when it is tried again, `• Trying the message again at 2026-11-15 12:52:46 +00:00` or
+`• Trying schedule 9110f7d2's fire again at 2026-11-15 12:38:38 +00:00`; one given up on says why,
+`! Gave up on a message: <reason>` or `! Gave up on schedule ebb6897f's fire: <reason>`.
 
 When the turn ends, a row closes it, in the same dim register as the other stage directions:
 
@@ -323,7 +341,7 @@ A command that needs the agent's turn to be over (`/compact`, `/rewind`, `/resum
 first, or wait for it to end. `/resume` and `/fork` are refused as well while the session
 still runs a background task or a sub-agent, which reports to the session it started in; the panel
 says how to stop them. What a command *does* (set a level, change directory,
-cancel a job) is one dimmed `•` row on the transcript. What a command has to *say back* instead, a
+cancel a schedule) is one dimmed `•` row on the transcript. What a command has to *say back* instead, a
 refusal, a failure or an empty list, is a panel as well, closed with Esc, and leaves no row.
 `/log` opens the last few hundred log lines at every level, newest last, whatever `-v` lets onto
 the transcript: a warning is a row as it happens, and the debug lines around it are there to read
@@ -333,9 +351,9 @@ A bare `/permission`, `/approvals`, `/profile`, `/project` or `/resume` is a **p
 cursor on the current one, Up and Down (or **j** and **k**) to move it, PgUp and PgDn to move it by
 a page, Ctrl+Home and Ctrl+End to the ends, **Enter** to apply, **Esc** to leave it as it was. In `/resume`'s list, **/** starts typing a filter that keeps only the rows
 matching the text; **Esc** stops typing and keeps the filter, and a second **Esc** closes the list. With an argument each sets the value directly. A bare `/skill`, `/memory`, `/task` or
-`/schedule` is a picker too: the skills and memories by name and description, the tasks and jobs by
-id with what each is doing (a job that cannot fire is marked `held`), and **Enter** runs the picked
-skill or shows the picked memory, task or job in full. A bare `/mcp` lists the configured servers
+`/schedule` is a picker too: the skills and memories by name and description, the tasks and schedules by
+id with what each is doing (a schedule that cannot fire is marked `held`), and **Enter** runs the picked
+skill or shows the picked memory, task or schedule in full. A bare `/mcp` lists the configured servers
 with their state, and **Enter** offers reconnect, login and logout for the picked one.
 
 | Command | Description |
@@ -356,7 +374,7 @@ with their state, and **Enter** offers reconnect, login and logout for the picke
 | `/cd [path]` | Change working directory (bare: back to where Meka started) |
 | `/skill [name] [extra]` | Pick a skill to run, or run one by name with extra context |
 | `/memory [name]` | Pick a memory to show, or show one by name |
-| `/schedule [show\|cancel <id>]` | Pick a scheduled job to show; show or cancel one by id |
+| `/schedule [show\|cancel <id>]` | List this session's schedules, show one, or cancel one by id |
 | `/task [show\|cancel <id>]` | Pick a background task to show; show or cancel one by id, or all |
 | `/mcp <subcommand>` | Manage MCP servers and prompts |
 | `/mcp list` | Pick a server to reconnect, log in or log out |

@@ -27,7 +27,7 @@ rank  module          holds
  6    tools           the Tool trait, the registry, the built-ins, MCP tools as Tools
  7    prompt          the system prompt and the per-turn context block
  8    session         the materials a session is built from, and its live cells
- 9    scheduler       the sweep that claims due jobs and hands a Wakeup to a host
+ 9    scheduler       the sweep that claims due schedules, runs their gates and queues their fires
  9    background      tool calls the agent starts and does not wait for
 10    mcp             the MCP client: connections, published tools, progress, auth
 11    provider        the Provider trait, wire types, the registry, one backend per API
@@ -39,7 +39,7 @@ rank  module          holds
 13    workspace       cwd, roots, the write fence, private-directory refusals
 13    tokens          token estimates for the gauge between provider reports
 14    store           every SQL statement, behind one connection owner
-15    schedule        what a scheduled job is: parsing, gates, the scheduler's memory
+15    schedule        what a schedule is: timing, gates, the scheduler's memory
 16    conversation    the event-log conversation and its title
 16    stats           per-session counters
 16    config          config.toml, ResolvedConfig; profile.rs holds accounts and profiles
@@ -70,15 +70,15 @@ below, never in `host`. A new module fails the test until it is given a rank.
 | `build.rs` | The Windows icon resource, and `MEKA_GIT_REVISION`: the commit the binary was built from, `-dirty` included, which the screen's banner shows beside the version; absent outside a checkout unless the build's environment sets it. |
 | `src/cli.rs`, `src/cli/` | The clap definitions and one handler file per subcommand group: `account`, `profile`, `project`, `session`, `recall`, `mcp`, `tool`, `skills`, `memory`, `instructions`, `schedule`, `background`. Everything that owns the stdout/stderr contract lives here; `account`, `profile` and `mcp` are the prompts, flags and listings over the doors in `src/installation/`. |
 | `src/installation.rs`, `src/installation/` | The installation's editor, shared by the CLI and the HTTP API: `account.rs` writes `[accounts.<name>]` under the config file lock, moves a credential on a rename, and holds the browser login that acquires one; `profile.rs` writes `[profiles.<name>]` and takes a `ProfileChanges`; `mcp.rs` writes a `[[mcp.servers]]` entry, takes a `ServerChanges`, stores a server's secrets and runs its OAuth login behind a `LoginPrompt`. `Patch<T>` is the one tri-state every edit is spelled in: a key kept, removed or set. No prompt and no request body reaches it. |
-| `src/host.rs`, `src/host/` | `host/assembly.rs` builds a session: `SharedDeps`, `build_session_agent`, `hydrate_conversation`, `resolve_profile_switch`, `record_session_change`. `host/session.rs` runs one: `ResidentSession`, `TurnGuard`, the `CancelCell`, the `Sessions` registry and its idle sweep, `fork_and_lock`, outcome claiming. `host/scheduler.rs` is `HostHooks`, `run_wakeup`, the out-of-band turn every host runs the same way, `spawn_outcome_poller`, the one background-outcome poller both servers spawn, and `TurnSource`, who started a turn. `host.rs` keeps `wait_for_shutdown_signal`, and `host/assembly.rs` `apply_recorded_bindings`, which both servers call ahead of every turn, `POST /compact` included, so a session runs on the profile and the project its row names. `host/terminal.rs` is what the screen and one-shot share: Ctrl+C, the interruptible turn. `host.rs` keeps `COMMANDS`, the slash-command table the screen offers and ACP advertises the rows with an `editor_help` of. `host/tui`, `host/oneshot`, `host/acp` and `host/http` are the hosts; `host/tui/model.rs` is the transcript the screen draws from (a bounded window of the session's log plus this run's tail), `host/tui/view.rs` how each item is drawn and the viewport, `host/tui/panel.rs` the panel a command's answer, a picker or the approval prompt opens in, `host/tui/screen.rs` the task that owns the terminal; `host/http/feed.rs` is the session feed, the SSE channel and replay ring `HttpFrontend` produces into and the stream handlers read. |
+| `src/host.rs`, `src/host/` | `host/assembly.rs` builds a session: `SharedDeps`, `build_session_agent`, `hydrate_conversation`, `resolve_profile_switch`, `record_session_change`. `host/session.rs` runs one: `ResidentSession`, `TurnGuard`, the `CancelCell`, the `Sessions` registry and its idle sweep, `fork_and_lock`, outcome claiming. `host/scheduler.rs` is `HostHooks`, `run_inbox_turns`, the turns every host runs the same way on what waits in a session's inbox, `spawn_inbox_driver`, the one inbox driver both servers spawn, `spawn_outcome_poller`, the one background-outcome poller both servers spawn, and `TurnStarter`, who started a turn. `host.rs` keeps `wait_for_shutdown_signal`, and `host/assembly.rs` `apply_recorded_bindings`, which both servers call ahead of every turn, `POST /compact` included, so a session runs on the profile and the project its row names. `host/terminal.rs` is what the screen and one-shot share: Ctrl+C, the interruptible turn. `host.rs` keeps `COMMANDS`, the slash-command table the screen offers and ACP advertises the rows with an `editor_help` of. `host/tui`, `host/oneshot`, `host/acp` and `host/http` are the hosts; `host/tui/model.rs` is the transcript the screen draws from (a bounded window of the session's log plus this run's tail), `host/tui/view.rs` how each item is drawn and the viewport, `host/tui/panel.rs` the panel a command's answer, a picker or the approval prompt opens in, `host/tui/screen.rs` the task that owns the terminal; `host/http/feed.rs` is the session feed, the SSE channel and replay ring `HttpFrontend` produces into and the stream handlers read. |
 | `src/agent.rs`, `src/agent/` | The `Agent` and its options; `turn.rs` runs a turn in phases (`open_turn`, `run_rounds`, `settle_turn`) and owns `TurnInput`, `dispatch.rs` executes tool calls and owns `run_admitted_call`, the one sequence a resolved call goes through, `compaction.rs` summarizes, `recovery.rs` decides what a failed request becomes. |
-| `src/view.rs` | The record shapes `--format json` prints and the HTTP API serves, each defined once with its `From` conversion from the store or config type it shows: `SessionView`, `ProfileView`, `ProjectView`, `AccountView`, `McpServerView`, `McpToolView`, `ScheduledJobView`, `GateView`, `MemoryDetail`, `ToolView`, `SkillView`, `SkillDetail`. A host adds what only it can answer around the shared core by `#[serde(flatten)]`: the HTTP `SessionResponse` flattens `SessionView` under `capabilities`, `turn_in_flight`, `inbox_pending`, `requests_pending` and `checklist`; the CLI's `InstalledSkillView` and `ConfiguredToolView` flatten a core under what only a terminal should see, such as a path on this machine. Every `Option` field is omitted when absent, never `null`. |
+| `src/view.rs` | The record shapes `--format json` prints and the HTTP API serves, each defined once with its `From` conversion from the store or config type it shows: `SessionView`, `ProfileView`, `ProjectView`, `AccountView`, `McpServerView`, `McpToolView`, `ScheduleView`, `GateView`, `MemoryDetail`, `ToolView`, `SkillView`, `SkillDetail`. A host adds what only it can answer around the shared core by `#[serde(flatten)]`: the HTTP `SessionResponse` flattens `SessionView` under `capabilities`, `turn_in_flight`, `inbox_pending`, `requests_pending` and `checklist`; the CLI's `InstalledSkillView` and `ConfiguredToolView` flatten a core under what only a terminal should see, such as a path on this machine. Every `Option` field is omitted when absent, never `null`. |
 | `src/session.rs` | What a session is made of: `CoreMaterials` and `SessionMaterials` (what every agent and registry of a session is built from), `SessionCells` (permission, cwd, roots, session id, the project, checklist, the published profile, the context gauge, background tasks, the frontend, the session lock slot, a pending compaction), `ToolSite` (the four cells a built-in reads), `AgentOptions` and `CompactRequest`. No host and no SQL. |
 | `src/provider.rs`, `src/provider/` | The `Provider` trait, the wire types, `MessageAccumulator`, the registry of profiles, and one backend per API: `anthropic/messages.rs` and `anthropic/subscription.rs` over `anthropic/shared.rs`; `openai/chat_completions.rs`, `openai/responses.rs` and `openai/subscription.rs`, the last two over `openai/responses_wire.rs`. Every streaming backend reads SSE through `provider/sse.rs`; the refresh-once rule for a rejected subscription credential is `oauth::send_with_one_refresh`; `provider/mock.rs` is the scripted provider the test suites drive. |
 | `src/tools.rs`, `src/tools/` | The `Tool` trait, `ToolContext`, `admit_arguments`, the registry and its builders, the gate toolset, the built-in tools, and `mcp_adapter.rs`: each remote MCP tool as a `Tool`, and the registry as a subscriber to the client's tool lists. A built-in reads the session it serves through one `ToolSite`. |
 | `src/mcp.rs`, `src/mcp/` | The MCP client: `ServerEntry` per server, the connector and its reconnects, the client handler, `policy.rs` (which of a server's tools register, load eagerly, and at what level, as pure config policy), `subscriptions.rs` (what the model subscribed to, applied to every connection the entry adopts: per-URI requests on a 2025-11-25 connection, one `subscriptions/listen` stream on a 2026-07-28 one), each server's tools published to whoever subscribes (held weakly, so a session that is dropped takes its registry with it), progress and resource-update routing on `McpClientContext`, and auth. It never names a registry and never talks to a terminal: an interactive login goes through the `oauth::LoginPrompt` installed on the client context, which only a login run with a person at hand provides. |
 | `src/store.rs`, `src/store/` | The store. `migrations.rs` is the append-only ledger; `locks.rs` the per-session file claim; `backup.rs` the copy taken before a migration; `export.rs` the archive format; `projects.rs` the `projects` table and the one transaction a rename or a removal is; `connection.rs` the store's SQLite connection, on a thread of its own that runs each closure handed to it in order; every other file owns the statements for one table family. |
-| `src/schedule.rs`, `src/schedule/` | Scheduled jobs as a domain: parsing, gates, and `SchedulerMemory` (`schedule/memory.rs`), the per-process record of which refusals have been reported and of why this process could not run a job's last fire. No SQL. `src/scheduler.rs`, above the store, is the sweep that fires them. |
+| `src/schedule.rs`, `src/schedule/` | Schedules as a domain: timing, gates, and `SchedulerMemory` (`schedule/memory.rs`), the per-process record of which refusals have been reported and of which gate probes keep failing. No SQL. `src/scheduler.rs`, above the store, is the sweep that fires them. |
 | `src/config.rs`, `src/config/` | `ConfigFile`, loading, `expand_env_vars` (the one `${VAR}` grammar), `ResolvedConfig`, and the vocabulary every layer reads; `mcp.rs` and `serve.rs` hold the `[mcp]` and `[serve]` schemas. `profile.rs` is `Backend`, an account and a profile as written, a profile as resolved through its account, `select_profile` and `require_profile`. Live services and probes are resolved by the host, not here. |
 | `src/prompt.rs`, `src/prompt/world.rs` | The system prompt and `build_turn_context`, the block the model sees ahead of every user turn; `world.rs` renders the world state, whole or as the diff against what the model was last shown. |
 | `src/fs.rs`, `src/oauth.rs`, `src/sync.rs`, `src/text.rs` | Private directories and the file locks; PKCE, refresh, the loopback callback and `SubscriptionCredential`, the one token-refresh-and-rejection machine both subscription backends run; the one place a poisoned lock is recovered; and every pure text rule the surfaces share. |
@@ -91,14 +91,14 @@ A host admits the turn, the agent runs it, and everything the user sees comes ba
 1. **Admission.** A `ResidentSession` counts its work in one cell, `in_flight`, and holding the
    conversation mutex is what "a turn is in flight" means. HTTP and ACP admit a typed prompt with
    `admit_turn`, which hands back a `TurnGuard` and samples the cancel epoch; HTTP wraps it in
-   `host::http::state::admit_turn` to add the process-wide cap. A scheduled fire, an outcome
-   delivery or an inbox turn goes through `HostHooks::admit`, which under `serve` counts on the
-   same cap and steps back for the next tick when it is full; HTTP compact and rewind take
-   `claim_idle`, which refuses while anything is in flight. The screen and the one-shot drive one
-   session from one thread, so they sample `cancel.admit()` themselves and take the conversation
-   lock.
+   `host::http::state::admit_turn` to add the process-wide cap. An inbox turn, one on a
+   schedule's fire included, or an outcome delivery goes through `HostHooks::admit`, which under
+   `serve` counts on the same cap and steps back for the next tick when it is full; HTTP compact
+   and rewind take `claim_idle`, which refuses while anything is in flight. The screen and the
+   one-shot drive one session from one thread, so they sample `cancel.admit()` themselves and take
+   the conversation lock.
 2. **Input.** The host builds a `TurnInput`: the typed prompt or the outcomes it carries, images,
-   and the retention, which the scheduler sets per job and the HTTP turn takes from the request.
+   and the retention, which an inbox turn sets to withdraw and the HTTP turn takes from the request.
    `TurnInput::from_parts` is the empty-prompt rule, raising
    `MekaError::EmptyPrompt` before admission.
 3. **The loop.** `Agent::run_turn` appends one user message of two blocks: a `TurnContext` block
@@ -170,13 +170,13 @@ columns of the tables in `HEAD_TABLES`; a migration that rolls back removes the 
 | `mcp_credentials` | `store/credentials.rs` | `server`, `kind`, `secret`, `updated_at`; keyed by `(server, kind)`, so a client secret and its refreshable bundle coexist. |
 | `blobs`, `message_blobs` | `store/blobs.rs` | `hash`, `media_type`, `bytes`, `size_bytes`, `created_at`; and `message_id`, `hash` for which message rows reference a blob. `idx_message_blobs_hash`. |
 | `scratchpad_entries` | `store/scratchpad.rs` | `session_id`, `name`, `content`, `created_at`. |
-| `scheduled_jobs` | `store/schedule.rs` | `id`, `session_id`, `kind`, `spec`, `prompt`, `gate_kind`, `gate_spec_json`, `gate_last_output`, `gate_permission`, `claimed_by`, `claim_expires_at`, `attempts`, `created_at`, `last_fired_at`, `next_fire_at`. `idx_scheduled_jobs_next_fire_at`, `idx_scheduled_jobs_session_id`. |
+| `schedules` | `store/schedule.rs` | `id`, `session_id`, `kind`, `spec`, `prompt`, `gate_kind`, `gate_spec_json`, `gate_last_output`, `gate_permission`, `claimed_by`, `claim_expires_at`, `attempts`, `created_at`, `last_fired_at`, `next_fire_at`. `idx_schedules_next_fire_at`, `idx_schedules_session_id`. |
 | `background_tasks` | `store/background.rs` | `id`, `session_id`, `tool`, `label`, `status`, `outcome`, `scratchpad_entry`, `started_at`, `finished_at`, `announced_at`, `delivered_at`, `subagent_id`. `idx_background_tasks_session_id_status`. |
 | `memories`, `memories_fts` | `store/memory.rs` | `id`, `name`, `description`, `tags`, `body`, `priority`, `created_at`, `updated_at`, `read_count`. `idx_memories_priority_created_at`. The FTS index and its triggers are rebuilt to this build's definition by `reconcile_index` on every open, so they are outside the ledger's fingerprint. |
 | `recall_entries` | `store/recall.rs` | The screen's recall: `id`, `command_line`, `created_at`. |
 
 Per-process state that is not a table has an owner too: the scheduler's memory of which refusals it
-has already reported, and of why it could not run a job's last fire, is the `SchedulerMemory` on the
+has already reported, and of which gate probes keep failing, is the `SchedulerMemory` on the
 `Store`; MCP progress routing and resource
 updates live on the `McpClientContext`; the per-path write locks are the `WriteLocks` on the host's
 `SharedDeps`, cloned into every session's `CoreMaterials`; a frontend's sticky approval answers are
@@ -190,7 +190,7 @@ they guard. When adding a path, call the predicate rather than restating the rul
 
 | Rule | Predicate | Doors |
 |------|-----------|-------|
-| Whether a turn may start | `ResidentSession::admit_turn` and `claim_idle` on the one `in_flight` cell | `admit_turn`: HTTP `POST /turns` (under the process cap, `host::http::state::admit_turn`) and ACP `session/prompt`, and through `HostHooks::admit` the scheduled fires, outcome deliveries and inbox turns in `host/scheduler.rs` (under the same cap in `serve`); `claim_idle`: HTTP compact and rewind. The screen and one-shot sample `cancel.admit()` directly. |
+| Whether a turn may start | `ResidentSession::admit_turn` and `claim_idle` on the one `in_flight` cell | `admit_turn`: HTTP `POST /turns` (under the process cap, `host::http::state::admit_turn`) and ACP `session/prompt`, and through `HostHooks::admit` the inbox turns and outcome deliveries in `host/scheduler.rs` (under the same cap in `serve`); `claim_idle`: HTTP compact and rewind. The screen and one-shot sample `cancel.admit()` directly. |
 | Whether a second turn is refused | the conversation mutex, `try_lock` | HTTP `POST /turns` (`try_lock_owned`, 409), ACP `session/prompt` (`InvalidParams`) |
 | Whether a session is idle enough to evict | `host::session::idle_on`, behind `ResidentSession::is_idle_given` and `Sessions::sweep_idle` | the HTTP GC and the ACP idle sweep |
 | Whether a prompt is empty | `TurnInput::from_parts` for typed words, `TurnInput::sent` for blocks | every host, before admission |
@@ -201,9 +201,9 @@ they guard. When adding a path, call the predicate rather than restating the rul
 | What forgets the conversation's old shape when the log is rewritten | `Agent::reset_conversation_markers`: the accepted-prefix marker, the world snapshot, the read tracker, the schema advisories, the response a compaction armed for `cc_prev_msg` (a compaction takes it first and carries it forward), the gauge and its row, and the previous request and message ids when no assistant message is left | compaction, screen `/rewind`, HTTP `POST /rewind`, a reload of what the store holds (`Agent::match_the_store`) |
 | Whether a count taken on one view of the conversation cuts the other in the same place | `Agent::match_the_store`, which replaces a resident conversation with the store's when the two hold different numbers of messages; `Agent::match_the_store_after_a_failed_save` asks only once a write failed (`Agent::note_save`, which every save helper of the agent passes through, sets `store_behind`), and a reload records where the store's view first differs from what memory had sent (`unaccepted_from`), the furthest back a turn's degrade then reaches until a request is accepted; a withdrawal whose save fails is undone in memory | a rewind of a resident session through `Agent::rewind_resident` (screen `/rewind`, HTTP `POST /rewind`); after a failed save, the start of every turn, a compaction between turns, HTTP `POST /compact` and the background-outcome poller |
 | Which tools a session has called | `Agent::note_tool_called`, into `SessionStats::record_tools_used`: a call counts once it reaches its tool, and a session's set is shared by its sub-agents with the counters, saved on the root's row with them, and read back on a resume | `Agent::run_admitted_call` (inline dispatch and the checkpoint's own calls, not the summary it submits); `Agent::note_tools_called`, the same rule over the context's calls, at a turn's start and in `reset_conversation_markers`, as Claude Code reads its transcript; copied by a fork and an archive; the screen's `/resume` opens the session with an agent of its own; `/fork` refuses while a sub-agent sharing the set still runs |
-| Whether a turn runs on the profile its row names | `host::apply_recorded_profile`, under the conversation lock | ACP `session/prompt` and its fires, HTTP `POST /turns`, `POST /compact` and its fires, through `HostHooks::prepare` |
-| Whether a session is a sub-agent's | `store::spawned_session_sql` in SQL; `SpawnTerms::describe` for the sentence every refusal starts with | every listing, `meka -c`, session search, the inbox driver; the refusals of the HTTP fork, the ACP fork, `POST /responses`, a job on it, and every builder |
-| What the retention sweep may take | `EXPIRABLE`: a root by its own age, spared while a pin or a job sits anywhere in its tree | the retention sweep, `meka session remove --older-than-days` |
+| Whether a turn runs on the profile its row names | `host::apply_recorded_profile`, under the conversation lock | ACP `session/prompt` and its inbox turns, HTTP `POST /turns`, `POST /compact` and its inbox turns, through `HostHooks::prepare` |
+| Whether a session is a sub-agent's | `store::spawned_session_sql` in SQL; `SpawnTerms::describe` for the sentence every refusal starts with | every listing, `meka -c`, session search, the inbox driver; the refusals of the HTTP fork, the ACP fork, `POST /responses`, a schedule on it, and every builder |
+| What the retention sweep may take | `EXPIRABLE`: a root by its own age, spared while a pin or a schedule sits anywhere in its tree | the retention sweep, `meka session remove --older-than-days` |
 | How old a message row is, and which rows a turn sweep may take | `ROW_AGE_SQL` in `store/sessions.rs` (its turn's end, else its turn's start, else its own stamp), and only below the session's latest `compact_boundary` row; a copy of a row it takes becomes the row history shows, and a turn's record stays while a copy says it | `Store::delete_expired_turns` at startup, hourly and at each turn's start; `view_holds_a_turn_older_than`, which decides whether a retention compaction has to run first |
 | What a delete locks | `Store::lock_tree`: the session and every sub-agent under it, since the cascade takes them | the sweep and `--all` (over roots, through `delete_the_unattached_among`), `session remove <id>`, `agent_delete`, the servers' deletes of a session they have not loaded |
 | What `${VAR}` means in `config.toml` | `config::expand_env_vars`, one grammar (`${VAR}`, `${VAR:-default}`; an unclosed `${`, an empty name or a nested default is reported as malformed and left as written); what a miss or a malformed reference costs is the caller's: `[serve]` refuses, an MCP server is refused when it sits in `args`, `env`, `url` or `headers`, and `mcp add` skips its probe | `[serve]` tokens and URLs, every MCP server field |
@@ -219,7 +219,7 @@ they guard. When adding a path, call the predicate rather than restating the rul
 | What Meka wrote into a conversation, and how a reader tells it from someone else's words | a type, never text: `ContentBlock::HarnessNote` and `Summary`, `ToolResultContent::HarnessNote`, `ImageCaption` and `LargeOutput`, `ToolUse.unparsed`; each label is rendered by one function (`conversation::harness_note_text`, `ToolResultContent::wire_part`, `ContentBlock::model_text`, compaction's summary headings, `prompt::render_inbox_item`, ACP's `notice_update`), and `tests/layering.rs` keeps every other file from spelling one through its `LABELS` ledger | every wire, the screen, ACP, the HTTP API, titles, search, compaction, the exports |
 | Where a `MEKA_*` variable is read | `ResolvedConfig::resolve` in `config.rs`, with `paths.rs` for the two that locate the config file; `tests/layering.rs` keeps every other file out through its `ENVIRONMENT_READERS` ledger | every operational override: the permission level, the standing instructions, the sandbox backend, the render mode, the MCP tool timeout, and the debug-only mock switches |
 | The level a call must clear | `tools::effective_permission`: the `[tools.tool_permissions]` override, else the tool's own | dispatch, the gate, `tool_load`'s listing, the catalog |
-| What level a scheduled job runs at | `scheduler::live_permission`, reading the session row through `admit_recorded` | the fire door, the wake watcher, `meka schedule show` |
+| What level a schedule's gate is checked at | `scheduler::live_permission`, reading the session row through `admit_recorded` | the sweep (`scheduler::prepare`), `meka schedule show`, the `withheld` of `GET /v1/schedules` |
 | Whether a recorded level still applies | `EnabledPermissions::admit_recorded` | a resume on every host (`host/assembly.rs`, `host/http/reattach.rs`, `host/acp/session.rs`), the scheduler |
 | The refusal for a level the set does not admit | `EnabledPermissions::disabled_level`, raising `MekaError::DisabledLevel` | `SharedPermission::try_set` behind `/permission`, ACP `session/set_mode` and its permission option; HTTP create and `PATCH` |
 | Whether a profile name is configured | `config::require_profile`, raising `MekaError::ProfileNotConfigured` | `--profile` and `default_profile` selection, `resolve_profile_switch` and the resume repin (`host/assembly.rs`), HTTP create and `PATCH`, the provider registry, `meka profile use` |
@@ -245,12 +245,13 @@ they guard. When adding a path, call the predicate rather than restating the rul
 | Where a tool sits in a request | `Registered::insert` in `tools/registry.rs`: tools that are not a server's in the order they were registered, then the servers' sorted by name, so the array does not depend on when a server listed | `register`, `register_builtin`, `replace_server_tools`, the sub-agent and gate registries |
 | What a server's listing puts in a registry | `ToolRegistry::replace_server_tools`, its tools and its deferred marks in one step under both locks | `mcp_adapter::apply`: every listing a session's registry is told of, and the listings `McpClientManager::connected_server_tools` holds for a sub-agent's, which asks no server |
 | The rounds a request takes when a 2026-07-28 server answers `input_required` | `handler::Rounds` | `McpTool::call_tool_once`, `mcp::read_resource`, `mcp::get_prompt` |
-| Whether a fire's session is still resident | `HostHooks::still_resident` | scheduled fires and outcome deliveries, once the lock is won |
-| Whether a resident session is mid-turn | `ResidentSession::is_busy`: work counted on it, or its conversation held; answered without waiting | the scheduler scopes of `meka serve` (`runnable_here`) and `meka acp`, which hold a busy session's jobs over ahead of the gate; `run_wakeup` defers a fire that finds the conversation taken |
+| Whether a session is still resident | `HostHooks::still_resident` | inbox turns and outcome deliveries, once the lock is won |
+| Whether a resident session is mid-turn | `ResidentSession::is_busy`: work counted on it, or its conversation held; answered without waiting | `meka serve`'s `residency_of`; no scheduler scope asks it, since a schedule is checked whatever its session is doing |
+| Whether a session is this process's to serve | `is_ours` in `host/http/schedule.rs`: one this process has loaded, mid-turn or not, else one whose lock is free | `meka serve`'s scheduler scope and its inbox driver |
+| Whether a turn opened on inbox items is a schedule's | `store::inbox::fired_schedules`: every item a fire | the turn's origin (`TurnInput::inbox`), `TurnStarter::Schedule` and the `turn.started` it names (`run_inbox_turns`) |
+| Whether a fire's lateness is worth saying | `frontend::FireLateness::of`: more than a minute late, or more than one occurrence | the fire's header (`prompt::render_fire`), the `late` of `InboxAppended` and `MessageAppended`, the screen's direction |
 | Whether the screen may move to another session | `refuse_a_switch_while_background_work_runs` in `host/tui/commands.rs`: no sub-agent running, and no background task of the session on screen that has not been told to stop (`BackgroundTasks::unstopped_count_all`) | `/resume`, `/fork`, ahead of every side effect |
-| Whether a fire cut short is handed back | `deferred_by_the_drain` in `host/scheduler.rs`: the turn was interrupted and its own stop reason is `CancelReason::ServerShutdown` | every host's `run_wakeup` |
-| Whether a fire that did not run counts toward parking | `Unrunnable::standing_reason` in `schedule/memory.rs`: a cause that is the installation's is forgiven (`ScheduleStore::forgive_attempt`) and reported through `job_withheld`; the job's own is counted | `run_due` |
-| Which job a typed id names, over the stored ids | `ScheduleStore::job_ids_matching` | `schedule_cancel`, `/schedule cancel`, `meka schedule cancel` |
+| Which schedule a typed id names, over the stored ids | `ScheduleStore::schedule_ids_matching` | `schedule_cancel`, `/schedule cancel`, `meka schedule cancel` |
 | Whether an HTTP write outlives its client | `outlives_its_client` behind `run_writes_to_completion` in `host/http.rs`: every method that is not safe (RFC 9110), on every route `HELD_ON_THE_CONNECTION` does not name; `state::Writes` counts them for the shutdown drain | every write route but `POST /turns`, whose turn runs on its own task and claims its riding outcomes there (`with_outcomes_riding`) |
 | The record a session is answered and announced with | `resident_record` (its store reads in `stored_record_parts`, its assembly in `resident_record_from`) and `dormant_record` in `handlers/sessions.rs` | `GET`, create, fork, both `PATCH` paths, both rewind paths, the rename announcements |
 | What a frontend answered for a file operation | `Delegation` | `file_read`, `file_edit`, `file_write` |
@@ -343,16 +344,49 @@ differently by design.
   the same 409. The `detail` names what was refused (`doing`), and a `session_id` member carries
   the id. A `PATCH` naming only `permission` or `approvals` writes the cells and the row without
   waiting, the same three steps ACP takes below. `POST /v1/sessions/{id}/inbox` never refuses for a turn in flight: it writes an
-  `inbox_items` row (`store/inbox.rs`) and wakes the driver (`host/http/inbox.rs`). The row reaches
+  `inbox_items` row (`store/inbox.rs`) and wakes the driver (`host::scheduler::spawn_inbox_driver`,
+  which `meka serve` and `meka acp` spawn; the screen's host loop drains its one session's inbox
+  itself, through `TuiHooks::drain_inbox`, when its watcher or a fire wakes it and after a typed
+  turn, a skill, an MCP prompt or a compaction). The row reaches
   the model at one of four places, all in `Agent::run_attributed_turn` so no host door can forget
   one: a `steer` or an `interrupt` at a round boundary, after a tool round's results or after a
   reply that would have ended the turn, in the same user message or the one that follows the reply,
   stamped `appended_at` by the same transaction (`save_events_atomic_marking_inbox`); an `interrupt` the moment it lands while a provider call
-  is in flight; any class at the next turn's opening, after the words, whoever started the turn;
-  or as the opening message of a turn the driver starts (`host::scheduler::run_inbox_turns`) when
-  the session is idle. The item is `delivered` where `last_accepted_len` is stamped, which is the
+  is in flight; any class at the opening of the next turn a person or a background outcome
+  starts, after the words; or as the opening message of a turn the driver starts
+  (`host::scheduler::run_inbox_turns`) when the session is idle, which opens on the items the
+  driver took and no later arrival, since its origin and the ids its `turn.started` names were
+  decided from that read. The opening keeps what `stands_for_any` of them: the same item, or a
+  fire under the id an occurrence that joined it while the turn was starting has given it (a join
+  keeps the item's `created_at`, so a fire queued after the one handed in was withdrawn is not
+  taken for it). It tells the driver what it took (`OpenedOn`), and
+  a stop or a failure is dealt with on those, as they are after the turn. The item is `delivered` where `last_accepted_len` is stamped, which is the
   request the provider accepted, and `FrontendEvent::InboxDelivered` is what the feed and the
   webhook relay.
+- **A schedule's fire is an inbox item.** The sweep (`scheduler::run_due`, one `prepare` per due
+  schedule) claims the occurrence, runs the gate, and makes one write, `ScheduleStore::queue_fire`:
+  in one transaction it closes the claim (`close_claim_in`, which advances the schedule or retires a
+  one-shot and records `last_fired_at` and the gate's baseline) and, only if that took, queues the
+  fire (`store::inbox::queue_fire_in`). The row is a `steer` whose origin is typed in columns of its
+  own (`schedule_id`, `gate_output`, `occurrences`, `due_at`, `fired_at`), decoded as
+  `InboxOrigin::Fire` and never read back out of its text. An occurrence whose schedule has a fire
+  still pending joins it: `occurrences` grows, `gate_output` and `fired_at` are replaced, and the row
+  takes a new id, so a turn that read it under the old id and stamps it by that id stamps nothing,
+  and the next pause reads the fire whole; `QueuedFire::replaces` is the old id. The host's callback
+  runs once the write has committed: `meka serve`'s `announce_fire` sends `schedule.fired` and wakes
+  its driver, `meka acp` wakes its driver, the screen's sweep sends `UiEvent::Wake`. From there a
+  fire is read as any item is, rendered by `prompt::render_fire` into a `ContentBlock::Scheduled`
+  (`inbox_block`). `ScheduleStore::delete_schedule` withdraws every fire of the schedule no
+  request has delivered (`withdraw_fires_in`) in the delete's own transaction, and answers what it
+  withdrew (`CanceledSchedule`, its ids parsed once the delete has committed, so a damaged row
+  still cancels), which a door with a feed says: `DELETE /v1/schedules/{schedule_id}` pushes
+  `inbox.withdrawn`, and the `schedule_cancel` tool emits `FrontendEvent::InboxWithdrawn`, which
+  `meka serve` relays as the same event. A withdrawal and a delivery are separate stamps: a fire
+  withdrawn while its text is in the conversation is still stamped delivered when a provider
+  accepts the request carrying it (`InboxStore::mark_delivered`), and loses `appended_at` when
+  its message leaves the log instead (`reset_pending_in`, `reset_appended_in`). A screen on its
+  way out gives back only the lease of a gate its stopped sweep was running
+  (`SchedulerMemory::take_gates_cut_short`, `ScheduleStore::give_back_gates_cut_short`).
 - **An interrupt is decided by the loop, never by a host.** Each provider call runs under a child
   of the turn's token, and `watch_for_interrupts` polls the inbox once a second
   (`INTERRUPT_POLL_INTERVAL`) and cancels the child when an `interrupt` row is pending: polled
@@ -397,14 +431,16 @@ to the parent's frontend and drops the rest). Where they differ:
 | `ReplyStopped` (a reply that made calls stopped for a reason a round does not) | a row saying how, `Reply hit the output limit`, after the round's results, as a replay says it | dropped: the protocol has no place for it | dropped | dropped | dropped | dropped |
 | `RedactedThinking` (a thinking block the provider withheld) | a `[redacted thinking]` thinking row | a thought chunk in the same words | `thinking.redacted` event, with `supports_reasoning_stream` | dropped: `messages` carries the `redacted_thinking` block | dropped | dropped |
 | `TurnOpened` (the level a turn opened under) | the turn's prompts take the level's color on their bar | dropped: the protocol has no place for it | dropped: the turn's record carries it | the in-flight turn's `permission` | dropped | dropped |
-| `InboxAppended` (inbox items added behind a round's results, a nudge or a prompt an interrupt cut) | each item another client posted drawn as a prompt where it lands; one the screen enqueued itself is already drawn | `UserMessageChunk` per item | dropped: `inbox.delivered` says it, and the messages hold its words | dropped | dropped | dropped |
-| `MessageAppended` (the message a turn opens with, whoever opened it, or one an interrupt appends whole) | a dim `• Scheduled job <id> fired: …` or `• Background task <id> …` row per fire or report block; an inbox item another client posted is drawn as a prompt with its `(steer)` note, one the screen enqueued itself is already drawn; the person's words are drawn as typed | `UserMessageChunk` per `scheduled` or `inbox` block; a `background_report` block is said as what reported, a `notice` with the tasks under `_meta.background` or a stage-direction chunk; the editor's own words are not echoed | `message.appended` event (`MessageBody`), re-issued with `resumed: true` to a client joining mid-turn | the opening, first in `messages[]` | a paragraph break | dropped |
-| Scheduled fire failure | a red `■` row; `! Interrupted` on a cancel | warn notice `scheduled job '<id>' failed: ...`; info on a cancel | `schedule.fired` webhook, `status` `completed`, `canceled`, `failed` or `not_run`; nothing on the frontend | same webhook | no scheduler | n/a |
+| `InboxAppended` (inbox items added behind a round's results, a nudge or a prompt an interrupt cut) | each item another client posted drawn as a prompt where it lands; one the screen enqueued itself is already drawn; a fire a dim `• Schedule <id> fired …` row, with the lateness the event's `late` carries | `UserMessageChunk` per item, a fire's included | dropped: `inbox.delivered` says it, and the messages hold its words | dropped | dropped | dropped |
+| `MessageAppended` (the message a turn opens with, whoever opened it, or one appended whole after a reply or an interrupt) | a dim `• Schedule <id> fired: …` (with the lateness the event's `late` carries) or `• Background task <id> …` row per fire or report block; an inbox item another client posted is drawn as a prompt with its `(steer)` note, one the screen enqueued itself is already drawn; the person's words are drawn as typed | `UserMessageChunk` per `scheduled` or `inbox` block; a `background_report` block is said as what reported, a `notice` with the tasks under `_meta.background` or a stage-direction chunk; the editor's own words are not echoed | `message.appended` event (`MessageBody`), re-issued with `resumed: true` to a client joining mid-turn | the opening, first in `messages[]` | a paragraph break | dropped |
+| Inbox turn failure (a turn the host opened on inbox items, a fire's included) | a red `■` row, `! Interrupted` on a cancel; then `• Trying … again at …` while its items wait for another try, `! Gave up on …` for each one given up on | warn notice `Schedule '<id>' failed: ...` (one schedule's fires), `The scheduled turn failed: ...` (several), `The inbox turn failed: ...`; info `… was interrupted.`; then info `Trying … again at …` or warn `Gave up on …` | the turn's terminal; `inbox.deferred` or `inbox.failed` on the feed and the webhooks; the `turn.finished` or `turn.failed` webhook | same webhooks | no inbox driver | n/a |
 
-The scheduled-fire failure row comes from each host's `HostHooks` (`finished`) rather than its
-`Frontend`, in `host/tui.rs`, `host/acp/schedule.rs` and `host/http/schedule.rs`. The fire's
-prompt takes no hook: the agent emits `MessageAppended` where it appends a turn's opening, which is
-the one place every door passes, so a report riding a client's turn is announced as a fire's is.
+The inbox-turn failure row comes from each host's `HostHooks` (`finished`, `inbox_deferred`,
+`inbox_given_up`) rather than its `Frontend`, in `host/tui.rs`, `host/acp/schedule.rs` and
+`host/http/schedule.rs`, worded by `host::scheduler::deferral_notice` and `give_up_notice`. A fire
+takes no hook of its own: the agent emits `InboxAppended` or `MessageAppended` where it appends one,
+which is the one place every door passes, so a fire a client's turn reads is announced as one that
+opens a turn is.
 
 The ACP frontend sends each tool call under an id `CallIds` (`host/acp/frontend.rs`) gives it, since
 a provider may give one id to every call or reuse its ids each round: the provider's own id the

@@ -2131,7 +2131,7 @@ fn a_oneshot_prints_the_last_text_block_and_nothing_else() {
 ///
 /// At `workspace` the working directory *is* the writable boundary, so taking the shell's would
 /// silently widen it: resume a project session from `$HOME` and the whole home directory becomes
-/// writable, with a scheduled job able to fire before the user can react.
+/// writable, with a schedule able to fire before the user can react.
 #[test]
 fn a_resumed_session_opens_in_the_directory_it_recorded() {
     let install = Install::new();
@@ -3598,7 +3598,7 @@ fn an_empty_listing_in_json_is_an_empty_envelope_and_a_quiet_stderr() {
         (vec!["account", "list"], "accounts"),
         (vec!["profile", "list"], "profiles"),
         (vec!["mcp", "list"], "servers"),
-        (vec!["schedule", "list"], "jobs"),
+        (vec!["schedule", "list"], "schedules"),
         (vec!["memory", "list"], "memories"),
         (vec!["recall", "list"], "recall"),
         (vec!["skill", "list"], "skills"),
@@ -4151,10 +4151,10 @@ fn skill_list_get_and_show_print_json() {
     );
 }
 
-/// `schedule list` and `schedule show` under `--format json` print each job with the fields
-/// `GET /v1/jobs` uses, ids in full, and the optional fields absent rather than null.
+/// `schedule list` and `schedule show` under `--format json` print each schedule with the fields
+/// `GET /v1/schedules` uses, ids in full, and the optional fields absent rather than null.
 #[test]
-fn schedule_list_and_show_print_the_job_as_json() {
+fn schedule_list_and_show_print_the_schedule_as_json() {
     let install = Install::new();
     write_provider_config(&install, "alpha", &["alpha"]);
     let created = run_scripted(&install, &["--oneshot", "-p", "hello"]);
@@ -4164,28 +4164,28 @@ fn schedule_list_and_show_print_the_job_as_json() {
         String::from_utf8_lossy(&created.stderr)
     );
     let session = only_session(&install);
-    let job = "7f3a1b2c-0000-4000-8000-000000000000";
+    let schedule = "7f3a1b2c-0000-4000-8000-000000000000";
     let now = chrono::Utc::now();
     store(&install)
         .execute(
-            "INSERT INTO scheduled_jobs (id, session_id, kind, spec, prompt, created_at, \
+            "INSERT INTO schedules (id, session_id, kind, spec, prompt, created_at, \
              next_fire_at) VALUES (?1, ?2, 'every', '1h', 'watch the thing', ?3, ?4)",
             rusqlite::params![
-                job,
+                schedule,
                 session,
                 now.to_rfc3339(),
                 (now + chrono::Duration::hours(1)).to_rfc3339()
             ],
         )
-        .expect("plant a job");
+        .expect("plant a schedule");
 
     let listed = json_stdout(run_isolated(&install, &[
         "schedule", "list", "--format", "json",
     ]));
-    let row = &listed["jobs"][0];
-    assert_eq!(row["id"], job);
+    let row = &listed["schedules"][0];
+    assert_eq!(row["id"], schedule);
     assert_eq!(row["session_id"], session);
-    assert_eq!(row["schedule"], "every 1h");
+    assert_eq!(row["timing"], "every 1h");
     assert_eq!(row["prompt"], "watch the thing");
     assert!(
         row["next_fire_at"].is_string() && row["created_at"].is_string(),
@@ -4195,13 +4195,13 @@ fn schedule_list_and_show_print_the_job_as_json() {
         row.get("gate").is_none()
             && row.get("withheld").is_none()
             && row.get("last_fired_at").is_none(),
-        "an ungated job that has never fired carries none of the optional fields: {row}"
+        "an ungated schedule that has never fired carries none of the optional fields: {row}"
     );
 
     let shown = json_stdout(run_isolated(&install, &[
         "schedule",
         "show",
-        &job[..8],
+        &schedule[..8],
         "--format",
         "json",
     ]));

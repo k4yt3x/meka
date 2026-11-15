@@ -24,7 +24,7 @@ use crate::{
     mcp::AdvertisedTool,
     memory::Memory,
     permission::Permission,
-    schedule::ScheduledJob,
+    schedule::Schedule,
     skills::{self, Skill},
     store::{SessionMatch, SessionSummary, turns::TurnRecord},
 };
@@ -621,39 +621,39 @@ pub(crate) struct McpToolsResponse {
     pub(crate) tools: Vec<McpToolView>,
 }
 
-/// A scheduled job: what `meka schedule list` prints and `GET /v1/jobs` answers with.
+/// A schedule: what `meka schedule list` prints and `GET /v1/schedules` answers with.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
-pub(crate) struct ScheduledJobView {
+pub(crate) struct ScheduleView {
     pub(crate) id: String,
     pub(crate) session_id: Uuid,
-    /// Human-readable rendering of the schedule, e.g. `every 30m`, `0 9 * * 1-5 in Asia/Tokyo`,
+    /// Human-readable rendering of the timing, e.g. `every 30m`, `0 9 * * 1-5 in Asia/Tokyo`,
     /// or the instant a one-shot fires.
-    pub(crate) schedule: String,
-    /// The IANA zone a cron job's pattern is read in; absent for one read in the host machine's
-    /// zone, and for every other kind.
+    pub(crate) timing: String,
+    /// The IANA zone a cron schedule's pattern is read in; absent for one read in the host
+    /// machine's zone, and for every other kind.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) timezone: Option<String>,
     pub(crate) prompt: String,
-    /// Present when the job is gated, on a shell command or a tool call.
+    /// Present when the schedule is gated, on a shell command or a tool call.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) gate: Option<GateView>,
     pub(crate) created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_fired_at: Option<String>,
     pub(crate) next_fire_at: String,
-    /// Why this job will not fire on its next occurrence, when something is holding it back.
+    /// Why this schedule will not fire on its next occurrence, when something is holding it back.
     ///
-    /// Absent means it will, as far as the reader can establish. A held job and a healthy watcher
-    /// with nothing to report are otherwise identical from outside: neither fires, and
-    /// `last_fired_at` is absent for a brand-new job too. Computed per request from the session's
-    /// current level, not stored, so it tracks a `PATCH /v1/sessions/{id}` without the job being
-    /// rewritten.
+    /// Absent means it will, as far as the reader can establish. A held schedule and a healthy
+    /// watcher with nothing to report are otherwise identical from outside: neither fires, and
+    /// `last_fired_at` is absent for a brand-new schedule too. Computed per request from the
+    /// session's current level, not stored, so it tracks a `PATCH /v1/sessions/{id}` without the
+    /// schedule being rewritten.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) withheld: Option<String>,
 }
 
-/// A job's gate: what it runs and when the result fires the job.
+/// A schedule's gate: what it runs and when the result fires the schedule.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 pub(crate) struct GateView {
@@ -663,11 +663,11 @@ pub(crate) struct GateView {
     /// The HTTP API withholds it from a token that does not also hold `sessions:r`. A gate command
     /// is a `shell_execute` line that runs unattended, the highest-entropy field in the system
     /// and the one most likely to carry a credential someone pasted into a `curl`, and `GET
-    /// /v1/jobs` is server-wide, so a `schedule:r` token would otherwise read every gate on
+    /// /v1/schedules` is server-wide, so a `schedule:r` token would otherwise read every gate on
     /// the box. A tool gate is withheld on the same terms, though it discloses less either
     /// way: this carries the bare tool name, and its arguments reach only `schedule_list`. The
-    /// gate's kind and its condition stay visible, so a client can still tell a gated job from
-    /// an ungated one, and a shell gate from a tool gate, without being told what it runs.
+    /// gate's kind and its condition stay visible, so a client can still tell a gated schedule
+    /// from an ungated one, and a shell gate from a tool gate, without being told what it runs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) check: Option<String>,
     /// `shell` or `tool`.
@@ -676,27 +676,27 @@ pub(crate) struct GateView {
     pub(crate) when: String,
 }
 
-impl ScheduledJobView {
-    /// The view of a job for one reader, disclosing the gate's command only when `reveal_command`
-    /// is set, and carrying the `withheld` reason that reader worked out.
+impl ScheduleView {
+    /// The view of a schedule for one reader, disclosing the gate's command only when
+    /// `reveal_command` is set, and carrying the `withheld` reason that reader worked out.
     ///
     /// Not a `From` impl: the rendering depends on the caller's scopes, and a conversion that
     /// cannot see them is exactly how the command came to be disclosed at `schedule:r`.
-    pub(crate) fn new(job: &ScheduledJob, reveal_command: bool, withheld: Option<String>) -> Self {
+    pub(crate) fn new(schedule: &Schedule, reveal_command: bool, withheld: Option<String>) -> Self {
         Self {
-            id: job.id.clone(),
-            session_id: job.session_id,
-            schedule: job.schedule.describe(),
-            timezone: job.schedule.timezone().map(str::to_string),
-            prompt: job.prompt.clone(),
-            gate: job.gate.as_ref().map(|gate| GateView {
+            id: schedule.id.clone(),
+            session_id: schedule.session_id,
+            timing: schedule.timing.describe(),
+            timezone: schedule.timing.timezone().map(str::to_string),
+            prompt: schedule.prompt.clone(),
+            gate: schedule.gate.as_ref().map(|gate| GateView {
                 check: reveal_command.then(|| gate.probe.summary()),
                 kind: gate.probe.kind_str().to_string(),
                 when: gate.predicate.summary(),
             }),
-            created_at: job.created_at.to_rfc3339(),
-            last_fired_at: job.last_fired_at.map(|at| at.to_rfc3339()),
-            next_fire_at: job.next_fire_at.to_rfc3339(),
+            created_at: schedule.created_at.to_rfc3339(),
+            last_fired_at: schedule.last_fired_at.map(|at| at.to_rfc3339()),
+            next_fire_at: schedule.next_fire_at.to_rfc3339(),
             withheld,
         }
     }
@@ -1197,12 +1197,12 @@ mod tests {
     /// A gate's command is disclosed only to a reader allowed to see it, and the gate's kind and
     /// condition survive either way.
     #[test]
-    fn a_job_view_withholds_the_gate_command_unless_told_to_reveal_it() {
+    fn a_schedule_view_withholds_the_gate_command_unless_told_to_reveal_it() {
         let now = chrono::Utc::now();
-        let job = ScheduledJob {
-            id: "job-1".to_string(),
+        let schedule = Schedule {
+            id: "schedule-1".to_string(),
             session_id: Uuid::nil(),
-            schedule: crate::schedule::Schedule::parse_every("1h").expect("a schedule"),
+            timing: crate::schedule::Timing::parse_every("1h").expect("a timing"),
             prompt: "watch".to_string(),
             gate: Some(crate::schedule::Gate {
                 probe: crate::schedule::GateProbe::Shell {
@@ -1217,12 +1217,12 @@ mod tests {
             next_fire_at: now,
             attempts: 0,
         };
-        let hidden = serde_json::to_value(ScheduledJobView::new(&job, false, None)).expect("json");
+        let hidden = serde_json::to_value(ScheduleView::new(&schedule, false, None)).expect("json");
         assert!(hidden["gate"].get("check").is_none(), "{hidden}");
         assert_eq!(hidden["gate"]["kind"], "shell");
         assert!(hidden.get("last_fired_at").is_none(), "{hidden}");
         assert!(hidden.get("withheld").is_none(), "{hidden}");
-        let shown = serde_json::to_value(ScheduledJobView::new(&job, true, None)).expect("json");
+        let shown = serde_json::to_value(ScheduleView::new(&schedule, true, None)).expect("json");
         assert_eq!(shown["gate"]["check"], "curl -s https://example.test");
     }
 }

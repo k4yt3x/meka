@@ -571,8 +571,8 @@ pub(crate) struct RunOnName {
     pub(crate) pinned_under: Vec<Uuid>,
 }
 
-/// The ids an `UPDATE … RETURNING id` answers, each refused unless it is one Meka wrote.
-fn ids_returned(
+/// The ids a `RETURNING` clause answers, each refused unless it is one Meka wrote.
+pub(super) fn ids_returned(
     transaction: &rusqlite::Transaction<'_>,
     sql: &str,
     params: impl rusqlite::Params,
@@ -989,12 +989,12 @@ pub(crate) struct ProbedSource {
 /// under an expired root goes with it however it is dated.
 ///
 /// A pin anywhere in the tree keeps it: a pin is the user saying keep this, and the cascade would
-/// take a pinned child with an expiring root. So does a job anywhere in it, whatever `updated_at`
-/// says: only turns bump that column ([`ScheduleStore::claim_occurrence`] and
-/// [`ScheduleStore::complete_claim`] touch `scheduled_jobs` alone), so a gated watcher that
+/// take a pinned child with an expiring root. So does a schedule anywhere in it, whatever
+/// `updated_at` says: only turns bump that column ([`ScheduleStore::claim_occurrence`] and
+/// [`ScheduleStore::complete_claim`] touch `schedules` alone), so a gated watcher that
 /// evaluates every tick and rarely fires looks untouched for exactly as long as it is working, and
-/// a job created against a child (reachable over HTTP, whose only gate is that the session exists)
-/// would be cascaded away with the root.
+/// a schedule created against a child (reachable over HTTP, whose only gate is that the session
+/// exists) would be cascaded away with the root.
 ///
 /// A constant because it is applied twice, in two statements, and the pair is only sound while
 /// they agree: see [`Store::delete_the_unattached_among`].
@@ -1010,7 +1010,7 @@ const EXPIRABLE: &str = "parent_session_id IS NULL \
          ) \
          SELECT root FROM tree \
           WHERE id IN (SELECT id FROM sessions WHERE pinned_at IS NOT NULL) \
-             OR id IN (SELECT session_id FROM scheduled_jobs) \
+             OR id IN (SELECT session_id FROM schedules) \
      )";
 /// How many sessions a prefix scan fetches before it stops counting.
 ///
@@ -2362,7 +2362,7 @@ impl Store {
     /// parent in this store. [`crate::host::refuse_a_spawned_session`] reads it that way and
     /// refuses it, so every rule *around* that refusal has to agree, or `meka -c` selects an
     /// orphan it cannot then drive, `session import` prints a `meka -r` that is already
-    /// illegal, and `POST /schedule` accepts a job that fails on every fire.
+    /// illegal, and `POST /v1/schedules` accepts a schedule that fails on every fire.
     pub(crate) async fn spawn_terms(&self, session_id: Uuid) -> Result<Option<SpawnTerms>> {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
@@ -5034,8 +5034,8 @@ impl Store {
                 // a question the database can answer: it depends on which of them another process
                 // has open. [`Self::delete_the_unattached_among`] re-applies the same condition
                 // inside the delete, so splitting one statement into two does not open a window
-                // where a job created in between is cascaded away by a decision taken before it
-                // existed.
+                // where a schedule created in between is cascaded away by a decision taken before
+                // it existed.
                 let mut statement = connection.prepare(&format!(
                     "SELECT id FROM sessions WHERE updated_at < ?1 AND {EXPIRABLE}"
                 ))?;
@@ -5282,9 +5282,9 @@ impl Store {
     /// on the rows as they are rather than on a list read earlier. Selecting candidates and then
     /// deleting them by id is two statements, and a condition checked only in the first can stop
     /// being true in between: the retention sweep's "no schedule ahead of it" is the case that
-    /// matters, because a job created against a sub-agent child in that gap would be cascaded away
-    /// with a parent nothing has locked. A `&'static str` and never anything derived from input;
-    /// `""` for a caller with no further condition, which is `--all`.
+    /// matters, because a schedule created against a sub-agent child in that gap would be cascaded
+    /// away with a parent nothing has locked. A `&'static str` and never anything derived from
+    /// input; `""` for a caller with no further condition, which is `--all`.
     ///
     /// Chunked because a lock is an open file descriptor: a sweep over ten thousand expired
     /// sessions would otherwise hold ten thousand at once and hit the process limit, turning a
@@ -5561,7 +5561,7 @@ impl Store {
     }
 
     /// Delete a root session whose tree is [`EXPIRABLE`], and nothing else: what an idle server
-    /// may take from under nobody, by the rule the retention sweep follows, so a pin or a job
+    /// may take from under nobody, by the rule the retention sweep follows, so a pin or a schedule
     /// anywhere in the tree keeps it. `false` when the row was spared or is gone.
     pub(crate) async fn delete_session_if_expirable(&self, session_id: Uuid) -> Result<bool> {
         let deleted = self
@@ -5659,8 +5659,8 @@ impl Store {
             .filter_map(|id| session_id_in(&id))
             .collect();
         // No further condition: `--all` means every session nobody else has open, schedules
-        // included. Sparing a job-owning session here would make the command quietly not mean what
-        // it says.
+        // included. Sparing a schedule-owning session here would make the command quietly not mean
+        // what it says.
         self.delete_the_unattached_among(&ids, "", None).await
     }
 }
@@ -10581,14 +10581,14 @@ mod tests {
     ///
     /// Selecting candidates and then deleting them by id is two statements where there was one, so
     /// a condition checked only in the first can stop being true in between. The one that matters
-    /// is "no schedule ahead of it": `parent_session_id` cascades, so a job created against a
+    /// is "no schedule ahead of it": `parent_session_id` cascades, so a schedule created against a
     /// sub-agent child in that gap would be swept away with a parent nothing has locked, and the
     /// lock cannot stand in for the check because it is the *parent* being deleted and the
-    /// *child* that acquired the job.
+    /// *child* that acquired the schedule.
     ///
     /// Driven through [`Store::delete_the_unattached_among`] directly, with a candidate
-    /// that already owns a job, because the gap itself is microseconds wide and not something a
-    /// test can sit inside. What it pins is the property that closes it: the predicate is in the
+    /// that already owns a schedule, because the gap itself is microseconds wide and not something
+    /// a test can sit inside. What it pins is the property that closes it: the predicate is in the
     /// delete, not only in the select.
     #[tokio::test]
     async fn the_sweep_re_checks_its_own_condition_inside_the_delete() {
@@ -10603,12 +10603,12 @@ mod tests {
             .expect("create");
         store
             .schedule_store()
-            .create_scheduled_job(
-                &crate::schedule::ScheduledJob {
+            .create_schedule(
+                &crate::schedule::Schedule {
                     attempts: 0,
-                    id: "job-1".to_string(),
+                    id: "schedule-1".to_string(),
                     session_id: scheduled,
-                    schedule: crate::schedule::Schedule::parse_every("1h").expect("parses"),
+                    timing: crate::schedule::Timing::parse_every("1h").expect("parses"),
                     prompt: "check the thing".to_string(),
                     gate: None,
                     created_at: chrono::Utc::now(),
@@ -10618,7 +10618,7 @@ mod tests {
                 usize::MAX,
             )
             .await
-            .expect("create the job");
+            .expect("create the schedule");
 
         let sweep = store
             .delete_the_unattached_among(&[scheduled, ordinary], EXPIRABLE, None)
@@ -10628,7 +10628,7 @@ mod tests {
         assert_eq!(sweep.deleted, 1, "only the one with nothing ahead of it");
         assert!(
             store.session_exists(scheduled).await.expect("exists"),
-            "a session a job still depends on must survive a delete it was listed for"
+            "a session a schedule still depends on must survive a delete it was listed for"
         );
         assert!(!store.session_exists(ordinary).await.expect("exists"));
     }
@@ -10788,19 +10788,19 @@ mod tests {
         assert!(messages.is_empty());
     }
 
-    /// The FK cascade must not take a job-owning child with its stale parent.
+    /// The FK cascade must not take a schedule-owning child with its stale parent.
     ///
-    /// A session holding a scheduled job is not idle, whatever its `updated_at` says: only turns
+    /// A session holding a schedule is not idle, whatever its `updated_at` says: only turns
     /// bump that column, so a gated watcher that evaluates every tick and rarely fires looks
     /// untouched precisely while it is doing its job.
     ///
-    /// Sparing only the row named by `scheduled_jobs.session_id` left the guard half-built:
+    /// Sparing only the row named by `schedules.session_id` left the guard half-built:
     /// `parent_session_id` carries `ON DELETE CASCADE`, so a root session that has gone quiet
-    /// still deletes its sub-agent children, and a job created against a child -- which the HTTP
-    /// surface allows, gating only on the session existing -- went with them. The sweep then
+    /// still deletes its sub-agent children, and a schedule created against a child -- which the
+    /// HTTP surface allows, gating only on the session existing -- went with them. The sweep then
     /// reported one deletion and said nothing about the schedule it destroyed.
     #[tokio::test]
-    async fn retention_spares_the_parent_of_a_child_that_has_a_scheduled_job() {
+    async fn retention_spares_the_parent_of_a_child_that_has_a_schedule() {
         let store = Store::for_test().await;
         let parent = store
             .create_session(None, "test-profile".to_string())
@@ -10819,11 +10819,11 @@ mod tests {
             .expect("create child")
             .0;
 
-        let job = crate::schedule::ScheduledJob {
+        let schedule = crate::schedule::Schedule {
             attempts: 0,
             id: uuid::Uuid::new_v4().to_string(),
             session_id: child,
-            schedule: crate::schedule::Schedule::parse_every("30m").expect("parses"),
+            timing: crate::schedule::Timing::parse_every("30m").expect("parses"),
             prompt: "check the build".to_string(),
             gate: None,
             created_at: chrono::Utc::now(),
@@ -10832,9 +10832,9 @@ mod tests {
         };
         store
             .schedule_store()
-            .create_scheduled_job(&job, usize::MAX)
+            .create_schedule(&schedule, usize::MAX)
             .await
-            .expect("save job");
+            .expect("save schedule");
 
         // Only the parent looks ancient; the child is what owns the future.
         let ancient = (chrono::Utc::now() - chrono::Duration::days(400)).to_rfc3339();
@@ -10850,7 +10850,7 @@ mod tests {
 
         assert!(
             store.session_exists(child).await.expect("exists"),
-            "the child owning the job was cascaded away with its stale parent"
+            "the child owning the schedule was cascaded away with its stale parent"
         );
         assert!(
             store.session_exists(parent).await.expect("exists"),
@@ -10858,12 +10858,12 @@ mod tests {
         );
     }
 
-    /// Retention must leave a session alone while it still owns a scheduled job.
+    /// Retention must leave a session alone while it still owns a schedule.
     ///
-    /// It did not: the cascade took the job along with the session, and the sweep reported only
-    /// "deleted N session(s)".
+    /// It did not: the cascade took the schedule along with the session, and the sweep reported
+    /// only "deleted N session(s)".
     #[tokio::test]
-    async fn retention_spares_a_session_that_still_has_a_scheduled_job() {
+    async fn retention_spares_a_session_that_still_has_a_schedule() {
         let store = Store::for_test().await;
         let watcher = store
             .create_session(None, "test-profile".to_string())
@@ -10874,11 +10874,11 @@ mod tests {
             .await
             .expect("create");
 
-        let job = crate::schedule::ScheduledJob {
+        let schedule = crate::schedule::Schedule {
             attempts: 0,
             id: uuid::Uuid::new_v4().to_string(),
             session_id: watcher,
-            schedule: crate::schedule::Schedule::parse_every("30m").expect("parses"),
+            timing: crate::schedule::Timing::parse_every("30m").expect("parses"),
             prompt: "check the build".to_string(),
             gate: None,
             created_at: chrono::Utc::now(),
@@ -10887,9 +10887,9 @@ mod tests {
         };
         store
             .schedule_store()
-            .create_scheduled_job(&job, usize::MAX)
+            .create_schedule(&schedule, usize::MAX)
             .await
-            .expect("save job");
+            .expect("save schedule");
 
         // Both look ancient by `updated_at`; only one of them has a future.
         let ancient = (chrono::Utc::now() - chrono::Duration::days(400)).to_rfc3339();
@@ -10907,7 +10907,7 @@ mod tests {
 
         assert!(
             store.session_exists(watcher).await.expect("exists"),
-            "a session with a pending job must survive retention"
+            "a session with a pending schedule must survive retention"
         );
         assert!(
             !store.session_exists(plain).await.expect("exists"),
@@ -10916,12 +10916,12 @@ mod tests {
         assert_eq!(
             store
                 .schedule_store()
-                .list_scheduled_jobs(watcher)
+                .list_schedules(watcher)
                 .await
                 .expect("list")
                 .len(),
             1,
-            "the job must survive with its session"
+            "the schedule must survive with its session"
         );
     }
 

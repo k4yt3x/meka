@@ -1,4 +1,4 @@
-//! A job's gate: the probe it runs, the predicate applied to the result, and why a fire was
+//! A schedule's gate: the probe it runs, the predicate applied to the result, and why a fire was
 //! withheld.
 
 use super::*;
@@ -26,7 +26,7 @@ pub(crate) enum GateProbe {
     },
 }
 impl GateProbe {
-    /// Discriminant stored in `scheduled_jobs.gate_kind`, mirroring [`Schedule::kind_str`] so a row
+    /// Discriminant stored in `schedules.gate_kind`, mirroring [`Timing::kind_str`] so a row
     /// can be read for its shape without parsing the spec.
     pub(crate) fn kind_str(&self) -> &'static str {
         match self {
@@ -53,12 +53,12 @@ impl GateProbe {
     /// `schedule_list` is that reader: the model wrote those arguments and cannot otherwise read
     /// back what it created, so a gate it built with the wrong `since` looks identical to a correct
     /// one. Every other surface stays on [`Self::summary`], because the operator's listing and the
-    /// HTTP view are read by parties who did not author the job.
+    /// HTTP view are read by parties who did not author the schedule.
     ///
     /// The kind is named because the two are otherwise indistinguishable where a tool's name would
     /// also be a valid command: `web_fetch` as a shell gate and `web_fetch` as a tool gate rendered
     /// identically, and they are an unsandboxed `sh -c` and a structured call. The model needs the
-    /// difference to recreate the job it is reading back.
+    /// difference to recreate the schedule it is reading back.
     pub(crate) fn detail(&self) -> String {
         match self {
             Self::Shell { command } => format!("shell {command}"),
@@ -134,7 +134,7 @@ impl From<PointerTest> for String {
         test.name().to_string()
     }
 }
-/// What the probe's result has to look like for the job to fire.
+/// What the probe's result has to look like for the schedule to fire.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum GatePredicate {
@@ -303,7 +303,7 @@ impl GatePredicate {
         }
     }
 }
-/// The cheap check that decides whether a due job spends a model turn.
+/// The cheap check that decides whether a due schedule spends a model turn.
 ///
 /// This is the whole reason a 30-second cadence is affordable: without it, watching something costs
 /// one model turn per interval whether or not anything happened.
@@ -312,7 +312,7 @@ pub(crate) struct Gate {
     pub(crate) probe: GateProbe,
     pub(crate) predicate: GatePredicate,
     /// The comparison baseline from the last evaluation, for the predicates that need one. `None`
-    /// until the first run, at which point the job fires: with nothing to compare against,
+    /// until the first run, at which point the schedule fires: with nothing to compare against,
     /// "changed" is the honest answer, and it also proves the gate works rather than leaving
     /// it silently untested.
     ///
@@ -323,13 +323,13 @@ pub(crate) struct Gate {
     /// The permission level the creating session held when this gate was authorized.
     ///
     /// Creation checks the level, but creation is a moment and the row outlives it: the session
-    /// drops to `read`, or `meka serve --permission read` restarts and inherits the job, and
+    /// drops to `read`, or `meka serve --permission read` restarts and inherits the schedule, and
     /// without this field nothing downstream can tell that the authority behind the gate is
     /// gone. Carrying the level on the row is what lets [`crate::scheduler::prepare`] re-check it
     /// at fire time instead of trusting a decision made days ago.
     pub(crate) permission: crate::permission::Permission,
 }
-/// The parts of a gate that round-trip through `scheduled_jobs.gate_spec_json` as one JSON value.
+/// The parts of a gate that round-trip through `schedules.gate_spec_json` as one JSON value.
 ///
 /// `last_output` and `permission` stay in their own columns: the first is rewritten on every
 /// evaluation and the second is read by the fire-time authority check, and neither wants a
@@ -455,7 +455,7 @@ impl ProbeOutcome {
 }
 /// Why a gate may not run at a given level.
 ///
-/// One type so the doors that ask (`schedule_create`, `POST /v1/jobs`, and the
+/// One type so the doors that ask (`schedule_create`, `POST /v1/schedules`, and the
 /// fire-time re-check in [`crate::scheduler::prepare`]) give the same answer for the same state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GateRefusal {
@@ -504,11 +504,11 @@ impl GateRefusal {
 }
 /// Whether `level` may author or fire this probe, re-resolving the tool every time it is asked.
 ///
-/// Both halves are checked, and both are checked *now* rather than trusted from creation. A job
-/// authored at `unrestricted` must stop firing its command once the session drops, or a daemon runs
-/// an unsandboxed command after the user lowered the level and is entitled to be surprised. And a
-/// tool that resolved to `read` when the job was written but resolves higher today must stop being
-/// a gate, because the operator retuned `tool_permissions` and meant it.
+/// Both halves are checked, and both are checked *now* rather than trusted from creation. A
+/// schedule authored at `unrestricted` must stop firing its command once the session drops, or a
+/// daemon runs an unsandboxed command after the user lowered the level and is entitled to be
+/// surprised. And a tool that resolved to `read` when the schedule was written but resolves higher
+/// today must stop being a gate, because the operator retuned `tool_permissions` and meant it.
 pub(crate) fn gate_probe_is_authorized(
     probe: &GateProbe,
     level: crate::permission::Permission,
@@ -543,8 +543,8 @@ pub(crate) fn gate_probe_is_authorized(
 /// Why `gate` will not fire right now, and the level that answer was reached at.
 ///
 /// One function for three readers: the fire door in [`crate::scheduler::prepare`], the
-/// `[Scheduled]` index the model sees every turn, and `schedule_list`, so a held-back job reaches
-/// the model, which can cancel a job it cannot fire, and not only the operator's log.
+/// `[Scheduled]` index the model sees every turn, and `schedule_list`, so a held-back schedule
+/// reaches the model, which can cancel a schedule it cannot fire, and not only the operator's log.
 ///
 /// The live level is tried first because it is the one that can be put back. A refusal that only
 /// the recorded level produces means a row nothing can currently restore, which is a different
@@ -580,7 +580,7 @@ pub(crate) trait GateTools: Send + Sync + std::fmt::Debug {
     /// Only the *reporting* surfaces ask. Authority does not: a gate whose server is mid-handshake
     /// genuinely cannot run, and [`Self::resolve`] returning `None` is the right answer there. But
     /// saying "not available right now" in the model's `[Scheduled]` block during startup marks a
-    /// healthy job as dead and then announces it alive again a turn later, which is worse than
+    /// healthy schedule as dead and then announces it alive again a turn later, which is worse than
     /// saying nothing for the second it takes.
     ///
     /// Defaulted to `false` so a dispatcher with no notion of connecting (every test stub, and any
@@ -593,7 +593,7 @@ pub(crate) trait GateTools: Send + Sync + std::fmt::Debug {
     /// answered and the authority check has passed.
     ///
     /// `cwd` is here and not on `resolve` because only the call needs it: what a tool *requires* is
-    /// a property of the tool, while where it runs is a property of the job.
+    /// a property of the tool, while where it runs is a property of the schedule.
     async fn call(
         &self,
         name: &str,
@@ -690,8 +690,8 @@ mod tests {
     /// The process ran fine, so this is not a spawn failure, but the predicate describes a shape
     /// the result does not have, so nothing was measured. Declining silently is survivable for
     /// `not_empty` and ruinous for `empty`: a missing value reads as empty, so a server that starts
-    /// returning prose or an error string would fire the job every interval, indefinitely. Both
-    /// directions are covered here because the asymmetry is the point.
+    /// returning prose or an error string would fire the schedule every interval, indefinitely.
+    /// Both directions are covered here because the asymmetry is the point.
     #[test]
     fn a_pointer_into_something_that_is_not_json_is_an_error() {
         for is in [
@@ -797,15 +797,15 @@ mod tests {
         );
     }
 
-    /// A job carrying `gate` and nothing else of interest, for the predicate tests that never touch
-    /// a store. A fresh id every call, so the process-global ledgers keyed by job id cannot carry
-    /// one test's state into another's.
-    fn job_carrying(gate: Option<Gate>) -> ScheduledJob {
-        ScheduledJob {
+    /// A schedule carrying `gate` and nothing else of interest, for the predicate tests that never
+    /// touch a store. A fresh id every call, so the process-global ledgers keyed by schedule id
+    /// cannot carry one test's state into another's.
+    fn schedule_carrying(gate: Option<Gate>) -> Schedule {
+        Schedule {
             attempts: 0,
             id: uuid::Uuid::new_v4().to_string(),
             session_id: uuid::Uuid::nil(),
-            schedule: Schedule::parse_every("1h").expect("parses"),
+            timing: Timing::parse_every("1h").expect("parses"),
             prompt: "watch the thing".to_string(),
             gate,
             created_at: Utc::now(),
@@ -817,9 +817,9 @@ mod tests {
     /// A gate whose server has not finished connecting is not reported as dead.
     ///
     /// Between process start and `Connected`, and again on every reconnect, the tool is absent from
-    /// the snapshot. Marking that in the model's `[Scheduled]` block says a healthy job is dead and
-    /// then announces it alive a turn later, churn the model may act on. Authority is unchanged:
-    /// the fire door still declines, because the probe genuinely cannot run.
+    /// the snapshot. Marking that in the model's `[Scheduled]` block says a healthy schedule is
+    /// dead and then announces it alive a turn later, churn the model may act on. Authority is
+    /// unchanged: the fire door still declines, because the probe genuinely cannot run.
     #[test]
     fn a_gate_whose_server_is_still_connecting_is_not_reported_as_dead() {
         let gate = Gate {
@@ -830,12 +830,12 @@ mod tests {
         };
         let level = crate::permission::Permission::Read;
 
-        let job = job_carrying(Some(gate.clone()));
+        let schedule = schedule_carrying(Some(gate.clone()));
 
         assert_eq!(
-            job_withheld_reason(
+            schedule_withheld_reason(
                 &SchedulerMemory::default(),
-                &job,
+                &schedule,
                 level,
                 Some(&StillConnecting)
             ),
@@ -843,9 +843,9 @@ mod tests {
             "a handshake in progress is not a verdict"
         );
         assert!(
-            job_withheld_reason(
+            schedule_withheld_reason(
                 &SchedulerMemory::default(),
-                &job,
+                &schedule,
                 level,
                 Some(&FixedTools(None))
             )
@@ -857,9 +857,9 @@ mod tests {
             "and the authority check refuses either way, since the probe cannot run"
         );
         assert_eq!(
-            job_withheld(&SchedulerMemory::default(), &job, Some(level), None),
+            schedule_withheld(&SchedulerMemory::default(), &schedule, Some(level), None),
             Withheld::Undetermined,
-            "a reader with no dispatcher has not established that the job is fine; it has \
+            "a reader with no dispatcher has not established that the schedule is fine; it has \
              established nothing, and `meka schedule list` renders that as `?` rather than as the \
              blank cell that means healthy"
         );
@@ -881,7 +881,7 @@ mod tests {
         );
     }
 
-    /// A tool that resolved to `read` when the job was written but resolves higher today.
+    /// A tool that resolved to `read` when the schedule was written but resolves higher today.
     /// Re-resolving at fire time is what catches it; trusting the level recorded at creation would
     /// keep calling it.
     #[test]

@@ -174,13 +174,13 @@ See [Instructions](../usage/instructions.md).
 
 ### `schedule`
 
-Inspect and cancel the wakeups the agent scheduled for itself. There is no `create`: a job needs a
-session for its turn to run in, and the agent creates one through `schedule_create`.
+Inspect and cancel the schedules the agent set for itself. There is no `create`: a schedule needs a
+session for its fire to go to, and the agent creates one through `schedule_create`.
 
 Every `<ID>` is a full id or any unique prefix of one, which is what `list` prints.
 
 ```bash
-meka schedule list [--session <SESSION>] [--format <FORMAT>]   # every session's jobs, or one session's by id or prefix
+meka schedule list [--session <SESSION>] [--format <FORMAT>]   # all schedules, or one session's by id or prefix
 meka schedule show <ID> [--format <FORMAT>]   # full prompt, gate command, session, withheld reason
 meka schedule cancel <ID>
 ```
@@ -370,8 +370,8 @@ started with `cd /tmp` has no write boundary, which is the safe direction to fai
 
 The flag reaches the interactive screen, one-shot runs, and ACP sessions. It does **not** reach
 sessions created through `POST /v1/sessions`, which are single-directory by design, and therefore
-does not reach a scheduled turn under `meka serve` either: those run in the session the job belongs
-to, which the HTTP API created.
+does not reach a turn `meka serve` opens on a schedule's fire either: it runs in the session the
+schedule belongs to, which the HTTP API created.
 
 ### `--additional-readable-directory <DIR>`
 
@@ -432,7 +432,7 @@ Every listing and `show` command takes the same `--format plain|json`: `session 
 `account list|usage|whoami|stats`, `profile list`, `project list`, `mcp list|get|tools`,
 `schedule list|show`, `memory list|get|show`, `tool list|show`, `recall list` and `skill list|get|show`.
 Under `json`, a `show` prints one object and a listing prints `{"<nouns>": [...]}` (`sessions`,
-`accounts`, `profiles`, `projects`, `servers`, `jobs`, `memories`, `tools`, `recall`, `skills`), with the field names the
+`accounts`, `profiles`, `projects`, `servers`, `schedules`, `memories`, `tools`, `recall`, `skills`), with the field names the
 [HTTP API](../usage/http-api.md) uses for the same object where it has one. An empty listing is the envelope around an empty array
 and nothing on stderr; in `plain`, it is a `No <nouns>.` note on stderr and nothing on stdout.
 Warnings and hints stay on stderr under either format, so `meka … --format json 2>/dev/null | jq`

@@ -24,7 +24,7 @@ use crate::{
         sse::SseEventType,
         state::ServerState,
     },
-    store::inbox::{InboxClass, InboxItem, NewInboxItem, Withdrawal},
+    store::inbox::{InboxClass, InboxItem, InboxOrigin, NewInboxItem, Withdrawal},
 };
 
 /// The body of `POST /v1/sessions/{id}/inbox`.
@@ -52,9 +52,17 @@ pub(crate) struct InboxItemView {
     pub(crate) id: Uuid,
     pub(crate) session_id: Uuid,
     pub(crate) class: String,
-    /// Absent when the client named nobody.
+    /// Who sent the message, as the client named them. Absent when the client named nobody, and on
+    /// a schedule's fire.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) source: Option<String>,
+    /// The schedule whose fire this is. Absent on a message somebody sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) schedule_id: Option<String>,
+    /// How many of its schedule's occurrences the fire stands for. Absent on a message somebody
+    /// sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) occurrences: Option<u32>,
     /// `pending`, `appended`, `delivered` or `withdrawn`.
     pub(crate) state: String,
     pub(crate) created_at: String,
@@ -81,11 +89,19 @@ pub(crate) struct InboxItemView {
 impl InboxItemView {
     /// The item as the API shows it, with the deadline `ceiling` sets from its enqueue.
     pub(crate) fn new(item: InboxItem, ceiling: std::time::Duration) -> Self {
+        let (source, schedule_id, occurrences) = match &item.origin {
+            InboxOrigin::Sent { source } => (source.clone(), None, None),
+            InboxOrigin::Fire(fire) => {
+                (None, Some(fire.schedule_id.clone()), Some(fire.occurrences))
+            }
+        };
         Self {
             id: item.id,
             session_id: item.session_id,
             class: item.class.name().to_string(),
-            source: item.source.clone(),
+            source,
+            schedule_id,
+            occurrences,
             state: item.state().name().to_string(),
             created_at: item.created_at.to_rfc3339(),
             appended_at: item.appended_at.map(|at| at.to_rfc3339()),
@@ -234,7 +250,7 @@ pub(crate) async fn enqueue(
     }
     entry.touch();
     // Whether or not a turn is running: a running one reads the inbox itself at its next
-    // boundary, and the driver finds the session busy and leaves it to that.
+    // boundary, and the driver waits for it to end and opens a turn on what it left.
     state.inbox_wake.notify_one();
     Ok((
         StatusCode::ACCEPTED,
@@ -366,5 +382,70 @@ pub(crate) async fn withdraw(
         )
         .with("session_id", session_id.to_string())),
         Withdrawal::Closed | Withdrawal::Missing => Err(not_found()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fire is shown by its schedule and the occurrences it stands for, and names no sender; a
+    /// message somebody sent is shown by its sender as before, with neither.
+    #[test]
+    fn a_fire_is_shown_by_its_schedule_and_a_message_by_its_sender() {
+        let now = chrono::Utc::now();
+        let view = |origin| {
+            serde_json::to_value(InboxItemView::new(
+                InboxItem {
+                    id: Uuid::nil(),
+                    session_id: Uuid::nil(),
+                    class: InboxClass::Steer,
+                    origin,
+                    body: "words".to_string(),
+                    created_at: now,
+                    attempts: 0,
+                    not_before: None,
+                    last_error: None,
+                    appended_at: None,
+                    delivered_at: None,
+                    withdrawn_at: None,
+                    failure: None,
+                },
+                std::time::Duration::from_secs(3600),
+            ))
+            .expect("json")
+        };
+        let fire = view(InboxOrigin::Fire(crate::store::inbox::Fire {
+            schedule_id: "1a2b3c4d-0000-4000-8000-000000000000".to_string(),
+            gate_output: Some("state: failed".to_string()),
+            occurrences: 3,
+            due_at: now,
+            fired_at: now,
+        }));
+        assert_eq!(
+            (
+                fire.get("source"),
+                &fire["schedule_id"],
+                &fire["occurrences"]
+            ),
+            (
+                None,
+                &serde_json::json!("1a2b3c4d-0000-4000-8000-000000000000"),
+                &serde_json::json!(3)
+            )
+        );
+        let sent = view(InboxOrigin::Sent {
+            source: Some("telegram".to_string()),
+        });
+        assert_eq!(
+            (
+                &sent["source"],
+                sent.get("schedule_id"),
+                sent.get("occurrences")
+            ),
+            (&serde_json::json!("telegram"), None, None)
+        );
+        let unnamed = view(InboxOrigin::Sent { source: None });
+        assert_eq!(unnamed.get("source"), None);
     }
 }

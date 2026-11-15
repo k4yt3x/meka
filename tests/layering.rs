@@ -48,7 +48,7 @@ const RANKS: &[(&str, u32)] = &[
     // materials hold the background handles.
     ("prompt", 7),
     ("session", 8),
-    // The scheduler runs jobs; `schedule`, below the store, is what a job is.
+    // The scheduler runs schedules; `schedule`, below the store, is what a schedule is.
     ("scheduler", 9),
     ("background", 9),
     ("mcp", 10),
@@ -553,6 +553,9 @@ const LABELS: &[(&str, &str)] = &[
     ("[End of messages received]", "src/agent/compaction.rs"),
     ("[Message from ", "src/prompt.rs"),
     ("[Message arrived ", "src/prompt.rs"),
+    ("[Schedule ", "src/prompt.rs"),
+    ("[Late by ", "src/prompt.rs"),
+    ("[Gate output]", "src/prompt.rs"),
     ("[Meka]", "src/host/acp/frontend.rs"),
     ("[Meka warn]", "src/host/acp/frontend.rs"),
     ("[No message content]", "src/provider/anthropic/shared.rs"),

@@ -61,8 +61,8 @@ had asked for them.
 Because they belong to the process, they are not recorded on the session either, and resuming a
 session does not bring them back: pass them again. This is the difference between them and the
 profile and permission level, which *are* recorded and *do* come back. Writing them to the row
-would mean a `meka serve` sharing the data directory could later grant those directories to a job
-it fires, on the authority of a flag that process was never given.
+would mean a `meka serve` sharing the data directory could later grant those directories to a
+schedule's turn, on the authority of a flag that process was never given.
 
 The same set governs both halves, derived once so they cannot disagree: the `file_*` tools check it
 before writing, and the shell sandbox is built from it. A refusal from `file_write` names the
@@ -312,7 +312,7 @@ surface says which of the two replaced it:
 silently re-pointing the name at the narrower level would have admitted tools a rung earlier than
 their author intended. A hard failure at every door is the safe direction.
 
-Anything Meka persisted for itself (a sub-agent's saved spec, a scheduled job's gate) needs the
+Anything Meka persisted for itself (a sub-agent's saved spec, a schedule's gate) needs the
 one-shot migration script; those values were never typed by you and cannot be fixed by hand.
 
 ## Changing permissions at runtime
@@ -527,7 +527,7 @@ The agent will explain that it cannot write files at `read` and suggest switchin
 |-------|----------|-------|
 | Memory | the `memories` table in `MEKA_DATA_DIR` | `memory_write`, `memory_edit`, `memory_delete` |
 | Skills | `~/.config/meka/skills/` | `skill_write`, `skill_edit`, `skill_delete` (only with [`[skills] agent_managed`](../configuration/config-file.md#skills)) |
-| Scratchpad, scheduled jobs, background tasks | the store | various |
+| Scratchpad, schedules, background tasks | the store | various |
 
 Of those, only the skill tools reach the filesystem at all; memory is a table in the store. Note what that makes `skill_write` at `read`: a persistence primitive. A skill it writes is read back into every later session's prompt, so a prompt-injected instruction can outlive the turn that carried it. That is the reason `[skills] agent_managed` is off by default and the tool is never given to a sub-agent. That boundary is enforced in two places: a skill name must be one path component matching the Agent Skills spec's own rule (lowercase letters, digits and hyphens), so it cannot contain `..` or a path separator, and a symlink sitting at that name is refused rather than followed, so an existing link cannot redirect a write out of the skills directory. Memory names are governed by a different and wider rule (`[A-Za-z0-9_-]`), which is safe for a different reason: a memory name is a primary key in a table, never a path. `file_write`, `file_edit` and `scratchpad_save_file` are the only built-ins that touch your tree, and all three require `workspace` or above, and are fenced to the workspace roots at that level.
 

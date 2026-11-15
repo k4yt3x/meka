@@ -1,18 +1,18 @@
-//! Scheduled wakeups: the agent arranging to be prompted again later.
+//! Schedules: the agent arranging to be prompted again later.
 //!
 //! Every other turn Meka runs originates outside the agent: a human typing, an editor sending
 //! `session/prompt`, a client calling `POST /v1/sessions/{id}/turns`. This module supplies the one
 //! trigger nothing else can, a timer: the agent's ability to say "wake me at 09:00" and have that
 //! survive the process it was said in.
 //!
-//! A job pairs a [`Schedule`] with the prompt to deliver, and optionally a *gate*: a cheap shell
+//! A schedule pairs a [`Timing`] with the prompt to deliver, and optionally a *gate*: a cheap shell
 //! command run first, whose result decides whether the expensive model turn happens at all. Without
 //! one, "watch X every 30s" costs a model turn every 30 seconds; with one it costs a process spawn,
 //! and a turn only when something actually changed.
 //!
-//! Jobs live in the session database rather than `config.toml` because they are runtime data the
-//! agent creates, not settings a human writes, and they are keyed to a session so a job dies with
-//! the conversation that asked for it.
+//! Schedules live in the session database rather than `config.toml` because they are runtime data
+//! the agent creates, not settings a human writes, and they are keyed to a session so a schedule
+//! dies with the conversation that asked for it.
 
 use std::time::Duration;
 
@@ -27,9 +27,9 @@ mod memory;
 
 pub(crate) use self::{gate::*, memory::*};
 
-/// Smallest interval a recurring job may use. Not a policy limit: a zero or sub-second interval
-/// makes `next_after` return an instant that is already in the past by the time it is stored, so
-/// the job fires every poll tick forever.
+/// Smallest interval a recurring schedule may use. Not a policy limit: a zero or sub-second
+/// interval makes `next_after` return an instant that is already in the past by the time it is
+/// stored, so the schedule fires every poll tick forever.
 const MIN_EVERY: Duration = Duration::from_secs(1);
 
 /// Upper bound on the missed-occurrence count reported to the model. Counting is a courtesy ("you
@@ -37,36 +37,36 @@ const MIN_EVERY: Duration = Duration::from_secs(1);
 /// figure is not worth the tick it would spend.
 pub(crate) const MAX_COALESCED_REPORTED: u32 = 1000;
 
-/// How many undelivered claims a job may accumulate before it stops being retried.
+/// How many unclosed claims a schedule may accumulate before it stops being retried.
 ///
-/// A lease is handed back on expiry, so a prompt that reliably kills the process is otherwise
-/// claimed again forever. Counting the claims that ended in neither a delivery nor a handback
-/// identifies exactly that job, and this is where it is parked: still listed, still cancelable,
-/// reported as held on every surface, and unable to take the daemon down with it. Three, because
-/// two is within the range of ordinary bad luck (a deploy during a fire, then a machine restart)
-/// and a fourth attempt on something that has failed three times is not going to be the one that
-/// works.
+/// A lease is taken again on expiry, so an occurrence that reliably takes its host down before its
+/// fire is written is otherwise claimed again forever. Counting the claims that were never closed
+/// identifies exactly that schedule, and this is where it is parked: still listed, still
+/// cancelable, reported as held on every surface, and unable to take the daemon down with it.
+/// Three, because two is within the range of ordinary bad luck (a deploy during a gate, then a
+/// machine restart) and a fourth attempt on something that has failed three times is not going to
+/// be the one that works.
 ///
-/// It also bounds the one shape the "advance on a failed probe" rule cannot reach: a job with no
-/// next occurrence, which in practice means a one-shot. There the lease is held rather than
+/// It also bounds the one shape the "advance on a failed probe" rule cannot reach: a schedule with
+/// no next occurrence, which in practice means a one-shot. There the lease is held rather than
 /// released, so the retry waits out `claim_lease` instead of coming round on the next tick, and
 /// this is what stops that from going on until the grace period closes. Three attempts an hour
 /// apart is a budget a transient outage survives and a broken gate does not; three ten-second ones,
 /// which is what releasing the lease would have given, is neither.
 pub(crate) const MAX_CLAIM_ATTEMPTS: u32 = 3;
 
-/// When a job fires.
+/// When a schedule fires.
 ///
 /// `Cron` is boxed because [`croner::Cron`] carries a parsed component table an order of magnitude
-/// larger than the other two variants, and a `Schedule` is cloned per poll tick.
+/// larger than the other two variants, and a `Timing` is cloned per poll tick.
 #[derive(Debug, Clone)]
-pub(crate) enum Schedule {
-    /// Fire once at an instant, then delete. Always absolute: see [`Schedule::parse_at`] for why a
+pub(crate) enum Timing {
+    /// Fire once at an instant, then delete. Always absolute: see [`Timing::parse_at`] for why a
     /// relative input is resolved at creation rather than stored as written.
     At(DateTime<Utc>),
     /// Fire repeatedly, this far apart.
     Every(Duration),
-    /// Fire on a 5-field cron pattern, read in the zone the job names, else the machine's.
+    /// Fire on a 5-field cron pattern, read in the zone the schedule names, else the machine's.
     Cron(Box<Cron>, Option<CronZone>),
 }
 
@@ -98,18 +98,18 @@ impl CronZone {
 }
 
 /// The machine's zone by its IANA name, for a surface that tells the model or a person what a
-/// cron job without a zone is read in; `None` where the system does not name it.
+/// cron schedule without a zone is read in; `None` where the system does not name it.
 pub(crate) fn machine_zone_name() -> Option<String> {
     jiff::tz::TimeZone::system().iana_name().map(str::to_string)
 }
 
-impl Schedule {
+impl Timing {
     /// Parse a one-shot time: either an RFC 3339 timestamp or a humantime duration relative to
     /// `now` (`"20m"`, `"2h"`, `"1h 30m"`).
     ///
     /// A relative input is resolved to an absolute instant here and stored that way. Keeping it
-    /// relative would be a job that never fires: every process restart would re-parse `"20m"` and
-    /// push the target twenty minutes further into the future.
+    /// relative would be a schedule that never fires: every process restart would re-parse `"20m"`
+    /// and push the target twenty minutes further into the future.
     pub(crate) fn parse_at(input: &str, now: DateTime<Utc>) -> Result<Self, String> {
         let input = input.trim();
         if let Ok(absolute) = DateTime::parse_from_rfc3339(input) {
@@ -146,9 +146,9 @@ impl Schedule {
     /// Parse a 5-field cron pattern, read in `zone`, else the machine's zone.
     ///
     /// Rejects a well-formed but unsatisfiable pattern like `0 0 30 2 *` (February 30th) at
-    /// creation, which is the only way to catch it instead of leaving a job that silently never
-    /// fires. croner reports its own search-limit error for those, so this only has to ask it for
-    /// one occurrence.
+    /// creation, which is the only way to catch it instead of leaving a schedule that silently
+    /// never fires. croner reports its own search-limit error for those, so this only has to ask it
+    /// for one occurrence.
     pub(crate) fn parse_cron(input: &str, zone: Option<CronZone>) -> Result<Self, String> {
         let input = input.trim();
         // Five fields, explicitly. `Cron::from_str` defaults to `Seconds::Optional`, so a six-field
@@ -165,19 +165,19 @@ impl Schedule {
             .build()
             .parse(input)
             .map_err(|error| format!("'{input}' is not a valid cron expression: {error}"))?;
-        let schedule = Self::Cron(Box::new(cron), zone);
-        if schedule.next_after(Utc::now()).is_none() {
+        let timing = Self::Cron(Box::new(cron), zone);
+        if timing.next_after(Utc::now()).is_none() {
             return Err(format!(
                 "cron expression '{input}' matches no calendar date"
             ));
         }
-        Ok(schedule)
+        Ok(timing)
     }
 
-    /// The schedule a request names: exactly one of `at`, `every` and `cron`, with `timezone`
+    /// The timing a request names: exactly one of `at`, `every` and `cron`, with `timezone`
     /// beside a cron pattern alone, since nothing else reads it. The one reading for every door
-    /// that creates a job. Ambiguity is refused rather than resolved by precedence: honoring one
-    /// and dropping the other would make a job fire on a schedule nobody asked for.
+    /// that creates a schedule. Ambiguity is refused rather than resolved by precedence: honoring
+    /// one and dropping the other would make a schedule fire on a timing nobody asked for.
     pub(crate) fn parse_request(
         at: Option<&str>,
         every: Option<&str>,
@@ -200,8 +200,7 @@ impl Schedule {
                 Self::parse_cron(value, zone.map(CronZone::resolve).transpose()?)
             }
             ([(key, _)], Some(_)) => Err(format!(
-                "`timezone` applies to a `cron` pattern alone; an `{key}` schedule does not read \
-                 one"
+                "`timezone` applies to a `cron` pattern alone; `{key}` does not read one"
             )),
             ([("at", value)], None) => Self::parse_at(value, now),
             ([(_, value)], None) => Self::parse_every(value),
@@ -209,7 +208,7 @@ impl Schedule {
                 Err("give one of `at` (once), `every` (interval), or `cron` (expression)".into())
             }
             (several, _) => Err(format!(
-                "give exactly one schedule, got {}",
+                "give exactly one of `at`, `every` and `cron`, got {}",
                 several
                     .iter()
                     .map(|(key, _)| format!("`{key}`"))
@@ -219,15 +218,15 @@ impl Schedule {
         }
     }
 
-    /// Rebuild a schedule from its persisted columns. The inverse of [`Schedule::kind_str`],
-    /// [`Schedule::spec`] and [`Schedule::timezone`].
+    /// Rebuild a timing from its persisted columns. The inverse of [`Timing::kind_str`],
+    /// [`Timing::spec`] and [`Timing::timezone`].
     pub(crate) fn from_stored(
         kind: &str,
         spec: &str,
         timezone: Option<&str>,
     ) -> Result<Self, String> {
         if timezone.is_some() && kind != "cron" {
-            return Err(format!("a stored '{kind}' schedule names a zone"));
+            return Err(format!("a stored '{kind}' timing names a zone"));
         }
         match kind {
             "at" => DateTime::parse_from_rfc3339(spec)
@@ -236,21 +235,21 @@ impl Schedule {
             "every" => Self::parse_every(spec),
             // Rehydrates through `parse_cron`, not `Cron::from_str`, so a stored spec is read back
             // under the same five-field grammar that accepted it. The permissive parser would read
-            // a six-field pattern's first field as seconds, giving a stored job a different meaning
-            // on reload than it had at creation. A spec that does not parse under those rules is
-            // surfaced as an error rather than silently reinterpreted.
+            // a six-field pattern's first field as seconds, giving a stored schedule a different
+            // meaning on reload than it had at creation. A spec that does not parse under those
+            // rules is surfaced as an error rather than silently reinterpreted.
             "cron" => timezone
                 .map(CronZone::resolve)
                 .transpose()
                 .and_then(|zone| Self::parse_cron(spec, zone))
                 .map_err(|error| format!("stored cron spec '{spec}' is invalid: {error}")),
-            other => Err(crate::text::unknown_name("schedule kind", other, [
+            other => Err(crate::text::unknown_name("timing kind", other, [
                 "at", "every", "cron",
             ])),
         }
     }
 
-    /// Discriminant as persisted in `scheduled_jobs.kind`.
+    /// Discriminant as persisted in `schedules.kind`.
     pub(crate) fn kind_str(&self) -> &'static str {
         match self {
             Self::At(_) => "at",
@@ -259,7 +258,7 @@ impl Schedule {
         }
     }
 
-    /// The zone a cron schedule names, as persisted in `scheduled_jobs.timezone`; `None` for one
+    /// The zone a cron timing names, as persisted in `schedules.timezone`; `None` for one
     /// read in the machine's zone and for every other kind.
     pub(crate) fn timezone(&self) -> Option<&str> {
         match self {
@@ -268,7 +267,7 @@ impl Schedule {
         }
     }
 
-    /// Round-trippable form as persisted in `scheduled_jobs.spec`.
+    /// Round-trippable form as persisted in `schedules.spec`.
     pub(crate) fn spec(&self) -> String {
         match self {
             Self::At(instant) => instant.to_rfc3339(),
@@ -277,7 +276,8 @@ impl Schedule {
         }
     }
 
-    /// Whether firing this schedule leaves a job to reschedule. One-shots are deleted on fire.
+    /// Whether firing on this timing leaves a schedule to reschedule. One-shots are deleted on
+    /// fire.
     pub(crate) fn is_recurring(&self) -> bool {
         !matches!(self, Self::At(_))
     }
@@ -285,15 +285,16 @@ impl Schedule {
     /// The occurrence to schedule after delivering the one at `delivered`, given the clock is now
     /// `now`.
     ///
-    /// This is what a firing job needs, and it is **not** `next_after(now)`. For `Every`, anchoring
-    /// on the current time adds the pickup latency to every interval, permanently: the scheduler
-    /// polls, notices a job is due some milliseconds late, and schedules the next one a full
-    /// interval from that moment rather than from the occurrence it just spent. At `poll_interval
-    /// = 1s` an `every = "1s"` job would run at 2.0s, half the requested rate, because the tick one
-    /// interval later lands microseconds early and the job loses a whole poll.
+    /// This is what a firing schedule needs, and it is **not** `next_after(now)`. For `Every`,
+    /// anchoring on the current time adds the pickup latency to every interval, permanently: the
+    /// scheduler polls, notices a schedule is due some milliseconds late, and schedules the next
+    /// one a full interval from that moment rather than from the occurrence it just spent. At
+    /// `poll_interval = 1s` an `every = "1s"` schedule would run at 2.0s, half the requested rate,
+    /// because the tick one interval later lands microseconds early and the schedule loses a whole
+    /// poll.
     ///
-    /// Advancing by whole intervals from `delivered` preserves the phase, so a job fires on the
-    /// grid it was created on however late any single pickup is. A backlog is skipped in one
+    /// Advancing by whole intervals from `delivered` preserves the phase, so a schedule fires on
+    /// the grid it was created on however late any single pickup is. A backlog is skipped in one
     /// multiplication rather than a loop, which matters after an outage: `occurrences_between`
     /// separately reports how many were coalesced.
     ///
@@ -310,9 +311,10 @@ impl Schedule {
                 let step = chrono::Duration::from_std(*interval).ok()?;
                 // Milliseconds, not seconds. `num_seconds` truncates, and `parse_every` accepts
                 // anything from 1s up while humantime parses `"1500ms"` and `"1s 500ms"`, which
-                // round-trip through `spec()`. With the interval truncated to 1s, a `1500ms` job
-                // would advance by whole seconds and walk off its own grid a little further on
-                // every fire, which is exactly the property this function exists to hold.
+                // round-trip through `spec()`. With the interval truncated to 1s, a `1500ms`
+                // schedule would advance by whole seconds and walk off its own grid a little
+                // further on every fire, which is exactly the property this function exists to
+                // hold.
                 let step_millis = step.num_milliseconds();
                 // A zero or negative interval has no grid to stay on; fall back rather than divide
                 // by zero.
@@ -336,11 +338,11 @@ impl Schedule {
     /// The first occurrence strictly after `anchor`, or `None` when there is no next occurrence
     /// (a one-shot whose instant has passed, or a cron pattern matching no upcoming date).
     ///
-    /// Callers must pass the job's own anchor (`last_fired_at` if it has ever fired, otherwise
+    /// Callers must pass the schedule's own anchor (`last_fired_at` if it has ever fired, otherwise
     /// `created_at`) and never `Utc::now()`. Anchoring on the current time makes a pinned pattern
     /// such as `30 14 27 2 *` skip to next year whenever the process happens to restart after its
-    /// window; anchoring permanently on `created_at` makes a long-lived job replay every occurrence
-    /// since it was created.
+    /// window; anchoring permanently on `created_at` makes a long-lived schedule replay every
+    /// occurrence since it was created.
     pub(crate) fn next_after(&self, anchor: DateTime<Utc>) -> Option<DateTime<Utc>> {
         match self {
             Self::At(instant) => (*instant > anchor).then_some(*instant),
@@ -349,10 +351,10 @@ impl Schedule {
                 anchor.checked_add_signed(interval)
             }
             Self::Cron(cron, zone) => {
-                // Cron patterns are wall-clock expressions: "0 9 * * *" means 09:00 in the job's
-                // zone, so the search runs there and the result converts back to the UTC Meka
-                // stores. A job naming no zone is read in the machine's, looked up now, so a
-                // machine that changes zone takes its jobs with it.
+                // Cron patterns are wall-clock expressions: "0 9 * * *" means 09:00 in the
+                // schedule's zone, so the search runs there and the result converts back to the UTC
+                // Meka stores. A schedule naming no zone is read in the machine's, looked up now,
+                // so a machine that changes zone takes its schedules with it.
                 let zone = zone
                     .as_ref()
                     .map_or_else(jiff::tz::TimeZone::system, |zone| zone.zone.clone());
@@ -365,8 +367,8 @@ impl Schedule {
                 // croner bounds its own forward search and reports a search-limit error for a
                 // pattern that matches no calendar date, so its verdict is the whole answer. An
                 // extra horizon here would be indistinguishable from that verdict at the call site,
-                // and `prepare` retires a job whose schedule has no next occurrence: a 366-day one
-                // would delete `0 0 29 2 *` the first time it fired, because the next February
+                // and `prepare` retires a schedule whose timing has no next occurrence: a 366-day
+                // one would delete `0 0 29 2 *` the first time it fired, because the next February
                 // 29th is up to four years out.
                 let next = cron.find_next_occurrence(&anchor, false).ok()?;
                 let next = next.timestamp();
@@ -395,36 +397,31 @@ impl Schedule {
     }
 }
 
-/// A persisted wakeup.
+/// A persisted schedule.
 #[derive(Debug, Clone)]
-pub(crate) struct ScheduledJob {
+pub(crate) struct Schedule {
     pub(crate) id: String,
     pub(crate) session_id: uuid::Uuid,
-    pub(crate) schedule: Schedule,
+    pub(crate) timing: Timing,
     pub(crate) prompt: String,
     pub(crate) gate: Option<Gate>,
     pub(crate) created_at: DateTime<Utc>,
     pub(crate) last_fired_at: Option<DateTime<Utc>>,
     pub(crate) next_fire_at: DateTime<Utc>,
-    /// Claims that ended without delivering the turn and without the *host* declining the job.
+    /// Claims that were never closed.
     ///
-    /// A claim raises it, and it is only cleared by an ending that says the job is fine. Two
-    /// endings do not: a host that dies or panics mid-delivery, and a job with no next occurrence
-    /// whose gate probe could not be evaluated, which keeps its lease so the retry waits out
+    /// A claim raises it, and closing one clears it: the fire queued, or the occurrence spent
+    /// without one. Two endings close nothing: a host that stops, or a store that refuses the
+    /// write, between the claim and the fire's write, and a schedule with no next occurrence whose
+    /// gate probe could not be evaluated, which keeps its lease so the retry waits out
     /// `claim_lease` rather than coming round on the next tick. Both leave an occurrence that
     /// nothing has spent, so something has to bound how often it is retried;
-    /// [`MAX_CLAIM_ATTEMPTS`] is where a job that keeps doing it stops being retried.
-    ///
-    /// A deferral does *not* raise it. That is a host saying "not me", which is a fact about the
-    /// host rather than the job, so [`crate::store::schedule::ScheduleStore::release_claim`]
-    /// resets the count. Nor does a fire the host owned and could not run for a cause of the
-    /// installation's (see [`Unrunnable::standing_reason`]):
-    /// [`crate::store::schedule::ScheduleStore::forgive_attempt`] forgives its claim's count.
+    /// [`MAX_CLAIM_ATTEMPTS`] is where a schedule that keeps doing it stops being retried.
     pub(crate) attempts: u32,
 }
 
-impl ScheduledJob {
-    /// The instant [`Schedule::next_after`] must be measured from for this job.
+impl Schedule {
+    /// The instant [`Timing::next_after`] must be measured from for this schedule.
     ///
     /// Exists so no call site has to remember the rule, because both ways of getting it wrong are
     /// silent: anchoring on `now` skips a pinned pattern to next year after an ill-timed restart,
@@ -438,42 +435,18 @@ impl ScheduledJob {
     pub(crate) fn short_id(&self) -> &str {
         self.id.get(..crate::text::ID_PREFIX).unwrap_or(&self.id)
     }
-
-    /// What should become of this job's prompt if the turn it triggers fails before the model ever
-    /// sees it.
-    ///
-    /// Defined once here rather than at each host, because every host has to answer it and the rule
-    /// is not obvious enough to restate three times. A recurring job produces the prompt again on
-    /// its next occurrence, so a failure withdrawing it costs nothing and spares the conversation
-    /// one unanswered message per fire through an outage. A one-shot does not: its row is retired
-    /// the moment the turn is delivered, so once a failed fire has been through `complete_claim`
-    /// the unanswered message is the last trace that the reminder ever existed, and withdrawing it
-    /// would be the deletion the feature is supposed to prevent.
-    ///
-    /// The row survives *during* the turn rather than being deleted before it, which is why the
-    /// reasoning is about the completion rather than the claim.
-    pub(crate) fn prompt_retention(&self) -> crate::conversation::PromptRetention {
-        match self.schedule.is_recurring() {
-            true => crate::conversation::PromptRetention::Withdraw,
-            false => crate::conversation::PromptRetention::Keep,
-        }
-    }
 }
 
-/// How many occurrences of `schedule` fall between `from` and `to`, capped at
+/// How many occurrences of `timing` fall between `from` and `to`, capped at
 /// [`MAX_COALESCED_REPORTED`].
-pub(crate) fn occurrences_between(
-    schedule: &Schedule,
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
-) -> u32 {
-    match schedule {
+pub(crate) fn occurrences_between(timing: &Timing, from: DateTime<Utc>, to: DateTime<Utc>) -> u32 {
+    match timing {
         // A one-shot has exactly the one occurrence, which is the fire being delivered.
-        Schedule::At(_) => 0,
-        Schedule::Every(interval) => {
+        Timing::At(_) => 0,
+        Timing::Every(interval) => {
             // Milliseconds, matching `next_after_delivering`: `as_secs` would truncate, so a
-            // `1500ms` job would count its coalesced occurrences against a 1s grid it does not run
-            // on.
+            // `1500ms` schedule would count its coalesced occurrences against a 1s grid it does not
+            // run on.
             let interval = interval.as_millis();
             if interval == 0 {
                 return 0;
@@ -483,13 +456,13 @@ pub(crate) fn occurrences_between(
                 .unwrap_or(MAX_COALESCED_REPORTED)
                 .min(MAX_COALESCED_REPORTED)
         }
-        Schedule::Cron(..) => {
+        Timing::Cron(..) => {
             // Counts occurrences in `(from, to]`, i.e. everything after the one being delivered,
             // matching the `Every` arm above, which divides the same open interval.
             let mut cursor = from;
             let mut count = 0;
             while count < MAX_COALESCED_REPORTED {
-                match schedule.next_after(cursor) {
+                match timing.next_after(cursor) {
                     Some(next) if next <= to => {
                         cursor = next;
                         count += 1;
@@ -515,7 +488,13 @@ fn parse_duration(input: &str) -> Result<Duration, humantime::DurationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{scheduler::*, store::schedule::*};
+    use crate::{
+        scheduler::*,
+        store::{
+            inbox::{InboxOrigin, InboxStore, QueuedFire},
+            schedule::*,
+        },
+    };
 
     pub(super) fn at(text: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(text)
@@ -526,27 +505,27 @@ mod tests {
     #[test]
     fn parse_at_accepts_rfc3339() {
         let now = at("2026-08-11T12:00:00Z");
-        let schedule = Schedule::parse_at("2026-08-12T09:30:00Z", now).expect("parses");
-        assert!(matches!(schedule, Schedule::At(instant) if instant == at("2026-08-12T09:30:00Z")));
+        let timing = Timing::parse_at("2026-08-12T09:30:00Z", now).expect("parses");
+        assert!(matches!(timing, Timing::At(instant) if instant == at("2026-08-12T09:30:00Z")));
     }
 
     /// A relative `at` must be resolved against `now` at parse time. Storing "20m" verbatim would
-    /// produce a job that re-bases itself on every restart and therefore never fires.
+    /// produce a schedule that re-bases itself on every restart and therefore never fires.
     #[test]
     fn parse_at_resolves_relative_input_to_an_absolute_instant() {
         let now = at("2026-08-11T12:00:00Z");
-        let schedule = Schedule::parse_at("20m", now).expect("parses");
-        assert!(matches!(schedule, Schedule::At(instant) if instant == at("2026-08-11T12:20:00Z")));
-        assert_eq!(schedule.spec(), at("2026-08-11T12:20:00Z").to_rfc3339());
+        let timing = Timing::parse_at("20m", now).expect("parses");
+        assert!(matches!(timing, Timing::At(instant) if instant == at("2026-08-11T12:20:00Z")));
+        assert_eq!(timing.spec(), at("2026-08-11T12:20:00Z").to_rfc3339());
     }
 
     #[test]
     fn parse_at_rejects_nonsense() {
         let now = at("2026-08-11T12:00:00Z");
-        assert!(Schedule::parse_at("next tuesday", now).is_err());
-        assert!(Schedule::parse_at("", now).is_err());
+        assert!(Timing::parse_at("next tuesday", now).is_err());
+        assert!(Timing::parse_at("", now).is_err());
         assert!(
-            Schedule::parse_at("2026-08-12", now).is_err(),
+            Timing::parse_at("2026-08-12", now).is_err(),
             "a bare date is not RFC 3339 and is not a duration either"
         );
     }
@@ -556,38 +535,36 @@ mod tests {
     /// in the system would notice.
     #[test]
     fn duration_units_distinguish_minutes_from_months() {
-        let minutes = Schedule::parse_every("30m").expect("parses");
-        let months = Schedule::parse_every("30M").expect("parses");
+        let minutes = Timing::parse_every("30m").expect("parses");
+        let months = Timing::parse_every("30M").expect("parses");
         assert!(
-            matches!(minutes, Schedule::Every(interval) if interval == Duration::from_secs(1800))
+            matches!(minutes, Timing::Every(interval) if interval == Duration::from_secs(1800))
         );
         assert!(
-            matches!(months, Schedule::Every(interval) if interval > Duration::from_secs(60 * 60 * 24 * 365))
+            matches!(months, Timing::Every(interval) if interval > Duration::from_secs(60 * 60 * 24 * 365))
         );
     }
 
     #[test]
     fn parse_every_rejects_sub_minimum_intervals() {
-        // A zero interval yields a next-fire that is already in the past, so the job would fire on
-        // every poll tick forever.
-        assert!(Schedule::parse_every("0s").is_err());
-        assert!(Schedule::parse_every("1s").is_ok());
+        // A zero interval yields a next-fire that is already in the past, so the schedule would
+        // fire on every poll tick forever.
+        assert!(Timing::parse_every("0s").is_err());
+        assert!(Timing::parse_every("1s").is_ok());
     }
 
     #[test]
     fn parse_every_reads_m_as_minutes() {
-        let schedule = Schedule::parse_every("30m").expect("parses");
-        assert!(
-            matches!(schedule, Schedule::Every(interval) if interval == Duration::from_secs(1800))
-        );
+        let timing = Timing::parse_every("30m").expect("parses");
+        assert!(matches!(timing, Timing::Every(interval) if interval == Duration::from_secs(1800)));
     }
 
     #[test]
     fn parse_cron_accepts_five_fields() {
         // The reason croner is used over the `cron` crate: `cron` demands a seconds field, so the
         // five-field expressions users and models actually write would fail to parse.
-        assert!(Schedule::parse_cron("0 9 * * 1-5", None).is_ok());
-        assert!(Schedule::parse_cron("*/5 * * * *", None).is_ok());
+        assert!(Timing::parse_cron("0 9 * * 1-5", None).is_ok());
+        assert!(Timing::parse_cron("*/5 * * * *", None).is_ok());
     }
 
     /// The five-field rule has to reach the rows already on disk, which is the only population it
@@ -596,17 +573,17 @@ mod tests {
     #[test]
     fn a_stored_cron_spec_is_read_with_the_same_grammar_it_was_created_under() {
         assert!(
-            Schedule::parse_cron("*/10 * * * * *", None).is_err(),
+            Timing::parse_cron("*/10 * * * * *", None).is_err(),
             "six fields are refused at creation"
         );
         assert!(
-            Schedule::from_stored("cron", "*/10 * * * * *", None).is_err(),
+            Timing::from_stored("cron", "*/10 * * * * *", None).is_err(),
             "and refused on the way back out of the database"
         );
 
         // A legitimate five-field row still round-trips.
         let stored =
-            Schedule::from_stored("cron", "0 9 * * 1-5", None).expect("five fields still load");
+            Timing::from_stored("cron", "0 9 * * 1-5", None).expect("five fields still load");
         assert_eq!(stored.spec(), "0 9 * * 1-5");
     }
 
@@ -614,7 +591,7 @@ mod tests {
     /// midnight UTC.
     #[test]
     fn a_cron_pattern_is_read_in_the_zone_it_names() {
-        let schedule = Schedule::parse_request(
+        let timing = Timing::parse_request(
             None,
             None,
             Some("0 9 * * *"),
@@ -623,18 +600,18 @@ mod tests {
         )
         .expect("parses");
         assert_eq!(
-            schedule.next_after(at("2025-12-31T23:30:00Z")),
+            timing.next_after(at("2025-12-31T23:30:00Z")),
             Some(at("2026-01-01T00:00:00Z"))
         );
-        assert_eq!(schedule.timezone(), Some("Asia/Tokyo"));
-        assert_eq!(schedule.describe(), "0 9 * * * in Asia/Tokyo");
+        assert_eq!(timing.timezone(), Some("Asia/Tokyo"));
+        assert_eq!(timing.describe(), "0 9 * * * in Asia/Tokyo");
     }
 
-    /// The zone's own rules decide the instant, so a job at 09:00 in New York fires at 09:00
+    /// The zone's own rules decide the instant, so a schedule at 09:00 in New York fires at 09:00
     /// local on both sides of the spring change, which is 14:00 UTC before it and 13:00 after.
     #[test]
     fn a_named_zone_keeps_its_wall_clock_across_daylight_saving() {
-        let schedule = Schedule::parse_request(
+        let timing = Timing::parse_request(
             None,
             None,
             Some("0 9 * * *"),
@@ -643,11 +620,11 @@ mod tests {
         )
         .expect("parses");
         assert_eq!(
-            schedule.next_after(at("2026-03-07T12:00:00Z")),
+            timing.next_after(at("2026-03-07T12:00:00Z")),
             Some(at("2026-03-07T14:00:00Z"))
         );
         assert_eq!(
-            schedule.next_after(at("2026-03-07T15:00:00Z")),
+            timing.next_after(at("2026-03-07T15:00:00Z")),
             Some(at("2026-03-08T13:00:00Z"))
         );
     }
@@ -657,41 +634,40 @@ mod tests {
     #[test]
     fn a_zone_is_refused_where_it_would_do_nothing_or_names_nothing() {
         let now = at("2026-01-01T00:00:00Z");
-        let refused = Schedule::parse_request(Some("20m"), None, None, Some("UTC"), now)
+        let refused = Timing::parse_request(Some("20m"), None, None, Some("UTC"), now)
             .expect_err("an `at` reads no zone");
         assert!(
             refused.contains("`timezone`") && refused.contains("`at`"),
             "{refused}"
         );
-        assert!(Schedule::parse_request(None, Some("1h"), None, Some("UTC"), now).is_err());
+        assert!(Timing::parse_request(None, Some("1h"), None, Some("UTC"), now).is_err());
         let unknown =
-            Schedule::parse_request(None, None, Some("0 9 * * *"), Some("Mars/Olympus"), now)
+            Timing::parse_request(None, None, Some("0 9 * * *"), Some("Mars/Olympus"), now)
                 .expect_err("not a zone");
         assert!(unknown.contains("'Mars/Olympus'"), "{unknown}");
-        let blank = Schedule::parse_request(None, None, Some("0 9 * * *"), Some("  "), now)
+        let blank = Timing::parse_request(None, None, Some("0 9 * * *"), Some("  "), now)
             .expect("a blank zone is not given");
         assert_eq!(blank.timezone(), None);
     }
 
     /// A stored zone reads back as it was written, and a zone stored beside anything but a cron
-    /// pattern is a damaged row rather than a job.
+    /// pattern is a damaged row rather than a schedule.
     #[test]
     fn a_stored_zone_round_trips_and_belongs_to_cron_alone() {
         let stored =
-            Schedule::from_stored("cron", "0 9 * * 1-5", Some("Europe/Berlin")).expect("loads");
+            Timing::from_stored("cron", "0 9 * * 1-5", Some("Europe/Berlin")).expect("loads");
         assert_eq!(stored.timezone(), Some("Europe/Berlin"));
-        assert!(Schedule::from_stored("every", "1h", Some("Europe/Berlin")).is_err());
+        assert!(Timing::from_stored("every", "1h", Some("Europe/Berlin")).is_err());
     }
 
     /// `5/5` starts at minute 5 and steps from there, where croner's strict default refuses it. A
     /// row written under the lenient grammar has to keep loading, and reading the `5` as `*` would
-    /// move the job onto a grid nobody asked for.
+    /// move the schedule onto a grid nobody asked for.
     #[test]
     fn a_step_after_a_bare_number_starts_the_range_there() {
         use chrono::{TimeZone, Timelike};
 
-        let schedule =
-            Schedule::from_stored("cron", "5/5 * * * *", None).expect("the lenient grammar");
+        let timing = Timing::from_stored("cron", "5/5 * * * *", None).expect("the lenient grammar");
         // Anchored in local time, the clock cron reads, so the host's offset cannot move the
         // minute.
         let anchor = chrono::Local
@@ -699,7 +675,7 @@ mod tests {
             .single()
             .expect("anchor")
             .with_timezone(&Utc);
-        let next = schedule
+        let next = timing
             .next_after(anchor)
             .expect("has a next occurrence")
             .with_timezone(&chrono::Local);
@@ -708,24 +684,24 @@ mod tests {
 
     #[test]
     fn parse_cron_rejects_unsatisfiable_pattern() {
-        // Well-formed but matches no calendar date; caught at creation rather than leaving a job
-        // that silently never fires.
-        assert!(Schedule::parse_cron("0 0 30 2 *", None).is_err());
+        // Well-formed but matches no calendar date; caught at creation rather than leaving a
+        // schedule that silently never fires.
+        assert!(Timing::parse_cron("0 0 30 2 *", None).is_err());
     }
 
-    /// A pattern whose next occurrence is years away is satisfiable, and `prepare` retires a job
-    /// whose schedule has no next occurrence, so `next_after` must not confuse "far off" with
-    /// "never". February 29th is the shortest such case at up to four years.
+    /// A pattern whose next occurrence is years away is satisfiable, and `prepare` retires a
+    /// schedule whose timing has no next occurrence, so `next_after` must not confuse "far off"
+    /// with "never". February 29th is the shortest such case at up to four years.
     #[test]
-    fn a_schedule_whose_next_occurrence_is_years_away_still_has_one() {
+    fn a_timing_whose_next_occurrence_is_years_away_still_has_one() {
         use chrono::TimeZone;
 
-        let schedule = Schedule::parse_cron("0 0 29 2 *", None).expect("Feb 29 is a real date");
+        let timing = Timing::parse_cron("0 0 29 2 *", None).expect("Feb 29 is a real date");
         let anchor = Utc
             .with_ymd_and_hms(2026, 8, 16, 12, 0, 0)
             .single()
             .expect("anchor");
-        let next = schedule
+        let next = timing
             .next_after(anchor)
             .expect("a leap day must not read as an unschedulable pattern");
         assert!(next > anchor + chrono::Duration::days(366), "{next}");
@@ -733,51 +709,48 @@ mod tests {
 
     #[test]
     fn parse_cron_rejects_malformed_pattern() {
-        assert!(Schedule::parse_cron("not a cron", None).is_err());
-        assert!(Schedule::parse_cron("99 * * * *", None).is_err());
+        assert!(Timing::parse_cron("not a cron", None).is_err());
+        assert!(Timing::parse_cron("99 * * * *", None).is_err());
     }
 
     #[test]
     fn next_after_at_fires_once_then_never() {
         let instant = at("2026-08-12T09:00:00Z");
-        let schedule = Schedule::At(instant);
-        assert_eq!(
-            schedule.next_after(at("2026-08-11T12:00:00Z")),
-            Some(instant)
-        );
+        let timing = Timing::At(instant);
+        assert_eq!(timing.next_after(at("2026-08-11T12:00:00Z")), Some(instant));
         // Anchored at or past its own instant, a one-shot has no next occurrence.
-        assert_eq!(schedule.next_after(instant), None);
-        assert_eq!(schedule.next_after(at("2026-08-13T00:00:00Z")), None);
+        assert_eq!(timing.next_after(instant), None);
+        assert_eq!(timing.next_after(at("2026-08-13T00:00:00Z")), None);
     }
 
     #[test]
     fn next_after_every_advances_one_interval_from_the_anchor() {
-        let schedule = Schedule::parse_every("30m").expect("parses");
+        let timing = Timing::parse_every("30m").expect("parses");
         assert_eq!(
-            schedule.next_after(at("2026-08-11T12:00:00Z")),
+            timing.next_after(at("2026-08-11T12:00:00Z")),
             Some(at("2026-08-11T12:30:00Z"))
         );
     }
 
-    /// The anchoring rule, stated as a test: a job that last fired ten days ago yields exactly one
-    /// next fire, not ten. Coalescing missed occurrences is the scheduler's job, but it depends on
-    /// `next_after` returning a single instant rather than a backlog.
+    /// The anchoring rule, stated as a test: a schedule that last fired ten days ago yields exactly
+    /// one next fire, not ten. Coalescing missed occurrences is the scheduler's job, but it depends
+    /// on `next_after` returning a single instant rather than a backlog.
     #[test]
     fn next_after_every_yields_one_occurrence_from_a_stale_anchor() {
-        let schedule = Schedule::parse_every("1h").expect("parses");
+        let timing = Timing::parse_every("1h").expect("parses");
         let stale = at("2026-08-01T12:00:00Z");
-        assert_eq!(schedule.next_after(stale), Some(at("2026-08-01T13:00:00Z")));
+        assert_eq!(timing.next_after(stale), Some(at("2026-08-01T13:00:00Z")));
     }
 
     #[test]
-    fn schedule_round_trips_through_stored_columns() {
+    fn timing_round_trips_through_stored_columns() {
         for original in [
-            Schedule::parse_at("2026-08-12T09:30:00Z", at("2026-08-11T12:00:00Z")).expect("parses"),
-            Schedule::parse_every("45m").expect("parses"),
-            Schedule::parse_cron("0 9 * * 1-5", None).expect("parses"),
+            Timing::parse_at("2026-08-12T09:30:00Z", at("2026-08-11T12:00:00Z")).expect("parses"),
+            Timing::parse_every("45m").expect("parses"),
+            Timing::parse_cron("0 9 * * 1-5", None).expect("parses"),
         ] {
             let restored =
-                Schedule::from_stored(original.kind_str(), &original.spec(), original.timezone())
+                Timing::from_stored(original.kind_str(), &original.spec(), original.timezone())
                     .expect("stored form parses back");
             assert_eq!(restored.kind_str(), original.kind_str());
             assert_eq!(restored.spec(), original.spec());
@@ -786,7 +759,7 @@ mod tests {
 
     #[test]
     fn from_stored_rejects_unknown_kind() {
-        assert!(Schedule::from_stored("on-exit", "make build", None).is_err());
+        assert!(Timing::from_stored("on-exit", "make build", None).is_err());
     }
 
     /// A gate command that creates `path`, in whichever shell the host will run it under.
@@ -997,8 +970,8 @@ mod tests {
     /// Count the `warn!` lines a block emits, so "said once, not once per tick" is testable.
     ///
     /// The suppression this guards is about log volume, and log volume has no other observable:
-    /// the job's state after a sweep is identical whether the line was written or not. Capturing
-    /// the output is the only way to tell a fix from a no-op here.
+    /// the schedule's state after a sweep is identical whether the line was written or not.
+    /// Capturing the output is the only way to tell a fix from a no-op here.
     ///
     /// `#[tokio::test]` is single-threaded, so `body` is polled on the thread that owns the
     /// capture throughout.
@@ -1011,20 +984,20 @@ mod tests {
         logs.logged().matches("not fired:").count()
     }
 
-    /// A held job says so once, not once per poll interval, including a one-shot.
+    /// A held schedule says so once, not once per poll interval, including a one-shot.
     ///
     /// Retiring a one-shot must not clear its held-back state on the reasoning that the row is
     /// gone: an authority refusal puts the row back, so a clear that ran before the refusal on
     /// every sweep would make the "first time" check true every time, and a held one-shot would
     /// warn every 10 seconds for up to the whole `missed_grace` window.
     #[tokio::test]
-    async fn a_held_job_warns_once_not_once_per_sweep() {
-        for (label, schedule) in [
+    async fn a_held_schedule_warns_once_not_once_per_sweep() {
+        for (label, timing) in [
             (
                 "one-shot",
-                Schedule::At(Utc::now() - chrono::Duration::minutes(1)),
+                Timing::At(Utc::now() - chrono::Duration::minutes(1)),
             ),
-            ("recurring", Schedule::parse_every("1h").expect("parses")),
+            ("recurring", Timing::parse_every("1h").expect("parses")),
         ] {
             let harness = SchedulerHarness::new().await;
             harness
@@ -1036,8 +1009,8 @@ mod tests {
                 .await
                 .expect("record the level the session was set to");
             harness
-                .overdue_job(
-                    schedule,
+                .overdue_schedule(
+                    timing,
                     Some(gate("true", GatePredicate::Succeeded, None)),
                     chrono::Duration::minutes(5),
                 )
@@ -1082,18 +1055,19 @@ mod tests {
         }
     }
 
-    /// Canceling a job that is already gone reports a miss, not a cancellation.
+    /// Canceling a schedule that is already gone reports a miss, not a cancellation.
     ///
     /// Both cancel doors resolve an id from a listing and then delete it, and a scheduler sweep can
     /// retire the row in between: a one-shot's occurrence retires it, and deleting a session takes
-    /// its jobs through the foreign key. Reporting success regardless would say "Canceled job
-    /// abc12345" about a job this call did not cancel, in the same words it uses when it did.
+    /// its schedules through the foreign key. Reporting success regardless would say "Canceled
+    /// schedule abc12345" about a schedule this call did not cancel, in the same words it uses when
+    /// it did.
     #[tokio::test]
-    async fn deleting_a_job_that_is_already_gone_reports_that_it_removed_nothing() {
+    async fn deleting_a_schedule_that_is_already_gone_reports_that_it_removed_nothing() {
         let harness = SchedulerHarness::new().await;
-        let job = harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+        let schedule = harness
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 None,
                 chrono::Duration::minutes(5),
             )
@@ -1102,16 +1076,18 @@ mod tests {
 
         assert!(
             store
-                .delete_scheduled_job(&job.id)
+                .delete_schedule(&schedule.id)
                 .await
-                .expect("the delete runs"),
+                .expect("the delete runs")
+                .is_some(),
             "the row was there, so this call is the one that removed it"
         );
         assert!(
-            !store
-                .delete_scheduled_job(&job.id)
+            store
+                .delete_schedule(&schedule.id)
                 .await
-                .expect("the delete runs"),
+                .expect("the delete runs")
+                .is_none(),
             "nothing was removed the second time, and saying otherwise is a claim about work that \
              did not happen"
         );
@@ -1119,7 +1095,7 @@ mod tests {
             harness
                 .manager
                 .schedule_store()
-                .cancel_scheduled_job(harness.session_id, job.short_id())
+                .cancel_schedule(harness.session_id, schedule.short_id())
                 .await
                 .expect("the cancel runs"),
             None,
@@ -1200,47 +1176,6 @@ mod tests {
         .expect("gate ran");
         assert!(outcome.fired);
         assert_eq!(outcome.output, "ready");
-    }
-
-    /// A gate runs in its session's directory, not the host process's.
-    ///
-    /// A parked job stays in the table on purpose, so "a row is due" and "something will run" are
-    /// different questions. Asking the first one would let a job at `MAX_CLAIM_ATTEMPTS`
-    /// interrupt the prompt every poll interval, forever, to run nothing.
-    #[test]
-    fn a_wake_is_only_worth_it_for_a_job_that_can_still_run() {
-        let mine = uuid::Uuid::new_v4();
-        let theirs = uuid::Uuid::new_v4();
-        let job = |session_id, attempts| ScheduledJob {
-            id: "j".to_string(),
-            session_id,
-            schedule: Schedule::At(Utc::now()),
-            prompt: "p".to_string(),
-            gate: None,
-            created_at: Utc::now(),
-            last_fired_at: None,
-            next_fire_at: Utc::now(),
-            attempts,
-        };
-
-        assert!(has_runnable_job(&[job(mine, 0)], mine));
-        assert!(
-            has_runnable_job(&[job(mine, MAX_CLAIM_ATTEMPTS - 1)], mine),
-            "one attempt short of parked is still runnable",
-        );
-        assert!(
-            !has_runnable_job(&[job(mine, MAX_CLAIM_ATTEMPTS)], mine),
-            "a parked job must not wake the prompt",
-        );
-        assert!(
-            !has_runnable_job(&[job(theirs, 0)], mine),
-            "another session's job is not this prompt's business",
-        );
-        assert!(!has_runnable_job(&[], mine));
-        assert!(
-            has_runnable_job(&[job(mine, MAX_CLAIM_ATTEMPTS), job(mine, 0)], mine),
-            "one runnable job among parked ones is enough",
-        );
     }
 
     /// A non-zero exit is how several perfectly good `changed` gates signal a change: `diff -q`
@@ -1336,13 +1271,38 @@ mod tests {
 
     // --- scheduler ---
 
-    /// What a fire delivered, in the shape the assertions care about.
+    /// What a fire queued, in the shape the assertions care about, read off the item the sweep
+    /// wrote.
     #[derive(Debug, Clone)]
     struct FiredRecord {
-        job_id: String,
+        schedule_id: String,
         coalesced: u32,
         gate_output: Option<String>,
         late_by: chrono::Duration,
+    }
+
+    /// Record the fire a sweep was told it queued, as the item it wrote reads.
+    async fn record_fire(
+        fired: std::sync::Arc<std::sync::Mutex<Vec<FiredRecord>>>,
+        inbox: InboxStore,
+        schedule: Schedule,
+        queued: QueuedFire,
+    ) {
+        let item = inbox
+            .get(queued.item_id)
+            .await
+            .expect("read the fire")
+            .expect("the fire is in the inbox");
+        let InboxOrigin::Fire(fire) = item.origin else {
+            panic!("not a fire: {item:?}");
+        };
+        assert_eq!(fire.schedule_id, schedule.id, "the fire is its schedule's");
+        crate::sync::lock(&fired).push(FiredRecord {
+            schedule_id: fire.schedule_id,
+            coalesced: fire.occurrences - 1,
+            gate_output: fire.gate_output,
+            late_by: fire.fired_at - fire.due_at,
+        });
     }
 
     struct SchedulerHarness {
@@ -1391,37 +1351,36 @@ mod tests {
             session_id
         }
 
-        /// A second session in the same database, at `unrestricted`, for the per-session budget
-        /// tests.
+        /// A second session in the same database, at `unrestricted`.
         async fn another_session(&self) -> uuid::Uuid {
             Self::session_at(&self.manager, crate::permission::Permission::Unrestricted).await
         }
 
-        /// Insert a job already overdue by `overdue`.
-        async fn overdue_job(
+        /// Insert a schedule already overdue by `overdue`.
+        async fn overdue_schedule(
             &self,
-            schedule: Schedule,
+            timing: Timing,
             gate: Option<Gate>,
             overdue: chrono::Duration,
-        ) -> ScheduledJob {
-            self.overdue_job_in(self.session_id, schedule, gate, overdue)
+        ) -> Schedule {
+            self.overdue_schedule_in(self.session_id, timing, gate, overdue)
                 .await
         }
 
         /// Same, against an explicit session.
-        async fn overdue_job_in(
+        async fn overdue_schedule_in(
             &self,
             session_id: uuid::Uuid,
-            schedule: Schedule,
+            timing: Timing,
             gate: Option<Gate>,
             overdue: chrono::Duration,
-        ) -> ScheduledJob {
+        ) -> Schedule {
             let now = Utc::now();
-            let job = ScheduledJob {
+            let schedule = Schedule {
                 attempts: 0,
                 id: uuid::Uuid::new_v4().to_string(),
                 session_id,
-                schedule,
+                timing,
                 prompt: "do the thing".to_string(),
                 gate,
                 created_at: now - overdue - chrono::Duration::seconds(1),
@@ -1430,14 +1389,14 @@ mod tests {
             };
             self.manager
                 .schedule_store()
-                .create_scheduled_job(&job, usize::MAX)
+                .create_schedule(&schedule, usize::MAX)
                 .await
-                .expect("create job");
-            job
+                .expect("create schedule");
+            schedule
         }
 
-        /// Drag a job back to a moment ago, so the next sweep considers it again without waiting
-        /// out its interval.
+        /// Drag a schedule back to a moment ago, so the next sweep considers it again without
+        /// waiting out its interval.
         async fn overdue_now(&self, id: &str) {
             let id = id.to_string();
             let due = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
@@ -1446,7 +1405,7 @@ mod tests {
                 .connection
                 .call(move |connection| {
                     connection.execute(
-                        "UPDATE scheduled_jobs SET next_fire_at = ?2 WHERE id = ?1",
+                        "UPDATE schedules SET next_fire_at = ?2 WHERE id = ?1",
                         rusqlite::params![id, due],
                     )
                 })
@@ -1467,7 +1426,7 @@ mod tests {
                 .connection
                 .call(move |connection| {
                     connection.execute(
-                        "UPDATE scheduled_jobs SET gate_spec_json = ?2 WHERE id = ?1",
+                        "UPDATE schedules SET gate_spec_json = ?2 WHERE id = ?1",
                         rusqlite::params![id, spec],
                     )
                 })
@@ -1487,54 +1446,37 @@ mod tests {
             tools: Option<std::sync::Arc<dyn GateTools>>,
         ) {
             let fired = self.fired.clone();
+            let inbox = self.manager.inbox_store();
             run_due(
                 &self.manager,
                 &config,
                 tools.as_deref(),
                 &NoResidents,
-                &SchedulerScope::every_job(),
-                &move |wakeup: Wakeup| {
-                    let fired = fired.clone();
-                    async move {
-                        if let Ok(mut guard) = fired.lock() {
-                            guard.push(FiredRecord {
-                                job_id: wakeup.job.id.clone(),
-                                coalesced: wakeup.coalesced,
-                                gate_output: wakeup.gate_output.clone(),
-                                late_by: wakeup.late_by,
-                            });
-                        }
-                        FireOutcome::Ran
-                    }
+                &SchedulerScope::every_schedule(),
+                &move |schedule: Schedule, queued: QueuedFire| {
+                    record_fire(fired.clone(), inbox.clone(), schedule, queued)
                 },
             )
             .await
             .expect("tick runs");
         }
 
-        /// One sweep whose every fire takes `delay`, for the tests about what a long sweep does to
-        /// the jobs behind it.
+        /// One sweep whose callback takes `delay` for every fire it is told of, standing in for a
+        /// gate, for the tests about what a long sweep does to the schedules behind it.
         async fn tick_slowly(&self, delay: Duration) {
             let fired = self.fired.clone();
+            let inbox = self.manager.inbox_store();
             run_due(
                 &self.manager,
                 &self.config,
                 None,
                 &NoResidents,
-                &SchedulerScope::every_job(),
-                &move |wakeup: Wakeup| {
-                    let fired = fired.clone();
+                &SchedulerScope::every_schedule(),
+                &move |schedule: Schedule, queued: QueuedFire| {
+                    let recorded = record_fire(fired.clone(), inbox.clone(), schedule, queued);
                     async move {
                         tokio::time::sleep(delay).await;
-                        if let Ok(mut guard) = fired.lock() {
-                            guard.push(FiredRecord {
-                                job_id: wakeup.job.id.clone(),
-                                coalesced: wakeup.coalesced,
-                                gate_output: wakeup.gate_output.clone(),
-                                late_by: wakeup.late_by,
-                            });
-                        }
-                        FireOutcome::Ran
+                        recorded.await;
                     }
                 },
             )
@@ -1549,12 +1491,12 @@ mod tests {
                 .unwrap_or_default()
         }
 
-        async fn jobs(&self) -> Vec<ScheduledJob> {
+        async fn schedules(&self) -> Vec<Schedule> {
             self.manager
                 .schedule_store()
-                .list_scheduled_jobs(self.session_id)
+                .list_schedules(self.session_id)
                 .await
-                .expect("list jobs")
+                .expect("list schedules")
         }
     }
 
@@ -1562,15 +1504,15 @@ mod tests {
     ///
     /// `schedule_cancel {"id": ""}` is a tool call, and `require_str` accepts an empty string, so
     /// this is reachable without a user typing anything. `"".starts_with` is true of every id, so
-    /// without the guard it would resolve to whichever job was alone and destroy the agent's own
-    /// reminder, reporting success, and only start to error once a second job existed.
+    /// without the guard it would resolve to whichever schedule was alone and destroy the agent's
+    /// own reminder, reporting success, and only start to error once a second schedule existed.
     #[tokio::test]
-    async fn canceling_an_empty_prefix_destroys_no_job() {
+    async fn canceling_an_empty_prefix_destroys_no_schedule() {
         let harness = SchedulerHarness::new().await;
-        let job = harness
-            .overdue_job_in(
+        let schedule = harness
+            .overdue_schedule_in(
                 harness.session_id,
-                Schedule::parse_every("1h").expect("parses"),
+                Timing::parse_every("1h").expect("parses"),
                 None,
                 chrono::Duration::seconds(1),
             )
@@ -1580,22 +1522,22 @@ mod tests {
             harness
                 .manager
                 .schedule_store()
-                .cancel_scheduled_job(harness.session_id, "")
+                .cancel_schedule(harness.session_id, "")
                 .await
                 .expect("an empty prefix is a miss, not an error")
                 .is_none(),
-            "an empty prefix must name no job"
+            "an empty prefix must name no schedule"
         );
         assert_eq!(
             harness
                 .manager
                 .schedule_store()
-                .list_scheduled_jobs(harness.session_id)
+                .list_schedules(harness.session_id)
                 .await
                 .expect("list")
                 .len(),
             1,
-            "and the job must survive it"
+            "and the schedule must survive it"
         );
 
         // The same id, typed as it was printed, still cancels.
@@ -1603,25 +1545,27 @@ mod tests {
             harness
                 .manager
                 .schedule_store()
-                .cancel_scheduled_job(harness.session_id, &job.id[..8])
+                .cancel_schedule(harness.session_id, &schedule.id[..8])
                 .await
-                .expect("cancel"),
-            Some(job.id),
+                .expect("cancel")
+                .map(|canceled| canceled.id),
+            Some(schedule.id),
             "a real prefix is unaffected by the guard"
         );
     }
 
-    /// Every field a job carries survives the write and the read back.
+    /// Every field a schedule carries survives the write and the read back.
     ///
-    /// `ScheduledJobRow` addresses columns by position, so the `INSERT`, the three `SELECT` lists
+    /// `ScheduleRow` addresses columns by position, so the `INSERT`, the three `SELECT` lists
     /// and the decoder have to agree on an ordering that is written out four times and checked
     /// nowhere. A field asserted here is one an index shift cannot move silently: the timestamps
-    /// stop parsing, and the gate and the schedule come back as something else.
+    /// stop parsing, and the gate and the timing come back as something else.
     ///
-    /// Both an ungated and a gated job, because the gate occupies four consecutive columns in the
-    /// middle of the row and a shift that starts after them is invisible to a job that has none.
+    /// Both an ungated and a gated schedule, because the gate occupies four consecutive columns in
+    /// the middle of the row and a shift that starts after them is invisible to a schedule that has
+    /// none.
     #[tokio::test]
-    async fn every_field_of_a_job_survives_the_round_trip() {
+    async fn every_field_of_a_schedule_survives_the_round_trip() {
         let harness = SchedulerHarness::new().await;
         // Fixed rather than `Utc::now()`: the store round-trips through RFC 3339, so a wall-clock
         // instant would make this assert the precision of that format rather than the ordering of
@@ -1643,11 +1587,11 @@ mod tests {
         };
 
         for (label, gate) in [("ungated", None), ("gated", Some(gate))] {
-            let written = ScheduledJob {
+            let written = Schedule {
                 attempts: 2,
                 id: uuid::Uuid::new_v4().to_string(),
                 session_id: harness.session_id,
-                schedule: Schedule::parse_every("90m").expect("parses"),
+                timing: Timing::parse_every("90m").expect("parses"),
                 prompt: "check the feed".to_string(),
                 gate,
                 created_at: now,
@@ -1657,26 +1601,22 @@ mod tests {
             harness
                 .manager
                 .schedule_store()
-                .create_scheduled_job(&written, usize::MAX)
+                .create_schedule(&written, usize::MAX)
                 .await
                 .expect("write");
 
             let read = harness
                 .manager
                 .schedule_store()
-                .list_scheduled_jobs(harness.session_id)
+                .list_schedules(harness.session_id)
                 .await
                 .expect("read back")
                 .into_iter()
-                .find(|job| job.id == written.id)
-                .unwrap_or_else(|| panic!("{label}: the job is not there"));
+                .find(|schedule| schedule.id == written.id)
+                .unwrap_or_else(|| panic!("{label}: the schedule is not there"));
 
             assert_eq!(read.session_id, written.session_id, "{label}: session");
-            assert_eq!(
-                read.schedule.spec(),
-                written.schedule.spec(),
-                "{label}: schedule"
-            );
+            assert_eq!(read.timing.spec(), written.timing.spec(), "{label}: timing");
             assert_eq!(read.prompt, written.prompt, "{label}: prompt");
             assert_eq!(
                 read.gate.as_ref().map(|gate| gate.spec()),
@@ -1705,20 +1645,20 @@ mod tests {
                 read.next_fire_at, written.next_fire_at,
                 "{label}: next_fire_at"
             );
-            // Not written by `create_scheduled_job`, which is itself the point: the column has a
+            // Not written by `create_schedule`, which is itself the point: the column has a
             // default and sits at the end of the row, so a shift lands here first.
             assert_eq!(read.attempts, 0, "{label}: attempts starts unclaimed");
         }
     }
 
-    /// The headline missed-job rule: an outage does not become a burst. A 30-second job that was
-    /// due six hours ago has 720 missed occurrences, and must produce exactly one turn.
+    /// The headline missed-schedule rule: an outage does not become a burst. A 30-second schedule
+    /// that was due six hours ago has 720 missed occurrences, and must produce exactly one turn.
     #[tokio::test]
     async fn a_long_outage_coalesces_into_a_single_fire() {
         let harness = SchedulerHarness::new().await;
-        let job = harness
-            .overdue_job(
-                Schedule::parse_every("30s").expect("parses"),
+        let schedule = harness
+            .overdue_schedule(
+                Timing::parse_every("30s").expect("parses"),
                 None,
                 chrono::Duration::hours(6),
             )
@@ -1728,7 +1668,7 @@ mod tests {
 
         let fired = harness.fired();
         assert_eq!(fired.len(), 1, "one turn, not 720");
-        assert_eq!(fired[0].job_id, job.id);
+        assert_eq!(fired[0].schedule_id, schedule.id);
         // Six hours of 30-second occurrences: the one due at the stored time, plus 720 after it.
         assert_eq!(
             fired[0].coalesced, 720,
@@ -1736,267 +1676,15 @@ mod tests {
         );
     }
 
-    /// Coalescing bounds one job's backlog; this bounds the whole sweep's. A session that
-    /// accumulated more watchers than the budget must not wake to a turn per job, and must not lose
-    /// any of them either.
-    #[tokio::test]
-    async fn the_fire_budget_holds_jobs_over_without_losing_them() {
-        let mut harness = SchedulerHarness::new().await;
-        harness.config.max_consecutive_fires = 5;
-        for _ in 0..8 {
-            harness
-                .overdue_job(
-                    Schedule::parse_every("1h").expect("parses"),
-                    None,
-                    chrono::Duration::hours(6),
-                )
-                .await;
-        }
-
-        harness.tick().await;
-        assert_eq!(harness.fired().len(), 5, "the budget bounds the burst");
-
-        harness.tick().await;
-        let fired = harness.fired();
-        assert_eq!(fired.len(), 8, "and the next sweep takes the rest");
-        let distinct: std::collections::HashSet<&str> =
-            fired.iter().map(|record| record.job_id.as_str()).collect();
-        assert_eq!(distinct.len(), 8, "every job fired exactly once");
-    }
-
-    /// Per session, not per sweep. A budget shared across sessions would let one conversation's
-    /// backlog delay another's due job, which under `meka serve` is somebody else's job entirely.
-    #[tokio::test]
-    async fn the_fire_budget_is_per_session_rather_than_global() {
-        let mut harness = SchedulerHarness::new().await;
-        harness.config.max_consecutive_fires = 5;
-        let other = harness.another_session().await;
-        // The backlog is older, so it sorts first and would exhaust a global budget before the
-        // quiet session's single job was ever reached.
-        for _ in 0..6 {
-            harness
-                .overdue_job(
-                    Schedule::parse_every("1h").expect("parses"),
-                    None,
-                    chrono::Duration::hours(6),
-                )
-                .await;
-        }
-        let lonely = harness
-            .overdue_job_in(
-                other,
-                Schedule::parse_every("1h").expect("parses"),
-                None,
-                chrono::Duration::minutes(5),
-            )
-            .await;
-
-        harness.tick().await;
-
-        let fired = harness.fired();
-        assert_eq!(
-            fired.len(),
-            6,
-            "five from the busy session, one from the other"
-        );
-        assert!(
-            fired.iter().any(|record| record.job_id == lonely.id),
-            "the quiet session's job was not held behind the busy one's backlog"
-        );
-    }
-
-    /// A job the gate retires spends no turn, so it must not spend budget either. Otherwise a
-    /// handful of quiet watchers would starve the one job that had something to report.
-    #[tokio::test]
-    async fn a_declining_gate_does_not_consume_the_fire_budget() {
-        let mut harness = SchedulerHarness::new().await;
-        harness.config.max_consecutive_fires = 2;
-        // More overdue, so both are evaluated before the ungated job below.
-        for _ in 0..2 {
-            harness
-                .overdue_job(
-                    Schedule::parse_every("1h").expect("parses"),
-                    Some(gate("exit 1", GatePredicate::Succeeded, None)),
-                    chrono::Duration::hours(6),
-                )
-                .await;
-        }
-        let speaks = harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
-                None,
-                chrono::Duration::minutes(5),
-            )
-            .await;
-
-        harness.tick().await;
-
-        let fired = harness.fired();
-        assert_eq!(fired.len(), 1, "the two silent gates cost nothing");
-        assert_eq!(fired[0].job_id, speaks.id);
-    }
-
-    /// A host handing an occurrence back has not spent a turn on it, so the deferral must not spend
-    /// budget either. Otherwise a `meka serve` whose session is held by a screen would burn its
-    /// whole per-sweep budget on jobs it never ran.
-    #[tokio::test]
-    async fn a_deferral_does_not_consume_the_fire_budget() {
-        let mut harness = SchedulerHarness::new().await;
-        harness.config.max_consecutive_fires = 1;
-        for _ in 0..2 {
-            harness
-                .overdue_job(
-                    Schedule::parse_every("1h").expect("parses"),
-                    None,
-                    chrono::Duration::hours(6),
-                )
-                .await;
-        }
-
-        let offered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        run_due(
-            &harness.manager,
-            &harness.config,
-            None,
-            &NoResidents,
-            &SchedulerScope::every_job(),
-            &move |_wakeup: Wakeup| {
-                let offered = offered.clone();
-                async move {
-                    // The first is handed back; only the second spends a turn.
-                    match offered.fetch_add(1, std::sync::atomic::Ordering::Relaxed) {
-                        0 => FireOutcome::Deferred,
-                        _ => FireOutcome::Ran,
-                    }
-                }
-            },
-        )
-        .await
-        .expect("sweep runs");
-
-        // Both jobs reached the host despite a budget of one, because the deferred one cost
-        // nothing. The second is the only one whose schedule advanced.
-        let still_due: Vec<_> = harness
-            .jobs()
-            .await
-            .into_iter()
-            .filter(|job| job.next_fire_at <= Utc::now())
-            .collect();
-        assert_eq!(
-            still_due.len(),
-            1,
-            "the deferred job kept its occurrence; the other one spent its turn"
-        );
-    }
-
-    /// The budget is checked before `prepare`, which is where a gate runs, so holding a job over
-    /// must cost nothing, not even the shell command whose expense is half the reason gates
-    /// exist.
-    ///
-    /// Observed through a side effect on the filesystem rather than through the job's stored gate
-    /// baseline. Enforcing the budget *after* `prepare` and then restoring the job would run the
-    /// command and put the baseline back, leaving every column identical to a job that was never
-    /// touched. Only the command's own footprint tells the two apart.
-    #[tokio::test]
-    async fn a_held_over_job_does_not_run_its_gate() {
-        let mut harness = SchedulerHarness::new().await;
-        harness.config.max_consecutive_fires = 1;
-        // Removed on drop rather than at the end of the test, so a failing assertion does not leak
-        // it into the temp directory of whoever ran the suite.
-        struct Probe(std::path::PathBuf);
-        impl Drop for Probe {
-            fn drop(&mut self) {
-                std::fs::remove_file(&self.0).ok();
-            }
-        }
-        let guard =
-            Probe(std::env::temp_dir().join(format!("meka-gate-probe-{}", uuid::Uuid::new_v4())));
-        let probe = guard.0.clone();
-        harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
-                None,
-                chrono::Duration::hours(6),
-            )
-            .await;
-        let watcher = harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
-                Some(gate(
-                    &create_file_command(&probe),
-                    GatePredicate::Changed,
-                    None,
-                )),
-                chrono::Duration::minutes(5),
-            )
-            .await;
-
-        harness.tick().await;
-
-        assert!(
-            !probe.exists(),
-            "the held-over job's gate command never ran"
-        );
-        let held = harness
-            .jobs()
-            .await
-            .into_iter()
-            .find(|job| job.id == watcher.id)
-            .expect("the held-over job is still there");
-        assert_eq!(
-            held.next_fire_at, watcher.next_fire_at,
-            "and its schedule was not advanced, so it is still due"
-        );
-
-        // The probe is only evidence if it can fire at all: the next sweep has budget for it.
-        harness.tick().await;
-        assert!(probe.exists(), "and it runs once the budget has room");
-        std::fs::remove_file(&probe).expect("clean up the probe");
-    }
-
-    /// The rule every host defers to. Withdrawing a failed fire's prompt is only safe when the job
-    /// will produce it again; `prepare` deletes a one-shot's row *before* the turn runs, so for
-    /// those the unanswered message is the last trace the reminder ever fired.
-    #[test]
-    fn only_a_recurring_job_lets_a_failed_fire_withdraw_its_prompt() {
-        let recurring = |schedule: Schedule| ScheduledJob {
-            attempts: 0,
-            id: "7f3a1b2c".to_string(),
-            session_id: uuid::Uuid::nil(),
-            schedule,
-            prompt: "check the news".to_string(),
-            gate: None,
-            created_at: at("2026-08-11T12:00:00Z"),
-            last_fired_at: None,
-            next_fire_at: at("2026-08-11T12:00:00Z"),
-        };
-
-        for schedule in [
-            Schedule::parse_every("1h").expect("parses"),
-            Schedule::parse_cron("0 9 * * 1-5", None).expect("parses"),
-        ] {
-            assert_eq!(
-                recurring(schedule).prompt_retention(),
-                crate::conversation::PromptRetention::Withdraw,
-                "a recurring job regenerates its prompt"
-            );
-        }
-        assert_eq!(
-            recurring(Schedule::At(at("2026-08-11T12:00:00Z"))).prompt_retention(),
-            crate::conversation::PromptRetention::Keep,
-            "a one-shot's row is already gone; its prompt is all that is left"
-        );
-    }
-
     /// The `Every` and `Cron` arms must agree on what they count, or the same outage reports a
-    /// different backlog depending on how the schedule happened to be written.
+    /// different backlog depending on how the timing happened to be written.
     #[test]
     fn occurrence_counting_agrees_between_interval_and_cron() {
         let from = at("2026-08-11T12:00:00Z");
         let to = at("2026-08-11T12:05:00Z");
-        let every = occurrences_between(&Schedule::parse_every("1m").expect("parses"), from, to);
+        let every = occurrences_between(&Timing::parse_every("1m").expect("parses"), from, to);
         let cron = occurrences_between(
-            &Schedule::parse_cron("* * * * *", None).expect("parses"),
+            &Timing::parse_cron("* * * * *", None).expect("parses"),
             from,
             to,
         );
@@ -2005,14 +1693,14 @@ mod tests {
     }
 
     /// After firing late, the next due time is measured from now rather than from the slot that was
-    /// missed. Rescheduling from the missed slot would leave the job still overdue and fire it
+    /// missed. Rescheduling from the missed slot would leave the schedule still overdue and fire it
     /// again on the very next tick, which is the burst this avoids.
     #[tokio::test]
-    async fn a_late_recurring_job_reschedules_from_now() {
+    async fn a_late_recurring_schedule_reschedules_from_now() {
         let harness = SchedulerHarness::new().await;
         harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 None,
                 chrono::Duration::hours(5),
             )
@@ -2021,11 +1709,11 @@ mod tests {
         harness.tick().await;
         assert_eq!(harness.fired().len(), 1);
 
-        let job = harness.jobs();
-        let job = job.await;
-        let job = job.first().expect("recurring job survives");
+        let schedule = harness.schedules();
+        let schedule = schedule.await;
+        let schedule = schedule.first().expect("recurring schedule survives");
         assert!(
-            job.next_fire_at > Utc::now(),
+            schedule.next_fire_at > Utc::now(),
             "next fire must be in the future, not still overdue"
         );
 
@@ -2043,7 +1731,7 @@ mod tests {
         let harness = SchedulerHarness::new().await;
         let stale = Utc::now() - chrono::Duration::days(5);
         harness
-            .overdue_job(Schedule::At(stale), None, chrono::Duration::days(5))
+            .overdue_schedule(Timing::At(stale), None, chrono::Duration::days(5))
             .await;
 
         harness.tick().await;
@@ -2052,7 +1740,7 @@ mod tests {
             harness.fired().is_empty(),
             "a five-day-old reminder is noise, not a reminder"
         );
-        assert!(harness.jobs().await.is_empty(), "and it is retired");
+        assert!(harness.schedules().await.is_empty(), "and it is retired");
     }
 
     #[tokio::test]
@@ -2060,7 +1748,7 @@ mod tests {
         let harness = SchedulerHarness::new().await;
         let due = Utc::now() - chrono::Duration::hours(3);
         harness
-            .overdue_job(Schedule::At(due), None, chrono::Duration::hours(3))
+            .overdue_schedule(Timing::At(due), None, chrono::Duration::hours(3))
             .await;
 
         harness.tick().await;
@@ -2068,17 +1756,20 @@ mod tests {
         let fired = harness.fired();
         assert_eq!(fired.len(), 1);
         assert!(fired[0].late_by >= chrono::Duration::hours(3) - chrono::Duration::seconds(5));
-        assert!(harness.jobs().await.is_empty(), "one-shots retire on fire");
+        assert!(
+            harness.schedules().await.is_empty(),
+            "one-shots retire on fire"
+        );
     }
 
-    /// A gate that declines must still advance the schedule, or the job stays overdue and the gate
-    /// runs on every single tick instead of on its interval.
+    /// A gate that declines must still advance the schedule, or the schedule stays overdue and the
+    /// gate runs on every single tick instead of on its interval.
     #[tokio::test]
     async fn a_declining_gate_reschedules_without_spending_a_turn() {
         let harness = SchedulerHarness::new().await;
         harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 Some(gate("exit 1", GatePredicate::Succeeded, None)),
                 chrono::Duration::minutes(5),
             )
@@ -2087,12 +1778,15 @@ mod tests {
         harness.tick().await;
 
         assert!(harness.fired().is_empty(), "the condition was false");
-        let jobs = harness.jobs().await;
-        let job = jobs.first().expect("job survives");
-        assert!(job.next_fire_at > Utc::now(), "but the schedule moved on");
+        let schedules = harness.schedules().await;
+        let schedule = schedules.first().expect("schedule survives");
         assert!(
-            job.last_fired_at.is_none(),
-            "evaluating is not firing; recording it as fired would misreport the job"
+            schedule.next_fire_at > Utc::now(),
+            "but the schedule moved on"
+        );
+        assert!(
+            schedule.last_fired_at.is_none(),
+            "evaluating is not firing; recording it as fired would misreport the schedule"
         );
     }
 
@@ -2102,8 +1796,8 @@ mod tests {
     async fn a_broken_gate_does_not_fire_and_does_not_claim_to_have() {
         let harness = SchedulerHarness::new().await;
         harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 Some(gate(
                     "definitely-not-a-real-command-xyzzy",
                     GatePredicate::Succeeded,
@@ -2116,18 +1810,24 @@ mod tests {
         harness.tick().await;
 
         assert!(harness.fired().is_empty());
-        let jobs = harness.jobs().await;
-        assert!(jobs.first().expect("job survives").last_fired_at.is_none());
+        let schedules = harness.schedules().await;
+        assert!(
+            schedules
+                .first()
+                .expect("schedule survives")
+                .last_fired_at
+                .is_none()
+        );
     }
 
     /// A gate is authorized once, at `unrestricted`, and then persists as a row that any process
     /// executes on a timer. Nothing about the creating session's later downgrade (Shift+Tab to
-    /// `read`, or a `meka serve --permission read` restart inheriting the job) can reach back to
-    /// withdraw it, so the level travels on the row and is re-checked here. Asserted through a real
-    /// filesystem side effect rather than through the returned outcome, because "did not fire" and
-    /// "did not *run*" are different claims and only the second one is the security property. The
-    /// scenario the feature exists for, driven the way production produces it: the gate carries the
-    /// `Unrestricted` it was legitimately created with, and the *session* has since dropped to
+    /// `read`, or a `meka serve --permission read` restart inheriting the schedule) can reach back
+    /// to withdraw it, so the level travels on the row and is re-checked here. Asserted through a
+    /// real filesystem side effect rather than through the returned outcome, because "did not fire"
+    /// and "did not *run*" are different claims and only the second one is the security property.
+    /// The scenario the feature exists for, driven the way production produces it: the gate carries
+    /// the `Unrestricted` it was legitimately created with, and the *session* has since dropped to
     /// `read`.
     ///
     /// The sibling below hand-sets `gate.permission` to `Read`, which no creation path can produce:
@@ -2143,8 +1843,8 @@ mod tests {
         let harness =
             SchedulerHarness::at_session_permission(crate::permission::Permission::Read).await;
         harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 // Recorded `Unrestricted`, exactly as `schedule_create` would have written it.
                 Some(gate(
                     &create_file_command(&marker),
@@ -2164,23 +1864,23 @@ mod tests {
         let _ = std::fs::remove_file(&marker);
     }
 
-    /// A recurring job stays on the grid it was created on, however late a pickup is.
+    /// A recurring schedule stays on the grid it was created on, however late a pickup is.
     ///
     /// Passing `now` to `next_after` would add each sweep's pickup latency to the interval and keep
-    /// it: at `poll_interval = 1s` an `every = "1s"` job would run at 2.0s, half the requested
-    /// rate, because the tick one interval later lands microseconds early and the job waits a whole
-    /// extra poll. This asserts the property directly rather than by timing a live scheduler, which
-    /// would be flaky.
+    /// it: at `poll_interval = 1s` an `every = "1s"` schedule would run at 2.0s, half the requested
+    /// rate, because the tick one interval later lands microseconds early and the schedule waits a
+    /// whole extra poll. This asserts the property directly rather than by timing a live scheduler,
+    /// which would be flaky.
     #[test]
-    fn a_recurring_schedule_advances_from_the_occurrence_it_delivered_not_from_now() {
-        let every = Schedule::parse_every("5s").expect("parses");
+    fn a_recurring_timing_advances_from_the_occurrence_it_delivered_not_from_now() {
+        let every = Timing::parse_every("5s").expect("parses");
         let delivered = chrono::Utc::now() - chrono::Duration::seconds(12);
         // Pickup is late, and not on a multiple of the interval.
         let now = delivered + chrono::Duration::milliseconds(12_345);
 
         let next = every
             .next_after_delivering(delivered, now)
-            .expect("a recurring schedule always has a next occurrence");
+            .expect("a recurring timing always has a next occurrence");
         assert!(next > now, "the next occurrence must be in the future");
         let offset = (next - delivered).num_milliseconds();
         assert_eq!(
@@ -2213,7 +1913,7 @@ mod tests {
         assert_eq!((resumed - delivered).num_milliseconds() % 5_000, 0);
 
         // Cron is absolute wall-clock and must be untouched by any of this.
-        let cron = Schedule::parse_cron("*/5 * * * *", None).expect("parses");
+        let cron = Timing::parse_cron("*/5 * * * *", None).expect("parses");
         assert_eq!(
             cron.next_after_delivering(delivered, now),
             cron.next_after(now),
@@ -2227,31 +1927,31 @@ mod tests {
     /// `next_after(now)` would leave every other schedule test passing. What the user feels is this
     /// value, persisted.
     #[tokio::test]
-    async fn a_fired_job_is_rescheduled_onto_its_own_grid() {
+    async fn a_fired_schedule_is_rescheduled_onto_its_own_grid() {
         let harness = SchedulerHarness::new().await;
-        let job = harness
-            .overdue_job(
-                Schedule::parse_every("5s").expect("parses"),
+        let schedule = harness
+            .overdue_schedule(
+                Timing::parse_every("5s").expect("parses"),
                 None,
                 chrono::Duration::seconds(12),
             )
             .await;
-        let delivered = job.next_fire_at;
+        let delivered = schedule.next_fire_at;
 
         harness.tick().await;
 
         let rescheduled = harness
-            .jobs()
+            .schedules()
             .await
             .into_iter()
-            .find(|candidate| candidate.id == job.id)
-            .expect("a recurring job lives on");
+            .find(|candidate| candidate.id == schedule.id)
+            .expect("a recurring schedule lives on");
         let offset = (rescheduled.next_fire_at - delivered).num_milliseconds();
         assert_eq!(
             offset % 5_000,
             0,
             "the persisted next fire must be a whole number of intervals from the occurrence just \
-             delivered, got {offset}ms -- anchoring on `now` instead makes every job drift"
+             delivered, got {offset}ms -- anchoring on `now` instead makes every schedule drift"
         );
         assert!(
             rescheduled.next_fire_at > delivered,
@@ -2277,8 +1977,8 @@ mod tests {
         // The row still says `unrestricted`, and something has to refuse to believe it.
         let harness = SchedulerHarness::new().await;
         harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 Some(gate(
                     &create_file_command(&marker),
                     GatePredicate::Succeeded,
@@ -2304,12 +2004,12 @@ mod tests {
 
         // And the control: with `unrestricted` still enabled, the identical row does authorize the
         // gate, so the refusal above is the enabled set rather than some unrelated part of the
-        // fixture. A second job, because the sweep above claimed the first one's occurrence by
+        // fixture. A second schedule, because the sweep above claimed the first one's occurrence by
         // advancing it: a declined gate still spends the occurrence, which is what stops a
         // refused watcher from re-running every poll.
         harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 Some(gate(
                     &create_file_command(&marker),
                     GatePredicate::Succeeded,
@@ -2325,23 +2025,23 @@ mod tests {
         harness.tick_with(permitted, None).await;
         assert!(
             marker.exists(),
-            "the same job must still fire while its recorded level is enabled"
+            "the same schedule must still fire while its recorded level is enabled"
         );
         let _ = std::fs::remove_file(&marker);
     }
 
-    /// A panic in one fire must not stop the scheduler.
+    /// A panic in one sweep must not stop the scheduler.
     ///
-    /// Under `meka serve` the callback runs a whole agent turn, so everything the tool loop can do
-    /// is inside the surface that can panic. Nothing joins this task, so losing it would produce
-    /// no error anywhere: scheduled jobs would simply stop firing, for the life of the process, and
-    /// the first sign would be a reminder that never arrived.
+    /// The callback is host code and a gate's probe calls into an MCP server's tool, so a sweep
+    /// can panic. Nothing joins this task, so losing it would produce no error anywhere: schedules
+    /// would simply stop firing, for the life of the process, and the first sign would be a
+    /// reminder that never arrived.
     #[tokio::test]
     async fn a_panicking_fire_does_not_stop_the_scheduler() {
         let harness = SchedulerHarness::new().await;
         harness
-            .overdue_job(
-                Schedule::parse_every("1s").expect("parses"),
+            .overdue_schedule(
+                Timing::parse_every("1s").expect("parses"),
                 None,
                 chrono::Duration::seconds(30),
             )
@@ -2350,10 +2050,6 @@ mod tests {
         let fires = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let config = crate::config::ResolvedScheduleConfig {
             poll_interval: std::time::Duration::from_millis(20),
-            // A panicking turn leaves its claim to expire, so without a lease shorter than the
-            // test's patience the same job would not come round twice. What is being asserted is
-            // that the *loop* survives a panic, not how long the retry waits.
-            claim_lease: std::time::Duration::from_millis(1),
             ..harness.config.clone()
         };
         let handle = spawn(
@@ -2361,14 +2057,14 @@ mod tests {
             config,
             None,
             std::sync::Arc::new(NoResidents),
-            SchedulerScope::every_job(),
+            SchedulerScope::every_schedule(),
             {
                 let fires = std::sync::Arc::clone(&fires);
-                move |_wakeup| {
+                move |_schedule, _queued| {
                     let fires = std::sync::Arc::clone(&fires);
                     async move {
                         fires.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        panic!("the turn blew up");
+                        panic!("the host blew up");
                     }
                 }
             },
@@ -2387,19 +2083,19 @@ mod tests {
         handle.abort();
     }
 
-    /// The other half of a withdrawn gate: the job does not fire either.
+    /// The other half of a withdrawn gate: the schedule does not fire either.
     ///
     /// "Did not run" and "did not fire" are separate claims and both matter. A gate is the
-    /// condition on the job, so a gate that cannot be evaluated has not passed, and delivering the
-    /// prompt regardless turns a conditional job into an unconditional one: on an `every = "1m"`
-    /// watcher, a turn a minute for as long as the session stayed below `unrestricted`.
+    /// condition on the schedule, so a gate that cannot be evaluated has not passed, and delivering
+    /// the prompt regardless turns a conditional schedule into an unconditional one: on an `every =
+    /// "1m"` watcher, a turn a minute for as long as the session stayed below `unrestricted`.
     #[tokio::test]
-    async fn a_job_whose_gate_cannot_be_run_does_not_fire_regardless() {
+    async fn a_schedule_whose_gate_cannot_be_run_does_not_fire_regardless() {
         let harness =
             SchedulerHarness::at_session_permission(crate::permission::Permission::Read).await;
         harness
-            .overdue_job(
-                Schedule::parse_every("1m").expect("parses"),
+            .overdue_schedule(
+                Timing::parse_every("1m").expect("parses"),
                 Some(gate("true", GatePredicate::Succeeded, None)),
                 chrono::Duration::minutes(5),
             )
@@ -2411,20 +2107,22 @@ mod tests {
             harness.fired().is_empty(),
             "an unevaluated gate is not a passed gate",
         );
-        let jobs = harness.jobs().await;
-        let job = jobs.first().expect("the job survives for the next sweep");
+        let schedules = harness.schedules().await;
+        let schedule = schedules
+            .first()
+            .expect("the schedule survives for the next sweep");
         assert!(
-            job.last_fired_at.is_none(),
+            schedule.last_fired_at.is_none(),
             "and it must not be recorded as having fired",
         );
         assert!(
-            job.next_fire_at > Utc::now(),
+            schedule.next_fire_at > Utc::now(),
             "the occurrence is spent, so a restored session does not get a backlog",
         );
     }
 
-    /// The companion: the same job, same recorded level, on a host still at `unrestricted`, runs.
-    /// Without this the test above would pass just as well if gates never ran at all.
+    /// The companion: the same schedule, same recorded level, on a host still at `unrestricted`,
+    /// runs. Without this the test above would pass just as well if gates never ran at all.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_gate_is_executed_while_the_host_still_holds_write() {
@@ -2433,8 +2131,8 @@ mod tests {
 
         let harness = SchedulerHarness::new().await;
         harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 Some(gate(
                     &create_file_command(&marker),
                     GatePredicate::Succeeded,
@@ -2471,25 +2169,25 @@ mod tests {
         );
     }
 
-    /// The clock is read per job. A sweep contains the turns it fires, so the second job's
-    /// `fired_at` and `next_fire_at` would otherwise be computed from an instant the first job's
-    /// turn had left behind; a recurring job would then be advanced into the past and fire again on
-    /// the next tick.
+    /// The clock is read per schedule. A sweep contains the gates it runs, so the second
+    /// schedule's `fired_at` and `next_fire_at` would otherwise be computed from an instant the
+    /// first schedule's gate had left behind; a recurring schedule would then be advanced into the
+    /// past and fire again on the next tick.
     #[tokio::test]
-    async fn each_job_in_a_sweep_is_timed_from_its_own_instant() {
+    async fn each_schedule_in_a_sweep_is_timed_from_its_own_instant() {
         let harness = SchedulerHarness::new().await;
         let first = harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 None,
                 chrono::Duration::minutes(2),
             )
             .await;
         let other_session = harness.another_session().await;
         let second = harness
-            .overdue_job_in(
+            .overdue_schedule_in(
                 other_session,
-                Schedule::parse_every("1h").expect("parses"),
+                Timing::parse_every("1h").expect("parses"),
                 None,
                 chrono::Duration::minutes(1),
             )
@@ -2497,18 +2195,22 @@ mod tests {
 
         harness.tick_slowly(Duration::from_millis(1100)).await;
 
-        assert_eq!(harness.fired().len(), 2, "both jobs fire in the one sweep");
+        assert_eq!(
+            harness.fired().len(),
+            2,
+            "both schedules fire in the one sweep"
+        );
         let fired_at = |session: uuid::Uuid, id: &str| {
             let store = harness.manager.schedule_store();
             let id = id.to_string();
             async move {
                 store
-                    .list_scheduled_jobs(session)
+                    .list_schedules(session)
                     .await
                     .expect("list")
                     .into_iter()
-                    .find(|job| job.id == id)
-                    .and_then(|job| job.last_fired_at)
+                    .find(|schedule| schedule.id == id)
+                    .and_then(|schedule| schedule.last_fired_at)
                     .expect("fired")
             }
         };
@@ -2516,7 +2218,7 @@ mod tests {
         let second_fired = fired_at(other_session, &second.id).await;
         assert!(
             second_fired - first_fired >= chrono::Duration::seconds(1),
-            "the second job's instant must follow the first's turn: {first_fired} vs {second_fired}"
+            "the second schedule's instant must follow the first's fire: {first_fired} vs {second_fired}"
         );
     }
 
@@ -2536,9 +2238,9 @@ mod tests {
             .await
             .expect("a row no door writes");
         harness
-            .overdue_job_in(
+            .overdue_schedule_in(
                 bare,
-                Schedule::parse_every("1h").expect("parses"),
+                Timing::parse_every("1h").expect("parses"),
                 None,
                 chrono::Duration::minutes(5),
             )
@@ -2551,8 +2253,8 @@ mod tests {
     }
 
     /// A session row the sweep cannot read decides nothing, so the occurrence stays. Read as a
-    /// session at `none`, the job would be declined, a recurring one advanced past a probe that
-    /// never ran, and the operator told to raise a session that may be at `unrestricted`.
+    /// session at `none`, the schedule would be declined, a recurring one advanced past a probe
+    /// that never ran, and the operator told to raise a session that may be at `unrestricted`.
     #[tokio::test]
     async fn an_unreadable_session_row_keeps_the_occurrence() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2571,9 +2273,9 @@ mod tests {
             config: crate::config::ResolvedScheduleConfig::default(),
             fired: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         };
-        let job = harness
-            .overdue_job(
-                Schedule::parse_every("6h").expect("parses"),
+        let schedule = harness
+            .overdue_schedule(
+                Timing::parse_every("6h").expect("parses"),
                 None,
                 chrono::Duration::minutes(1),
             )
@@ -2596,10 +2298,10 @@ mod tests {
         hide(false);
 
         assert!(harness.fired().is_empty(), "nothing can be decided");
-        let after = harness.jobs().await;
-        let after = after.first().expect("the job survives");
+        let after = harness.schedules().await;
+        let after = after.first().expect("the schedule survives");
         assert_eq!(
-            after.next_fire_at, job.next_fire_at,
+            after.next_fire_at, schedule.next_fire_at,
             "the occurrence is neither spent nor advanced; the next sweep decides it"
         );
     }
@@ -2624,14 +2326,14 @@ mod tests {
     }
 
     /// A gate whose tool cannot be resolved *yet* is left for the next sweep, not declined.
-    /// Declining would spend the occurrence, so a `6h` job due while its server was still
+    /// Declining would spend the occurrence, so a `6h` schedule due while its server was still
     /// connecting would be advanced six hours without its probe ever running.
     #[tokio::test]
     async fn a_gate_whose_server_is_still_connecting_keeps_its_occurrence() {
         let harness = SchedulerHarness::new().await;
-        let job = harness
-            .overdue_job(
-                Schedule::parse_every("6h").expect("parses"),
+        let schedule = harness
+            .overdue_schedule(
+                Timing::parse_every("6h").expect("parses"),
                 Some(Gate {
                     probe: tool_probe(),
                     predicate: GatePredicate::Succeeded,
@@ -2649,10 +2351,10 @@ mod tests {
             .await;
 
         assert!(harness.fired().is_empty(), "nothing can be evaluated yet");
-        let after = harness.jobs().await;
-        let after = after.first().expect("the job survives");
+        let after = harness.schedules().await;
+        let after = after.first().expect("the schedule survives");
         assert_eq!(
-            after.next_fire_at, job.next_fire_at,
+            after.next_fire_at, schedule.next_fire_at,
             "the occurrence is neither spent nor advanced; the next sweep decides it"
         );
     }
@@ -2768,8 +2470,8 @@ mod tests {
         );
         withdrawn.permission = crate::permission::Permission::Read;
         harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 Some(withdrawn),
                 chrono::Duration::minutes(5),
             )
@@ -2782,7 +2484,7 @@ mod tests {
             "a gate authorized at read must never reach the shell"
         );
         // And the occurrence is declined rather than delivered ungated; see
-        // `a_job_whose_gate_cannot_be_run_does_not_fire_regardless` for why.
+        // `a_schedule_whose_gate_cannot_be_run_does_not_fire_regardless` for why.
         assert!(harness.fired().is_empty());
 
         let _ = std::fs::remove_file(&marker);
@@ -2796,7 +2498,7 @@ mod tests {
     /// values, so the one value that matters on upgrade needs its own test.
     #[test]
     fn an_unreadable_gate_permission_authorizes_nothing() {
-        let row = |permission: Option<&str>| ScheduledJobRow {
+        let row = |permission: Option<&str>| ScheduleRow {
             attempts: 0,
             id: "7f3a1b2c-0000-0000-0000-000000000000".to_string(),
             session_id: uuid::Uuid::nil().to_string(),
@@ -2864,8 +2566,8 @@ mod tests {
             None,
         );
         harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 Some(authorized),
                 chrono::Duration::minutes(5),
             )
@@ -2903,8 +2605,8 @@ mod tests {
 
         let harness = SchedulerHarness::new().await;
         harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 Some(gate(
                     &create_file_command(&marker),
                     GatePredicate::Succeeded,
@@ -2935,9 +2637,9 @@ mod tests {
 
         // The row still says `unrestricted`, as it does after a failed write.
         let harness = SchedulerHarness::new().await;
-        let job = harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+        let schedule = harness
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 Some(gate(
                     &create_file_command(&marker),
                     GatePredicate::Succeeded,
@@ -2947,19 +2649,19 @@ mod tests {
             )
             .await;
 
-        let wakeup = prepare(
+        let queued = prepare(
             &harness.manager,
             &harness.config,
             None,
             &ResidentAt(crate::permission::Permission::Read),
-            job,
+            schedule,
             Utc::now(),
         )
         .await
         .expect("prepare runs");
 
         assert!(
-            wakeup.is_none(),
+            queued.is_none(),
             "the cell says `read`, so the gate is withheld"
         );
         assert!(
@@ -2969,17 +2671,17 @@ mod tests {
         let _ = std::fs::remove_file(&marker);
     }
 
-    /// A job on a session at `none` does not fire, gate or no gate.
+    /// A schedule on a session at `none` does not fire, gate or no gate.
     ///
     /// The turn it would spend can do nothing: every tool is refused at dispatch, so it reads
     /// nothing, changes nothing, and its `schedule_cancel` is refused too, leaving it unable to
     /// stop itself being woken again. Registration does not depend on the level, so it *sees* the
-    /// job in `[Scheduled]` and is offered the tool; the refusal is at the point of use, which is
-    /// the worst of both. An ungated `every = "5s"` job would be a turn every five seconds for as
-    /// long as the session sat there, stoppable only by an operator. Ungated is the case that
-    /// matters here: a gated job is already refused by the authority check.
+    /// schedule in `[Scheduled]` and is offered the tool; the refusal is at the point of use, which
+    /// is the worst of both. An ungated `every = "5s"` schedule would be a turn every five seconds
+    /// for as long as the session sat there, stoppable only by an operator. Ungated is the case
+    /// that matters here: a gated schedule is already refused by the authority check.
     #[tokio::test]
-    async fn an_ungated_job_does_not_fire_on_a_session_at_none() {
+    async fn an_ungated_schedule_does_not_fire_on_a_session_at_none() {
         let harness = SchedulerHarness::new().await;
         harness
             .manager
@@ -2990,8 +2692,8 @@ mod tests {
             .await
             .expect("record the level the session was set to");
         harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 None,
                 chrono::Duration::minutes(5),
             )
@@ -3001,7 +2703,7 @@ mod tests {
 
         assert!(
             harness.fired().is_empty(),
-            "waking a model that cannot act, and cannot cancel the job that woke it, is a turn \
+            "waking a model that cannot act, and cannot cancel the schedule that woke it, is a turn \
              spent to no purpose"
         );
     }
@@ -3030,8 +2732,8 @@ mod tests {
                 .await
                 .expect("record the level the session was set to");
             harness
-                .overdue_job(
-                    Schedule::At(Utc::now() - chrono::Duration::minutes(1)),
+                .overdue_schedule(
+                    Timing::At(Utc::now() - chrono::Duration::minutes(1)),
                     gate_on_it.then(|| gate("true", GatePredicate::Succeeded, None)),
                     chrono::Duration::minutes(1),
                 )
@@ -3041,7 +2743,7 @@ mod tests {
 
             assert!(harness.fired().is_empty(), "{label}: must not fire");
             assert_eq!(
-                harness.jobs().await.len(),
+                harness.schedules().await.len(),
                 1,
                 "{label}: the reminder was never evaluated, so it must still be there once the \
                  level is restored"
@@ -3049,7 +2751,7 @@ mod tests {
         }
     }
 
-    /// A refused job's row is never deleted, not even for the instant it took to put it back.
+    /// A refused schedule's row is never deleted, not even for the instant it took to put it back.
     ///
     /// Kept-and-restored and never-touched leave identical rows, which is why the resurrection this
     /// prevents was invisible: claiming by deleting a one-shot puts the refusal after the delete,
@@ -3061,8 +2763,8 @@ mod tests {
     /// its rowid was never deleted. Restoring the delete-then-restore shape fails this with two
     /// different values.
     ///
-    /// The second job is not decoration. With one row in the table the deleted rowid is also `max +
-    /// 1`, so SQLite hands the same value straight back and the assertion holds under both
+    /// The second schedule is not decoration. With one row in the table the deleted rowid is also
+    /// `max + 1`, so SQLite hands the same value straight back and the assertion holds under both
     /// orderings.
     #[tokio::test]
     async fn a_refused_one_shot_keeps_its_row_rather_than_being_deleted_and_restored() {
@@ -3075,9 +2777,9 @@ mod tests {
             })
             .await
             .expect("record the level the session was set to");
-        let job = harness
-            .overdue_job(
-                Schedule::At(Utc::now() - chrono::Duration::minutes(1)),
+        let schedule = harness
+            .overdue_schedule(
+                Timing::At(Utc::now() - chrono::Duration::minutes(1)),
                 Some(gate("true", GatePredicate::Succeeded, None)),
                 chrono::Duration::minutes(1),
             )
@@ -3085,8 +2787,8 @@ mod tests {
         // Behind it in the table and not due, so it is never considered and only ever raises
         // `max(rowid)`.
         harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 None,
                 -chrono::Duration::hours(1),
             )
@@ -3099,7 +2801,7 @@ mod tests {
                     .connection
                     .call(move |connection| {
                         connection.query_row(
-                            "SELECT rowid FROM scheduled_jobs WHERE id = ?1",
+                            "SELECT rowid FROM schedules WHERE id = ?1",
                             rusqlite::params![id],
                             |row| row.get::<_, i64>(0),
                         )
@@ -3109,9 +2811,9 @@ mod tests {
             }
         };
 
-        let before = rowid(job.id.clone()).await;
+        let before = rowid(schedule.id.clone()).await;
         harness.tick().await;
-        let after = rowid(job.id.clone()).await;
+        let after = rowid(schedule.id.clone()).await;
 
         assert_eq!(
             before, after,
@@ -3139,9 +2841,9 @@ mod tests {
             .await
             .expect("record the level the session was set to");
         // A pointer into output that is not JSON: an error, not an answer, on every evaluation.
-        let job = harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+        let schedule = harness
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 Some(gate(
                     "echo not-json-at-all",
                     GatePredicate::At {
@@ -3157,15 +2859,16 @@ mod tests {
 
         harness.tick().await;
         assert_eq!(
-            job_withheld_reason(harness.manager.scheduler_memory(), &job, level, None),
+            schedule_withheld_reason(harness.manager.scheduler_memory(), &schedule, level, None),
             None,
-            "one failure is a blip, and marking a job dead for it would flap"
+            "one failure is a blip, and marking a schedule dead for it would flap"
         );
 
-        harness.overdue_now(&job.id).await;
+        harness.overdue_now(&schedule.id).await;
         harness.tick().await;
-        let reported = job_withheld_reason(harness.manager.scheduler_memory(), &job, level, None)
-            .unwrap_or_default();
+        let reported =
+            schedule_withheld_reason(harness.manager.scheduler_memory(), &schedule, level, None)
+                .unwrap_or_default();
         assert!(
             reported.contains("keeps failing"),
             "a standing breakage is the model's to act on: {reported}"
@@ -3173,11 +2876,11 @@ mod tests {
 
         // And the sentence does not move once it has been said. Every reader compares it by
         // equality, so a running total in it would make `render_world_state_diff` re-announce the
-        // job to the model on every single failed evaluation.
-        harness.overdue_now(&job.id).await;
+        // schedule to the model on every single failed evaluation.
+        harness.overdue_now(&schedule.id).await;
         harness.tick().await;
         assert_eq!(
-            job_withheld_reason(harness.manager.scheduler_memory(), &job, level, None)
+            schedule_withheld_reason(harness.manager.scheduler_memory(), &schedule, level, None)
                 .unwrap_or_default(),
             reported,
             "a third failure says exactly what the second did"
@@ -3188,47 +2891,47 @@ mod tests {
         );
 
         // A working evaluation ends it, so the marker tracks the gate rather than accumulating.
-        harness.overdue_now(&job.id).await;
+        harness.overdue_now(&schedule.id).await;
         // Single-quoted, or `sh` eats the quotes and the probe emits `{chats: []}`, which is not
         // JSON either.
         harness
-            .rewrite_gate(&job.id, "echo '{\"chats\": []}'")
+            .rewrite_gate(&schedule.id, "echo '{\"chats\": []}'")
             .await;
         harness.tick().await;
         assert_eq!(
-            job_withheld_reason(harness.manager.scheduler_memory(), &job, level, None),
+            schedule_withheld_reason(harness.manager.scheduler_memory(), &schedule, level, None),
             None,
             "the probe answered, so there is nothing left to report"
         );
     }
 
-    /// A crash between the claim and the delivery costs a retry, not the job.
+    /// A crash between the claim and the fire costs a retry, not the schedule.
     ///
-    /// This is what the lease is for. Consuming the row to claim it (advancing a recurring job's
-    /// `next_fire_at`, deleting a one-shot's row outright) leaves the occurrence spent when a
-    /// host dies before the turn runs, and for a one-shot the reminder is gone with nothing
-    /// anywhere to recover it from. Nothing swept for it either, unlike `background_tasks`, which
-    /// is marked `interrupted` when a process takes the session lock.
+    /// This is what the lease is for. Consuming the row to claim it (advancing a recurring
+    /// schedule's `next_fire_at`, deleting a one-shot's row outright) leaves the occurrence spent
+    /// when a host dies before its fire is queued, and for a one-shot the reminder is gone with
+    /// nothing anywhere to recover it from. Nothing swept for it either, unlike `background_tasks`,
+    /// which is marked `interrupted` when a process takes the session lock.
     #[tokio::test]
-    async fn a_crash_between_the_claim_and_the_turn_does_not_lose_the_job() {
+    async fn a_crash_between_the_claim_and_the_fire_does_not_lose_the_schedule() {
         let harness = SchedulerHarness::new().await;
-        let job = harness
-            .overdue_job(
-                Schedule::At(Utc::now() - chrono::Duration::minutes(1)),
+        let schedule = harness
+            .overdue_schedule(
+                Timing::At(Utc::now() - chrono::Duration::minutes(1)),
                 None,
                 chrono::Duration::minutes(1),
             )
             .await;
         let store = harness.manager.schedule_store();
 
-        // A host takes the occurrence and is killed before it can deliver: no completion, no
-        // release, just a lease nobody will ever come back for.
+        // A host takes the occurrence and is killed before it can queue the fire: no completion,
+        // just a lease nobody will ever come back for.
         let died_at = Utc::now() - chrono::Duration::hours(2);
         assert!(
             store
                 .claim_occurrence(
-                    &job.id,
-                    job.next_fire_at,
+                    &schedule.id,
+                    schedule.next_fire_at,
                     "host-that-died",
                     died_at,
                     died_at + chrono::Duration::hours(1),
@@ -3242,27 +2945,27 @@ mod tests {
         assert_eq!(
             harness.fired().len(),
             1,
-            "the reminder is delivered by the next host once the dead one's lease expires"
+            "the reminder is queued by the next host once the dead one's lease expires"
         );
         assert!(
-            harness.jobs().await.is_empty(),
+            harness.schedules().await.is_empty(),
             "and retired properly afterwards, rather than left leased forever"
         );
     }
 
-    /// A job whose turn keeps taking the host down is parked rather than retried forever.
+    /// A schedule whose claims keep ending unclosed is parked rather than retried forever.
     ///
-    /// The counterpart the lease requires. A lease hands the same occurrence back every time, so
-    /// without a ceiling a prompt that kills the process is claimed again on every sweep, forever.
-    /// The row is kept rather than deleted: it stays listed, cancelable, and reported as held,
-    /// because Meka cannot tell a poisonous prompt from an unlucky one and destroying a user's job
-    /// on that guess would be worse.
+    /// The counterpart the lease requires. An expired lease hands the same occurrence out again
+    /// every time, so without a ceiling an occurrence that takes its host down before its fire is
+    /// written is claimed again on every sweep, forever. The row is kept rather than deleted: it
+    /// stays listed, cancelable, and reported as held, because Meka cannot tell a poisonous
+    /// schedule from an unlucky one and destroying a user's schedule on that guess would be worse.
     #[tokio::test]
-    async fn a_job_that_keeps_crashing_its_host_is_parked_rather_than_retried_forever() {
+    async fn a_schedule_that_keeps_crashing_its_host_is_parked_rather_than_retried_forever() {
         let harness = SchedulerHarness::new().await;
-        let job = harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+        let schedule = harness
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 None,
                 chrono::Duration::minutes(5),
             )
@@ -3275,8 +2978,8 @@ mod tests {
             assert!(
                 store
                     .claim_occurrence(
-                        &job.id,
-                        job.next_fire_at,
+                        &schedule.id,
+                        schedule.next_fire_at,
                         &format!("host-{attempt}"),
                         now,
                         now - chrono::Duration::seconds(1),
@@ -3291,37 +2994,40 @@ mod tests {
 
         assert!(
             harness.fired().is_empty(),
-            "the ceiling is reached, so the job is not handed to a fourth host to kill"
+            "the ceiling is reached, so the schedule is not handed to a fourth host to kill"
         );
-        let parked = harness.jobs().await;
-        let parked = parked.first().expect("and the job is kept, not destroyed");
+        let parked = harness.schedules().await;
+        let parked = parked
+            .first()
+            .expect("and the schedule is kept, not destroyed");
         assert_eq!(parked.attempts, MAX_CLAIM_ATTEMPTS);
         assert_eq!(
-            job_withheld_reason(
+            schedule_withheld_reason(
                 harness.manager.scheduler_memory(),
                 parked,
                 crate::permission::Permission::Unrestricted,
                 None
             )
             .as_deref()
-            .map(|reason| reason.contains("claims ended without delivering")),
+            .map(|reason| reason.contains("claims ended without queuing a fire")),
             Some(true),
-            "and every surface says so, because a parked job that looks healthy is the thing this \
+            "and every surface says so, because a parked schedule that looks healthy is the thing this \
              whole marker exists to prevent"
         );
     }
 
-    /// A stale *completion* is refused too, not just a stale release.
+    /// A stale fire is refused: it neither retires the schedule nor is queued.
     ///
-    /// The completion of a one-shot is the one `DELETE` the scheduler issues, so an unscoped one
-    /// would let a host whose lease expired retire a job the current holder is still delivering:
-    /// the reminder vanishing mid-turn, from a write issued by a host that no longer owns it.
+    /// The close of a one-shot's claim is the one `DELETE` the scheduler issues, so an unscoped
+    /// one would let a host whose lease expired retire a schedule the current holder is still
+    /// evaluating, from a write issued by a host that no longer owns it; and a fire queued beside
+    /// the holder's would be the same occurrence twice.
     #[tokio::test]
-    async fn a_stale_completion_does_not_retire_another_hosts_job() {
+    async fn a_stale_fire_neither_retires_another_hosts_schedule_nor_is_queued() {
         let harness = SchedulerHarness::new().await;
-        let job = harness
-            .overdue_job(
-                Schedule::At(Utc::now() - chrono::Duration::minutes(1)),
+        let schedule = harness
+            .overdue_schedule(
+                Timing::At(Utc::now() - chrono::Duration::minutes(1)),
                 None,
                 chrono::Duration::minutes(1),
             )
@@ -3332,8 +3038,8 @@ mod tests {
         assert!(
             store
                 .claim_occurrence(
-                    &job.id,
-                    job.next_fire_at,
+                    &schedule.id,
+                    schedule.next_fire_at,
                     "host-a",
                     long_ago,
                     long_ago + chrono::Duration::minutes(1),
@@ -3345,8 +3051,8 @@ mod tests {
         assert!(
             store
                 .claim_occurrence(
-                    &job.id,
-                    job.next_fire_at,
+                    &schedule.id,
+                    schedule.next_fire_at,
                     "host-b",
                     now,
                     now + chrono::Duration::hours(1)
@@ -3355,268 +3061,46 @@ mod tests {
                 .expect("host B takes the expired lease")
         );
 
-        // Host A finally finishes and retires the one-shot it thinks it delivered.
-        store
-            .complete_claim(&job.id, "host-a", None, Some(Utc::now()), None)
-            .await
-            .expect("complete");
-
+        // Host A's gate finally passes, and it queues the fire it thinks it holds.
         assert_eq!(
-            harness.jobs().await.len(),
-            1,
-            "host B is still delivering it: a stale completion may not retire the row"
-        );
-    }
-
-    /// A turn that panics leaves its claim to expire, and is not forgiven for it.
-    ///
-    /// Two properties in one shape, because they are the same trade. Leaving the lease is what
-    /// spaces the retries: giving the occurrence back at once leaves the row due on the next
-    /// sweep, so three panics arrive within `3 * poll_interval` (half a minute at the default)
-    /// and park a recurring job that `missed_grace` will never retire. *Not* resetting the attempt
-    /// count is what stops the same panic being retried forever once the spacing is in place.
-    #[tokio::test]
-    async fn a_panicking_turn_leaves_its_claim_to_expire_and_still_counts_against_the_ceiling() {
-        let mut harness = SchedulerHarness::new().await;
-        // Expired by the time the next sweep looks, so one sweep stands in for one `claim_lease`.
-        // Set on the resolved config directly because `validate` refuses anything this short.
-        harness.config.claim_lease = Duration::from_millis(1);
-        let job = harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
-                None,
-                chrono::Duration::minutes(5),
-            )
-            .await;
-
-        let attempts_after = |attempt: u32| {
-            let manager = harness.manager.clone();
-            let config = harness.config.clone();
-            let id = job.id.clone();
-            async move {
-                run_due(
-                    &manager,
-                    &config,
-                    None,
-                    &NoResidents,
-                    &SchedulerScope::every_job(),
-                    &move |_wakeup: Wakeup| async move {
-                        panic!("the turn blew up");
-                    },
-                )
+            store
+                .queue_fire(&schedule, "host-a", None, None, crate::store::inbox::Fire {
+                    schedule_id: schedule.id.clone(),
+                    gate_output: None,
+                    occurrences: 1,
+                    due_at: schedule.next_fire_at,
+                    fired_at: Utc::now(),
+                })
                 .await
-                .expect("the sweep survives the panic");
-                tokio::time::sleep(Duration::from_millis(3)).await;
-                manager
-                    .schedule_store()
-                    .list_all_scheduled_jobs()
-                    .await
-                    .expect("list")
-                    .into_iter()
-                    .find(|job| job.id == id)
-                    .unwrap_or_else(|| panic!("attempt {attempt}: the job survives the panic"))
-                    .attempts
-            }
-        };
+                .expect("the write runs"),
+            ClaimClosed::LeaseLost
+        );
 
         assert_eq!(
-            attempts_after(1).await,
+            harness.schedules().await.len(),
             1,
-            "the crash is counted rather than forgiven"
+            "host B is still evaluating it: a stale fire may not retire the row"
         );
-        assert_eq!(
-            attempts_after(2).await,
-            2,
-            "a second panic counts again: forgiving it would retry this prompt forever"
-        );
-        assert_eq!(attempts_after(3).await, MAX_CLAIM_ATTEMPTS);
-
-        // The ceiling is reached, so the fourth sweep does not hand it to another turn to kill.
-        harness.tick().await;
-        assert!(harness.fired().is_empty(), "and the job is parked");
-    }
-
-    /// A fire the host could not run is held for its lease and does not count: three of them leave
-    /// `attempts` where it was, every surface says why while it lasts, and the job fires once its
-    /// session can run it again. An empty prompt is the job's own and still counts beside it.
-    ///
-    /// The cause is the installation's (a profile renamed under a running `meka serve`), so parking
-    /// would outlast the fix, and the parked reason would blame the job's prompt for it.
-    #[tokio::test]
-    async fn an_unrunnable_fire_is_retried_each_lease_without_counting_toward_parking() {
-        let harness = SchedulerHarness::new().await;
-        let hourly = || Schedule::parse_every("1h").expect("parses");
-        let job = harness
-            .overdue_job(hourly(), None, chrono::Duration::minutes(5))
-            .await;
-        let empty = harness
-            .overdue_job(hourly(), None, chrono::Duration::minutes(5))
-            .await;
-        let expire_the_leases = || {
-            let past = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
-            let connection = harness.manager.schedule_store().connection.clone();
-            async move {
-                connection
-                    .call(move |connection| {
-                        connection.execute(
-                            "UPDATE scheduled_jobs SET claim_expires_at = ?1",
-                            rusqlite::params![past],
-                        )
-                    })
-                    .await
-                    .expect("the rows are there");
-            }
-        };
-        let unrunnable = |wakeup: Wakeup| {
-            std::future::ready(FireOutcome::Unrunnable(if wakeup.job.id == empty.id {
-                Unrunnable::EmptyPrompt
-            } else {
-                Unrunnable::BindingsUnresolved(
-                    "no profile named 'work' (configured: home)".to_string(),
-                )
-            }))
-        };
-        let row = |rows: &[ScheduledJob], id: &str| {
-            rows.iter()
-                .find(|row| row.id == id)
-                .cloned()
-                .expect("the job is kept")
-        };
-
-        let mut held = job.clone();
-        for attempt in 1..=MAX_CLAIM_ATTEMPTS {
-            run_due(
-                &harness.manager,
-                &harness.config,
-                None,
-                &NoResidents,
-                &SchedulerScope::every_job(),
-                &unrunnable,
-            )
-            .await
-            .expect("the sweep runs");
-            let after = harness.jobs().await;
-            held = row(&after, &job.id);
-            assert_eq!(
-                held.attempts, 0,
-                "attempt {attempt}: a fire the host could not run is not counted"
-            );
-            assert_eq!(
-                row(&after, &empty.id).attempts,
-                attempt,
-                "attempt {attempt}: an empty prompt is the job's own, and counts"
-            );
-            let reported = job_withheld_reason(
-                harness.manager.scheduler_memory(),
-                &held,
-                crate::permission::Permission::Unrestricted,
-                None,
-            )
-            .unwrap_or_default();
-            assert!(
-                reported.contains("did not resolve")
-                    && reported.contains("no profile named 'work'"),
-                "attempt {attempt}: and it is reported for what it is: {reported}"
-            );
-
-            harness.tick().await;
-            assert!(
-                harness.fired().is_empty(),
-                "attempt {attempt}: the claims are held for their lease, so the retry waits it out"
-            );
-            expire_the_leases().await;
-        }
-
-        harness.tick().await;
-        let fired: Vec<String> = harness
-            .fired()
-            .into_iter()
-            .map(|fired| fired.job_id)
-            .collect();
-        assert_eq!(
-            fired,
-            [job.id.as_str()],
-            "the job fires once its session can run it, and the empty prompt is parked"
-        );
-        // Asked of the row as it stood before the turn first: a reader holding the row as it is now
-        // clears the record on its own, by the witness.
-        assert_eq!(
-            harness.manager.scheduler_memory().unrunnable_reason(&held),
-            None,
-            "the record goes with the fire that ran, not only with the row the fire moved"
-        );
-        assert_eq!(
-            job_withheld_reason(
-                harness.manager.scheduler_memory(),
-                &row(&harness.jobs().await, &job.id),
-                crate::permission::Permission::Unrestricted,
-                None,
-            ),
-            None,
-            "and nothing says it cannot fire any more"
-        );
-    }
-
-    /// What the attempt counter exists for still counts beside an unrunnable fire: a claim a host
-    /// abandoned by dying.
-    #[tokio::test]
-    async fn a_claim_abandoned_by_a_dead_owner_still_counts_beside_an_unrunnable_fire() {
-        let harness = SchedulerHarness::new().await;
-        let job = harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
-                None,
-                chrono::Duration::minutes(5),
-            )
-            .await;
-        let died_at = Utc::now() - chrono::Duration::hours(2);
         assert!(
             harness
                 .manager
-                .schedule_store()
-                .claim_occurrence(
-                    &job.id,
-                    job.next_fire_at,
-                    "host-that-died",
-                    died_at,
-                    died_at + chrono::Duration::hours(1),
-                )
+                .inbox_store()
+                .list_open(harness.session_id)
                 .await
-                .expect("claim"),
-            "a host takes the occurrence and dies holding it"
-        );
-
-        run_due(
-            &harness.manager,
-            &harness.config,
-            None,
-            &NoResidents,
-            &SchedulerScope::every_job(),
-            &|_wakeup: Wakeup| {
-                std::future::ready(FireOutcome::Unrunnable(Unrunnable::SessionUnreachable(
-                    "database is locked".to_string(),
-                )))
-            },
-        )
-        .await
-        .expect("the sweep runs");
-
-        let after = harness.jobs().await;
-        assert_eq!(
-            after.first().expect("the job is kept").attempts,
-            1,
-            "the dead host's claim counts, and the unrunnable fire after it forgives only its own"
+                .expect("list")
+                .is_empty(),
+            "and queues nothing, since the occurrence is host B's"
         );
     }
 
-    /// The other half of the reorder: a *recurring* job refused for authority still spends the
+    /// The other half of the reorder: a *recurring* schedule refused for authority still spends the
     /// occurrence it came due for.
     ///
-    /// Moving the checks above the claim must not turn a held job into one that sits permanently
-    /// due, accumulating a backlog it would report the moment it was authorized again. Only the
-    /// one-shot is spared, because only the one-shot's claim destroys anything.
+    /// Moving the checks above the claim must not turn a held schedule into one that sits
+    /// permanently due, accumulating a backlog it would report the moment it was authorized again.
+    /// Only the one-shot is spared, because only the one-shot's claim destroys anything.
     #[tokio::test]
-    async fn a_refused_recurring_job_still_spends_its_occurrence() {
+    async fn a_refused_recurring_schedule_still_spends_its_occurrence() {
         let harness = SchedulerHarness::new().await;
         harness
             .manager
@@ -3626,9 +3110,9 @@ mod tests {
             })
             .await
             .expect("record the level the session was set to");
-        let job = harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+        let schedule = harness
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 Some(gate("true", GatePredicate::Succeeded, None)),
                 chrono::Duration::minutes(5),
             )
@@ -3636,21 +3120,21 @@ mod tests {
 
         harness.tick().await;
 
-        let after = harness.jobs().await;
+        let after = harness.schedules().await;
         let [refused] = after.as_slice() else {
-            panic!("the job survives a refusal: {after:?}");
+            panic!("the schedule survives a refusal: {after:?}");
         };
         assert!(harness.fired().is_empty(), "it must not have fired");
         assert!(
-            refused.next_fire_at > job.next_fire_at,
+            refused.next_fire_at > schedule.next_fire_at,
             "the occurrence is spent, exactly as it is when a gate runs and says no"
         );
     }
 
-    /// The companion, so the refusal above is about `none` and not about ungated jobs having
-    /// quietly stopped working: one rung up, the same job fires.
+    /// The companion, so the refusal above is about `none` and not about ungated schedules having
+    /// quietly stopped working: one rung up, the same schedule fires.
     #[tokio::test]
-    async fn an_ungated_job_fires_on_a_session_at_read() {
+    async fn an_ungated_schedule_fires_on_a_session_at_read() {
         let harness = SchedulerHarness::new().await;
         harness
             .manager
@@ -3661,8 +3145,8 @@ mod tests {
             .await
             .expect("record the level the session was set to");
         harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 None,
                 chrono::Duration::minutes(5),
             )
@@ -3681,8 +3165,8 @@ mod tests {
     ///
     /// Both creation doors call `gate_probe_is_authorized`; a fire door that instead demands
     /// `unrestricted` whatever the probe is would *accept* a tool gate at `read` and then decline
-    /// it on every tick forever, warning about an unattended shell command the job does not have.
-    /// The headline case, `mcp__…__unseen` at `read`, would never call its probe once.
+    /// it on every tick forever, warning about an unattended shell command the schedule does not
+    /// have. The headline case, `mcp__…__unseen` at `read`, would never call its probe once.
     ///
     /// Every other fire-time test here uses a shell gate at `unrestricted`, where the two checks
     /// agree, so only this one can tell them apart.
@@ -3691,8 +3175,8 @@ mod tests {
         let harness =
             SchedulerHarness::at_session_permission(crate::permission::Permission::Read).await;
         harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 Some(Gate {
                     probe: tool_probe(),
                     predicate: GatePredicate::Succeeded,
@@ -3722,15 +3206,15 @@ mod tests {
         );
     }
 
-    /// The companion, and the user's second scenario: the same job, after the operator retuned the
-    /// tool above `read`. Withdrawn at fire time, without the row changing.
+    /// The companion, and the user's second scenario: the same schedule, after the operator retuned
+    /// the tool above `read`. Withdrawn at fire time, without the row changing.
     #[tokio::test]
     async fn a_tool_gate_stops_firing_once_the_tool_resolves_above_read() {
         let harness =
             SchedulerHarness::at_session_permission(crate::permission::Permission::Read).await;
         harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 Some(Gate {
                     probe: tool_probe(),
                     predicate: GatePredicate::Succeeded,
@@ -3755,7 +3239,7 @@ mod tests {
         assert!(
             harness.fired().is_empty(),
             "a tool that no longer resolves to `read` must stop being a gate, or retuning \
-             `tool_permissions` means nothing to a job already on the timer"
+             `tool_permissions` means nothing to a schedule already on the timer"
         );
     }
 
@@ -3767,8 +3251,8 @@ mod tests {
         let harness = SchedulerHarness::new().await;
         let due = Utc::now() - chrono::Duration::minutes(1);
         harness
-            .overdue_job(
-                Schedule::At(due),
+            .overdue_schedule(
+                Timing::At(due),
                 Some(gate("exit 1", GatePredicate::Succeeded, None)),
                 chrono::Duration::minutes(1),
             )
@@ -3778,7 +3262,7 @@ mod tests {
 
         assert!(harness.fired().is_empty(), "the condition was false");
         assert!(
-            harness.jobs().await.is_empty(),
+            harness.schedules().await.is_empty(),
             "and the one-shot is gone rather than left to retry forever"
         );
     }
@@ -3787,8 +3271,8 @@ mod tests {
     async fn gate_output_rides_along_to_the_turn() {
         let harness = SchedulerHarness::new().await;
         harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 Some(gate("echo ci-red", GatePredicate::Changed, None)),
                 chrono::Duration::minutes(5),
             )
@@ -3800,48 +3284,43 @@ mod tests {
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].gate_output.as_deref(), Some("ci-red"));
         // The baseline is persisted, so an unchanged second evaluation stays quiet.
-        let jobs = harness.jobs().await;
+        let schedules = harness.schedules().await;
         assert_eq!(
-            jobs.first()
-                .and_then(|job| job.gate.as_ref())
+            schedules
+                .first()
+                .and_then(|schedule| schedule.gate.as_ref())
                 .and_then(|gate| gate.last_output.as_deref()),
             Some("ci-red")
         );
     }
 
-    /// The screen only owns the conversation it has open; a job belonging to another session must
-    /// be left for whichever host can actually run it.
+    /// A host's scope leaves a schedule it does not cover untouched: the screen owns only the
+    /// conversation it has open, and a schedule belonging to another session must be left for
+    /// whichever host can actually run it.
     #[tokio::test]
-    async fn session_scope_ignores_jobs_from_other_sessions() {
+    async fn session_scope_ignores_schedules_from_other_sessions() {
         let harness = SchedulerHarness::new().await;
         harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 None,
                 chrono::Duration::minutes(5),
             )
             .await;
 
         let fired = harness.fired.clone();
+        let inbox = harness.manager.inbox_store();
+        let elsewhere = uuid::Uuid::new_v4();
         run_due(
             &harness.manager,
             &harness.config,
             None,
             &NoResidents,
-            &SchedulerScope::OneSession(uuid::Uuid::new_v4()),
-            &move |wakeup: Wakeup| {
-                let fired = fired.clone();
-                async move {
-                    if let Ok(mut guard) = fired.lock() {
-                        guard.push(FiredRecord {
-                            job_id: wakeup.job.id.clone(),
-                            coalesced: wakeup.coalesced,
-                            gate_output: None,
-                            late_by: wakeup.late_by,
-                        });
-                    }
-                    FireOutcome::Ran
-                }
+            &SchedulerScope::Schedules(std::sync::Arc::new(move |schedule: &Schedule| {
+                schedule.session_id == elsewhere
+            })),
+            &move |schedule: Schedule, queued: QueuedFire| {
+                record_fire(fired.clone(), inbox.clone(), schedule, queued)
             },
         )
         .await
@@ -3849,137 +3328,9 @@ mod tests {
 
         assert!(harness.fired().is_empty());
         assert_eq!(
-            harness.jobs().await.len(),
+            harness.schedules().await.len(),
             1,
-            "and the job is untouched, not consumed"
-        );
-    }
-
-    /// A host that cannot take a job must not consume its occurrence. `meka serve` hits this
-    /// whenever a screen holds the session's file lock: `prepare` has already stamped and advanced
-    /// the job by the time the lock is attempted, so without the restore the job would be
-    /// silently skipped on every tick for as long as the screen stayed open.
-    #[tokio::test]
-    async fn a_deferred_job_keeps_its_occurrence() {
-        let harness = SchedulerHarness::new().await;
-        let job = harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
-                None,
-                chrono::Duration::minutes(5),
-            )
-            .await;
-        let due_before = job.next_fire_at;
-
-        run_due(
-            &harness.manager,
-            &harness.config,
-            None,
-            &NoResidents,
-            &SchedulerScope::every_job(),
-            &|_wakeup: Wakeup| std::future::ready(FireOutcome::Deferred),
-        )
-        .await
-        .expect("tick runs");
-
-        let jobs = harness.jobs().await;
-        let job = jobs.first().expect("job survives a deferral");
-        assert_eq!(
-            job.next_fire_at, due_before,
-            "the occurrence must be put back, not spent"
-        );
-        assert!(
-            job.last_fired_at.is_none(),
-            "and it must not be recorded as having fired"
-        );
-
-        // Still due, so the host that *can* run it sees it on its next sweep.
-        assert_eq!(
-            harness
-                .manager
-                .schedule_store()
-                .list_due_scheduled_jobs(Utc::now())
-                .await
-                .expect("list due")
-                .len(),
-            1
-        );
-    }
-
-    /// The one-shot case of a deferral, which the recurring test above does not reach. Claiming a
-    /// one-shot *deletes* its row, so a restore that only updated columns matched nothing, reported
-    /// success, and lost the reminder for good. That is the concrete "remind me in 20 minutes"
-    /// failure when `meka serve` and a screen race for the same session.
-    #[tokio::test]
-    async fn a_deferred_one_shot_is_not_lost() {
-        let harness = SchedulerHarness::new().await;
-        let due = Utc::now() - chrono::Duration::minutes(1);
-        let created = harness
-            .overdue_job(Schedule::At(due), None, chrono::Duration::minutes(1))
-            .await;
-
-        run_due(
-            &harness.manager,
-            &harness.config,
-            None,
-            &NoResidents,
-            &SchedulerScope::every_job(),
-            &|_wakeup: Wakeup| std::future::ready(FireOutcome::Deferred),
-        )
-        .await
-        .expect("tick runs");
-
-        let jobs = harness.jobs().await;
-        assert_eq!(jobs.len(), 1, "the reminder must survive a deferral");
-        let job = jobs.first().expect("job present");
-        assert_eq!(job.id, created.id);
-        assert_eq!(
-            job.next_fire_at, created.next_fire_at,
-            "still due, for the host that can run it"
-        );
-        assert!(job.last_fired_at.is_none());
-    }
-
-    /// A deferral must also leave the gate's baseline alone.
-    ///
-    /// The baseline is measured inside `prepare` and rides on the [`Claim`] until the occurrence is
-    /// disposed of, which is what makes this work: a host that evaluates, decides to fire and then
-    /// cannot run the turn writes nothing. Persisting it at the moment the gate returned would
-    /// leave the watcher having already absorbed the change it exists to report, so the next host
-    /// would compare the new value against itself, see nothing, and stay quiet forever.
-    #[tokio::test]
-    async fn a_deferred_gated_job_keeps_its_baseline() {
-        let harness = SchedulerHarness::new().await;
-        harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
-                Some(gate(
-                    "echo changed",
-                    GatePredicate::Changed,
-                    Some("original"),
-                )),
-                chrono::Duration::minutes(1),
-            )
-            .await;
-
-        run_due(
-            &harness.manager,
-            &harness.config,
-            None,
-            &NoResidents,
-            &SchedulerScope::every_job(),
-            &|_wakeup: Wakeup| std::future::ready(FireOutcome::Deferred),
-        )
-        .await
-        .expect("tick runs");
-
-        let jobs = harness.jobs().await;
-        assert_eq!(
-            jobs.first()
-                .and_then(|job| job.gate.as_ref())
-                .and_then(|gate| gate.last_output.as_deref()),
-            Some("original"),
-            "the baseline must be as it was, so the change still fires for the next host"
+            "and the schedule is untouched, not consumed"
         );
     }
 
@@ -3992,16 +3343,16 @@ mod tests {
     /// hand back.
     #[tokio::test]
     async fn only_one_host_can_claim_an_occurrence() {
-        for (label, schedule) in [
-            ("recurring", Schedule::parse_every("1h").expect("parses")),
+        for (label, timing) in [
+            ("recurring", Timing::parse_every("1h").expect("parses")),
             (
                 "one-shot",
-                Schedule::At(Utc::now() - chrono::Duration::minutes(1)),
+                Timing::At(Utc::now() - chrono::Duration::minutes(1)),
             ),
         ] {
             let harness = SchedulerHarness::new().await;
-            let job = harness
-                .overdue_job(schedule, None, chrono::Duration::minutes(5))
+            let schedule = harness
+                .overdue_schedule(timing, None, chrono::Duration::minutes(5))
                 .await;
             let store = harness.manager.schedule_store();
             let now = Utc::now();
@@ -4009,27 +3360,32 @@ mod tests {
 
             assert!(
                 store
-                    .claim_occurrence(&job.id, job.next_fire_at, "host-a", now, until)
+                    .claim_occurrence(&schedule.id, schedule.next_fire_at, "host-a", now, until)
                     .await
                     .expect("claim"),
                 "{label}: the first host to reach the row takes the occurrence"
             );
             assert!(
                 !store
-                    .claim_occurrence(&job.id, job.next_fire_at, "host-b", now, until)
+                    .claim_occurrence(&schedule.id, schedule.next_fire_at, "host-b", now, until)
                     .await
                     .expect("claim"),
                 "{label}: and the second, still holding the copy it listed, is refused"
             );
             assert_eq!(
-                harness.jobs().await.first().map(|job| job.next_fire_at),
-                Some(job.next_fire_at),
+                harness
+                    .schedules()
+                    .await
+                    .first()
+                    .map(|schedule| schedule.next_fire_at),
+                Some(schedule.next_fire_at),
                 "{label}: and the row itself has not moved, because a claim no longer consumes it"
             );
         }
     }
 
-    /// A lease that has run out is takeable, and that is what a crash costs: a delay, not the job.
+    /// A lease that has run out is takeable, and that is what a crash costs: a delay, not the
+    /// schedule.
     ///
     /// The host that dies mid-delivery never releases. Were a claim to consume the row (advance
     /// past the occurrence, or delete a one-shot outright), the occurrence would be gone with
@@ -4037,9 +3393,9 @@ mod tests {
     #[tokio::test]
     async fn an_expired_lease_is_taken_by_the_next_host() {
         let harness = SchedulerHarness::new().await;
-        let job = harness
-            .overdue_job(
-                Schedule::At(Utc::now() - chrono::Duration::minutes(1)),
+        let schedule = harness
+            .overdue_schedule(
+                Timing::At(Utc::now() - chrono::Duration::minutes(1)),
                 None,
                 chrono::Duration::minutes(1),
             )
@@ -4050,8 +3406,8 @@ mod tests {
         assert!(
             store
                 .claim_occurrence(
-                    &job.id,
-                    job.next_fire_at,
+                    &schedule.id,
+                    schedule.next_fire_at,
                     "host-that-died",
                     died_at,
                     died_at + chrono::Duration::hours(1),
@@ -4064,18 +3420,18 @@ mod tests {
         assert!(
             store
                 .claim_occurrence(
-                    &job.id,
-                    job.next_fire_at,
+                    &schedule.id,
+                    schedule.next_fire_at,
                     "host-b",
                     now,
                     now + chrono::Duration::hours(1)
                 )
                 .await
                 .expect("claim"),
-            "an hour later the lease has expired and the job is deliverable again"
+            "an hour later the lease has expired and the schedule is deliverable again"
         );
         assert_eq!(
-            harness.jobs().await.len(),
+            harness.schedules().await.len(),
             1,
             "and it was there to be taken, which a consumed row would not have been"
         );
@@ -4084,17 +3440,17 @@ mod tests {
     /// A gate that cannot be evaluated spends the occurrence, exactly as one that ran and said no
     /// does.
     ///
-    /// Releasing the lease instead, since nothing was measured and the job has not had its turn,
-    /// would leave `next_fire_at` where it was, so the row would be due again on the very next
-    /// sweep: a six-hour job whose server is down would be re-probed every `poll_interval` rather
-    /// than every six hours, and a probe that hangs would burn the whole `gate_timeout` out of each
-    /// sweep.
+    /// Releasing the lease instead, since nothing was measured and the schedule has not fired,
+    /// would leave `next_fire_at` where it was, so the row would be due again on the very
+    /// next sweep: a six-hour schedule whose server is down would be re-probed every
+    /// `poll_interval` rather than every six hours, and a probe that hangs would burn the whole
+    /// `gate_timeout` out of each sweep.
     #[tokio::test]
     async fn a_gate_that_cannot_be_evaluated_spends_a_recurring_occurrence() {
         let harness = SchedulerHarness::new().await;
-        let job = harness
-            .overdue_job(
-                Schedule::parse_every("6h").expect("parses"),
+        let schedule = harness
+            .overdue_schedule(
+                Timing::parse_every("6h").expect("parses"),
                 // A pointer into output that is not JSON: an error on every evaluation.
                 Some(gate(
                     "echo not-json-at-all",
@@ -4113,20 +3469,20 @@ mod tests {
         }
 
         assert!(harness.fired().is_empty(), "a broken gate never fires");
-        let after = harness.jobs().await;
-        let after = after.first().expect("the job survives");
+        let after = harness.schedules().await;
+        let after = after.first().expect("the schedule survives");
         assert!(
-            after.next_fire_at > job.next_fire_at,
+            after.next_fire_at > schedule.next_fire_at,
             "the occurrence is spent, so the next probe is a period away and not a tick away: \
              {:?} vs {:?}",
             after.next_fire_at,
-            job.next_fire_at
+            schedule.next_fire_at
         );
         assert_eq!(
             harness
                 .manager
                 .scheduler_memory()
-                .probe_failure(&job.id)
+                .probe_failure(&schedule.id)
                 .map(|(count, _)| count),
             Some(1),
             "and four sweeps cost one probe, because only one occurrence came due"
@@ -4142,7 +3498,7 @@ mod tests {
         );
         assert_eq!(
             after.attempts, 0,
-            "and the job is not on its way to being parked, because its occurrences are spent \
+            "and the schedule is not on its way to being parked, because its occurrences are spent \
              rather than accumulating"
         );
     }
@@ -4157,9 +3513,9 @@ mod tests {
     #[tokio::test]
     async fn a_gate_that_cannot_be_evaluated_holds_a_one_shots_lease_rather_than_reprobing() {
         let harness = SchedulerHarness::new().await;
-        let job = harness
-            .overdue_job(
-                Schedule::At(Utc::now() - chrono::Duration::minutes(1)),
+        let schedule = harness
+            .overdue_schedule(
+                Timing::At(Utc::now() - chrono::Duration::minutes(1)),
                 Some(gate(
                     "echo not-json-at-all",
                     GatePredicate::At {
@@ -4180,17 +3536,64 @@ mod tests {
             harness
                 .manager
                 .scheduler_memory()
-                .probe_failure(&job.id)
+                .probe_failure(&schedule.id)
                 .map(|(count, _)| count),
             Some(1),
             "six sweeps inside one lease cost one probe, not six"
         );
-        let after = harness.jobs().await;
-        let after = after.first().expect("the job is kept, not deleted");
+        let after = harness.schedules().await;
+        let after = after.first().expect("the schedule is kept, not deleted");
         assert_eq!(
             after.attempts, 1,
             "and it is nowhere near the ceiling, so a server that comes back inside the lease \
              still delivers the reminder"
+        );
+    }
+
+    /// A host on its way out gives back the lease of a gate it was running, and not this one: the
+    /// wait is the backoff, and handed back at every exit it would have the gate probed at every
+    /// start with the attempt taken back each time, so the schedule never parked.
+    #[tokio::test]
+    async fn a_host_that_leaves_keeps_the_lease_a_one_shot_s_failed_gate_holds() {
+        let harness = SchedulerHarness::new().await;
+        let schedule = harness
+            .overdue_schedule(
+                Timing::At(Utc::now() - chrono::Duration::minutes(1)),
+                Some(gate(
+                    "echo not-json-at-all",
+                    GatePredicate::At {
+                        pointer: "/chats".to_string(),
+                        is: PointerTest::NotEmpty,
+                    },
+                    None,
+                )),
+                chrono::Duration::minutes(1),
+            )
+            .await;
+
+        harness.tick().await;
+        harness
+            .manager
+            .schedule_store()
+            .give_back_gates_cut_short()
+            .await
+            .expect("give back");
+        harness.tick().await;
+
+        assert_eq!(
+            harness
+                .manager
+                .scheduler_memory()
+                .probe_failure(&schedule.id)
+                .map(|(count, _)| count),
+            Some(1),
+            "the lease still holds, so the next sweep does not probe again"
+        );
+        let after = harness.schedules().await;
+        assert_eq!(
+            after.first().expect("the schedule is kept").attempts,
+            1,
+            "and the attempt its claim counted stands"
         );
     }
 
@@ -4208,8 +3611,8 @@ mod tests {
         // setting anyone can configure.
         harness.config.claim_lease = Duration::from_millis(1);
         harness
-            .overdue_job(
-                Schedule::At(Utc::now() - chrono::Duration::minutes(1)),
+            .overdue_schedule(
+                Timing::At(Utc::now() - chrono::Duration::minutes(1)),
                 Some(gate(
                     "echo not-json-at-all",
                     GatePredicate::At {
@@ -4227,13 +3630,15 @@ mod tests {
             harness.tick().await;
         }
 
-        let after = harness.jobs().await;
-        let after = after.first().expect("a parked job is kept, not deleted");
+        let after = harness.schedules().await;
+        let after = after
+            .first()
+            .expect("a parked schedule is kept, not deleted");
         assert_eq!(
             after.attempts, MAX_CLAIM_ATTEMPTS,
-            "the ceiling still bites: past it the job is refused before its gate runs"
+            "the ceiling still bites: past it the schedule is refused before its gate runs"
         );
-        let reported = job_withheld_reason(
+        let reported = schedule_withheld_reason(
             harness.manager.scheduler_memory(),
             after,
             crate::permission::Permission::Unrestricted,
@@ -4257,33 +3662,33 @@ mod tests {
     /// dies holding a lease leaves it set for good. If those two paths tested the column rather
     /// than the expiry, such a row would be handed to `prepare` on every sweep and be invisible to
     /// both: a one-shot past its grace period would never be retired, never fired and never logged,
-    /// and a refused recurring job would never advance.
+    /// and a refused recurring schedule would never advance.
     #[tokio::test]
     async fn a_lease_left_by_a_dead_host_does_not_wedge_the_occurrence() {
-        for (label, schedule, level, overdue) in [
+        for (label, timing, level, overdue) in [
             (
                 "one-shot past its grace period is retired",
-                Schedule::At(Utc::now() - chrono::Duration::hours(25)),
+                Timing::At(Utc::now() - chrono::Duration::hours(25)),
                 crate::permission::Permission::Unrestricted,
                 chrono::Duration::hours(25),
             ),
             (
-                "recurring job refused at `none` still spends its occurrence",
-                Schedule::parse_every("1h").expect("parses"),
+                "recurring schedule refused at `none` still spends its occurrence",
+                Timing::parse_every("1h").expect("parses"),
                 crate::permission::Permission::None,
                 chrono::Duration::hours(6),
             ),
         ] {
-            let recurring = schedule.is_recurring();
+            let recurring = timing.is_recurring();
             let harness = SchedulerHarness::at_session_permission(level).await;
-            let job = harness.overdue_job(schedule, None, overdue).await;
+            let schedule = harness.overdue_schedule(timing, None, overdue).await;
             let store = harness.manager.schedule_store();
             let died_at = Utc::now() - overdue;
             assert!(
                 store
                     .claim_occurrence(
-                        &job.id,
-                        job.next_fire_at,
+                        &schedule.id,
+                        schedule.next_fire_at,
                         "host-that-died",
                         died_at,
                         died_at + chrono::Duration::hours(1),
@@ -4296,7 +3701,7 @@ mod tests {
             harness.tick().await;
 
             assert!(harness.fired().is_empty(), "{label}: nothing is delivered");
-            let after = harness.jobs().await;
+            let after = harness.schedules().await;
             match recurring {
                 false => assert!(
                     after.is_empty(),
@@ -4305,61 +3710,13 @@ mod tests {
                 true => assert!(
                     after
                         .first()
-                        .is_some_and(|after| after.next_fire_at > job.next_fire_at),
+                        .is_some_and(|after| after.next_fire_at > schedule.next_fire_at),
                     "{label}: {:?} vs {:?}",
                     after.first().map(|after| after.next_fire_at),
-                    job.next_fire_at
+                    schedule.next_fire_at
                 ),
             }
         }
-    }
-
-    /// A sweep that bounded its own coverage says so.
-    ///
-    /// The budget holds jobs over, and the next sweep takes them, so nothing is lost, which is
-    /// exactly why the line matters: without it a capped run is indistinguishable from a complete
-    /// one in the log, and an operator watching a backlog has no way to tell that the cap is what
-    /// they are looking at. The count has no reader but this line.
-    #[tokio::test]
-    async fn a_sweep_that_holds_jobs_over_reports_that_it_did() {
-        let mut harness = SchedulerHarness::new().await;
-        harness.config.max_consecutive_fires = 2;
-        for _ in 0..5 {
-            harness
-                .overdue_job(
-                    Schedule::parse_every("1h").expect("parses"),
-                    None,
-                    chrono::Duration::hours(6),
-                )
-                .await;
-        }
-
-        let logs = crate::streams::capture::capture_logs(tracing::Level::INFO);
-        harness.tick().await;
-        let reported = logs.logged();
-        drop(logs);
-        assert!(
-            reported.contains("held over 3 due job(s)"),
-            "five due jobs against a budget of two leaves three, and the count has to be right or \
-             the line is worse than nothing: {reported}"
-        );
-
-        // And it stays quiet when the budget did not engage, or it would train the reader to skip
-        // it.
-        let harness = SchedulerHarness::new().await;
-        harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
-                None,
-                chrono::Duration::hours(6),
-            )
-            .await;
-        let logs = crate::streams::capture::capture_logs(tracing::Level::INFO);
-        harness.tick().await;
-        assert!(
-            !logs.logged().contains("held over"),
-            "one job and a budget of five is not a bounded sweep"
-        );
     }
 
     /// Several hosts noticing the same expired one-shot produce one announcement, not one each.
@@ -4370,9 +3727,9 @@ mod tests {
     #[tokio::test]
     async fn only_the_host_that_removed_an_expired_one_shot_announces_it() {
         let harness = SchedulerHarness::new().await;
-        let job = harness
-            .overdue_job(
-                Schedule::At(Utc::now() - chrono::Duration::hours(30)),
+        let schedule = harness
+            .overdue_schedule(
+                Timing::At(Utc::now() - chrono::Duration::hours(30)),
                 None,
                 chrono::Duration::hours(30),
             )
@@ -4382,36 +3739,36 @@ mod tests {
 
         assert!(
             store
-                .retire_unclaimed(&job.id, job.next_fire_at, now)
+                .retire_unclaimed(&schedule.id, schedule.next_fire_at, now)
                 .await
                 .expect("retire"),
             "the host whose delete removed the row is the one that announces it"
         );
         assert!(
             !store
-                .retire_unclaimed(&job.id, job.next_fire_at, now)
+                .retire_unclaimed(&schedule.id, schedule.next_fire_at, now)
                 .await
                 .expect("retire"),
             "and a host arriving afterwards stays quiet rather than repeating it"
         );
     }
 
-    /// A parked job is not accused of crashing Meka when nothing knows that it did.
+    /// A parked schedule is not blamed on its host when nothing knows that it was.
     ///
     /// `attempts` is on the row; the reason it rose is in a process-global map. A restart is
-    /// exactly what an operator does once a job has gone inert, and `meka schedule list` is a
+    /// exactly what an operator does once a schedule has gone inert, and `meka schedule list` is a
     /// separate process that never had the map at all, so the commonest way to read this message
     /// is with the cause missing. Asserting the likelier cause from that absence would tell someone
-    /// whose MCP server was misconfigured that their prompt takes Meka down, with a remedy aimed at
+    /// whose MCP server was misconfigured that their host keeps stopping, with a remedy aimed at
     /// the wrong thing, in the model's own `[Scheduled]` block.
     ///
     /// The row still settles it one way: no gate means no probe that could have failed.
     #[tokio::test]
-    async fn a_parked_job_is_only_called_a_crash_when_the_row_can_prove_it() {
+    async fn a_parked_schedule_is_only_called_a_crash_when_the_row_can_prove_it() {
         let harness = SchedulerHarness::new().await;
         let mut gated = harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 Some(gate("true", GatePredicate::Succeeded, None)),
                 chrono::Duration::minutes(1),
             )
@@ -4421,7 +3778,7 @@ mod tests {
         // the state every reader is in after a restart.
         let memory = SchedulerMemory::default();
 
-        let reported = job_withheld_reason(
+        let reported = schedule_withheld_reason(
             &memory,
             &gated,
             crate::permission::Permission::Unrestricted,
@@ -4429,18 +3786,18 @@ mod tests {
         )
         .unwrap_or_default();
         assert!(
-            !reported.contains("the host died"),
-            "a gated job could have been parked by either cause, so neither may be asserted: \
+            !reported.contains("each time"),
+            "a gated schedule could have been parked by either cause, so neither may be asserted: \
              {reported}"
         );
         assert!(
-            reported.contains("gate cannot be evaluated") && reported.contains("takes the host"),
+            reported.contains("gate cannot be evaluated") && reported.contains("the host stopped"),
             "both possibilities are named, so the operator knows what to check: {reported}"
         );
 
         let mut ungated = gated;
         ungated.gate = None;
-        let reported = job_withheld_reason(
+        let reported = schedule_withheld_reason(
             &memory,
             &ungated,
             crate::permission::Permission::Unrestricted,
@@ -4448,9 +3805,9 @@ mod tests {
         )
         .unwrap_or_default();
         assert!(
-            reported.contains("the host died"),
-            "with no gate there is no probe that could have failed, so the crash can be named: \
-             {reported}"
+            reported.contains("the host stopped or its store refused the write each time"),
+            "with no gate there is no probe that could have failed, so the host's failure can be \
+             named: {reported}"
         );
     }
 
@@ -4459,21 +3816,21 @@ mod tests {
     /// The counter is per process and only the host that wins `claim_occurrence` ever touches it.
     /// Which host wins is a race between their tickers, so a second `meka serve` on the same store
     /// can take over every occurrence and heal the gate while this process's count stays where it
-    /// stopped. The marker would then stand forever: the model told, every turn, that a job firing
-    /// hourly was dead.
+    /// stopped. The marker would then stand forever: the model told, every turn, that a schedule
+    /// firing hourly was dead.
     ///
     /// Driven in one process rather than two. Advancing `last_fired_at` here is exactly what the
-    /// other host's `complete_claim` writes, and the counter it has to convince lives in this
+    /// other host's fire writes, and the counter it has to convince lives in this
     /// process either way, so a second one would add wall-clock and no signal. It would add
-    /// *coverage*, though: `GET /v1/jobs` does put this verdict on a wire
-    /// (`host::http::handlers::jobs` renders it as `withheld`), so a two-host test is constructible
-    /// and would exercise the convergence end to end rather than at the predicate.
+    /// *coverage*, though: `GET /v1/schedules` does put this verdict on a wire
+    /// (`host::http::handlers::schedules` renders it as `withheld`), so a two-host test is
+    /// constructible and would exercise the convergence end to end rather than at the predicate.
     #[tokio::test]
     async fn a_probe_verdict_stands_down_when_another_host_has_evaluated_the_gate() {
         let harness = SchedulerHarness::new().await;
-        let job = harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+        let schedule = harness
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 Some(gate("true", GatePredicate::Succeeded, None)),
                 chrono::Duration::minutes(1),
             )
@@ -4481,24 +3838,24 @@ mod tests {
         let memory = harness.manager.scheduler_memory();
 
         for _ in 0..PROBE_FAILURES_BEFORE_REPORTING {
-            memory.record_probe_failure(&job, "server said no such tool");
+            memory.record_probe_failure(&schedule, "server said no such tool");
         }
         assert!(
-            memory.standing_probe_failure(&job).is_some(),
+            memory.standing_probe_failure(&schedule).is_some(),
             "two failures with nothing to contradict them is a standing condition"
         );
 
-        // What the other host's `complete_claim` writes when it fires the job. The failing path
-        // writes neither this nor the baseline, so it cannot be this process's own doing.
-        let mut fired = job.clone();
+        // What the other host's write records when it fires the schedule. The failing path writes
+        // neither this nor the baseline, so it cannot be this process's own doing.
+        let mut fired = schedule.clone();
         fired.last_fired_at = Some(Utc::now());
         assert!(
             memory.standing_probe_failure(&fired).is_none(),
-            "the job has fired since the last failure was counted, so somebody evaluated this \
+            "the schedule has fired since the last failure was counted, so somebody evaluated this \
              gate and got an answer"
         );
         assert!(
-            memory.standing_probe_failure(&job).is_none(),
+            memory.standing_probe_failure(&schedule).is_none(),
             "and the verdict is dropped rather than merely suppressed, so it does not come back \
              the next time this process reads the pre-fire row"
         );
@@ -4509,9 +3866,9 @@ mod tests {
     #[tokio::test]
     async fn a_probe_verdict_also_stands_down_on_a_baseline_another_host_recorded() {
         let harness = SchedulerHarness::new().await;
-        let job = harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+        let schedule = harness
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 Some(gate("true", GatePredicate::Changed, Some("old"))),
                 chrono::Duration::minutes(1),
             )
@@ -4519,11 +3876,11 @@ mod tests {
         let memory = harness.manager.scheduler_memory();
 
         for _ in 0..PROBE_FAILURES_BEFORE_REPORTING {
-            memory.record_probe_failure(&job, "server said no such tool");
+            memory.record_probe_failure(&schedule, "server said no such tool");
         }
-        assert!(memory.standing_probe_failure(&job).is_some());
+        assert!(memory.standing_probe_failure(&schedule).is_some());
 
-        let mut evaluated = job;
+        let mut evaluated = schedule;
         if let Some(gate) = evaluated.gate.as_mut() {
             gate.last_output = Some("new".to_string());
         }
@@ -4535,19 +3892,19 @@ mod tests {
 
     /// Closing an occurrence that is not there any more is not the same as losing the lease.
     ///
-    /// Both make the scoped write match nothing, and they mean opposite things. A job that fires
-    /// and then cancels itself is an ordinary shape (`schedule_create`'s own reply tells the model
-    /// how), and conflating the two would tell it, on every such fire, that a duplicate delivery
-    /// was possible and that an unrelated setting should be raised.
+    /// Both make the scoped write match nothing, and they mean opposite things. A schedule that
+    /// fires and then cancels itself is an ordinary shape (`schedule_create`'s own reply tells the
+    /// model how), and conflating the two would tell it, on every such fire, that a duplicate
+    /// delivery was possible and that an unrelated setting should be raised.
     #[tokio::test]
-    async fn closing_an_occurrence_tells_a_canceled_job_from_a_lost_lease() {
+    async fn closing_an_occurrence_tells_a_canceled_schedule_from_a_lost_lease() {
         let harness = SchedulerHarness::new().await;
         let store = harness.manager.schedule_store();
         let now = Utc::now();
 
         let canceled = harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 None,
                 chrono::Duration::minutes(1),
             )
@@ -4565,12 +3922,12 @@ mod tests {
                 .expect("claim")
         );
         store
-            .delete_scheduled_job(&canceled.id)
+            .delete_schedule(&canceled.id)
             .await
-            .expect("the model cancels the job during its own turn");
+            .expect("the schedule is canceled while its gate runs");
         assert_eq!(
             store
-                .complete_claim(&canceled.id, "host-a", Some(now), Some(now), None)
+                .complete_claim(&canceled.id, "host-a", Some(now), None)
                 .await
                 .expect("complete"),
             ClaimClosed::RowGone,
@@ -4578,8 +3935,8 @@ mod tests {
         );
 
         let taken = harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 None,
                 chrono::Duration::minutes(1),
             )
@@ -4598,26 +3955,22 @@ mod tests {
         );
         assert_eq!(
             store
-                .complete_claim(&taken.id, "host-a", Some(now), Some(now), None)
+                .complete_claim(&taken.id, "host-a", Some(now), None)
                 .await
                 .expect("complete"),
             ClaimClosed::LeaseLost,
-            "the row is there under someone else's claim, so this turn may be delivered again"
+            "the row is there under someone else's claim, so the occurrence is still open"
         );
     }
 
-    /// A cancellation issued while a host holds the lease is not undone by the handback.
-    ///
-    /// This is the failure the lease exists for. Claiming a one-shot by deleting its row makes the
-    /// handback an `INSERT` that cannot tell "I deleted this a moment ago" from "the user canceled
-    /// it in between", and puts the job back either way, silently discarding the cancellation. A
-    /// release is scoped to the claim, so it cannot recreate anything.
+    /// A schedule canceled while a host holds its lease, its gate running, queues nothing: the
+    /// fire's write is scoped to the claim, so it finds the row gone and a cancellation wins.
     #[tokio::test]
-    async fn a_cancellation_during_a_claim_is_not_undone_by_the_handback() {
+    async fn a_schedule_canceled_while_its_gate_runs_queues_nothing() {
         let harness = SchedulerHarness::new().await;
-        let job = harness
-            .overdue_job(
-                Schedule::At(Utc::now() - chrono::Duration::minutes(1)),
+        let schedule = harness
+            .overdue_schedule(
+                Timing::At(Utc::now() - chrono::Duration::minutes(1)),
                 None,
                 chrono::Duration::minutes(1),
             )
@@ -4628,8 +3981,8 @@ mod tests {
         assert!(
             store
                 .claim_occurrence(
-                    &job.id,
-                    job.next_fire_at,
+                    &schedule.id,
+                    schedule.next_fire_at,
                     "host-a",
                     now,
                     now + chrono::Duration::hours(1)
@@ -4639,32 +3992,50 @@ mod tests {
         );
         assert!(
             store
-                .delete_scheduled_job(&job.id)
+                .delete_schedule(&schedule.id)
                 .await
-                .expect("the operator cancels it while the host works"),
+                .expect("the operator cancels it while the host works")
+                .is_some(),
             "the cancel removes a row that is still there, and says so"
         );
 
-        store
-            .release_claim(&job.id, "host-a")
-            .await
-            .expect("the host hands the occurrence back");
-
+        assert_eq!(
+            store
+                .queue_fire(&schedule, "host-a", None, None, crate::store::inbox::Fire {
+                    schedule_id: schedule.id.clone(),
+                    gate_output: None,
+                    occurrences: 1,
+                    due_at: schedule.next_fire_at,
+                    fired_at: now,
+                })
+                .await
+                .expect("the gate passed, and the host queues the fire"),
+            ClaimClosed::RowGone
+        );
         assert!(
-            harness.jobs().await.is_empty(),
-            "a canceled job stays canceled: the handback may not resurrect it"
+            harness.schedules().await.is_empty(),
+            "a canceled schedule stays canceled"
+        );
+        assert!(
+            harness
+                .manager
+                .inbox_store()
+                .list_open(harness.session_id)
+                .await
+                .expect("list")
+                .is_empty(),
+            "and nothing is queued for it"
         );
     }
 
     /// What a lost claim must cost: nothing. `prepare` evaluates the gate only after the claim is
-    /// won, so a host that arrives second neither spawns the command nor produces a wakeup, and
-    /// leaves the winner's schedule exactly as the winner wrote it.
+    /// won, so a host that arrives second neither spawns the command nor queues a fire, and leaves
+    /// the winner's schedule exactly as the winner wrote it.
     ///
-    /// Observed through a side effect on the filesystem for the same reason
-    /// [`a_held_over_job_does_not_run_its_gate`] is: a gate that ran and was then discarded leaves
-    /// every column identical to one that never ran.
+    /// Observed through a side effect on the filesystem: a gate that ran and was then discarded
+    /// leaves every column identical to one that never ran.
     #[tokio::test]
-    async fn a_lost_claim_runs_no_gate_and_produces_no_wakeup() {
+    async fn a_lost_claim_runs_no_gate_and_queues_no_fire() {
         let harness = SchedulerHarness::new().await;
         struct Probe(std::path::PathBuf);
         impl Drop for Probe {
@@ -4675,9 +4046,9 @@ mod tests {
         let guard =
             Probe(std::env::temp_dir().join(format!("meka-claim-probe-{}", uuid::Uuid::new_v4())));
         let probe = guard.0.clone();
-        let job = harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+        let schedule = harness
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 Some(gate(
                     &create_file_command(&probe),
                     GatePredicate::Succeeded,
@@ -4686,7 +4057,7 @@ mod tests {
                 chrono::Duration::minutes(5),
             )
             .await;
-        let job_next_fire_at = job.next_fire_at;
+        let schedule_next_fire_at = schedule.next_fire_at;
 
         // The other host gets there first, while this one is still holding the copy it listed.
         let now = Utc::now();
@@ -4695,8 +4066,8 @@ mod tests {
                 .manager
                 .schedule_store()
                 .claim_occurrence(
-                    &job.id,
-                    job.next_fire_at,
+                    &schedule.id,
+                    schedule.next_fire_at,
                     "the-other-host",
                     now,
                     now + chrono::Duration::hours(1)
@@ -4705,27 +4076,27 @@ mod tests {
                 .expect("the other host claims")
         );
 
-        let wakeup = prepare(
+        let queued = prepare(
             &harness.manager,
             &harness.config,
             None,
             &NoResidents,
-            job,
+            schedule,
             Utc::now(),
         )
         .await
         .expect("prepare runs");
 
-        assert!(wakeup.is_none(), "a host that lost the claim does not fire");
+        assert!(queued.is_none(), "a host that lost the claim does not fire");
         assert!(!probe.exists(), "and never ran the gate command");
         assert_eq!(
             harness
-                .jobs()
+                .schedules()
                 .await
                 .first()
-                .map(|job| job.next_fire_at)
-                .expect("job survives"),
-            job_next_fire_at,
+                .map(|schedule| schedule.next_fire_at)
+                .expect("schedule survives"),
+            schedule_next_fire_at,
             "and the winner's row is where the winner left it"
         );
     }
@@ -4733,11 +4104,11 @@ mod tests {
     /// The one-shot half of a lost claim: the host that did not win must not deliver "remind me in
     /// 20 minutes" a second time.
     #[tokio::test]
-    async fn a_lost_one_shot_claim_produces_no_wakeup() {
+    async fn a_lost_one_shot_claim_queues_no_fire() {
         let harness = SchedulerHarness::new().await;
-        let job = harness
-            .overdue_job(
-                Schedule::At(Utc::now() - chrono::Duration::minutes(1)),
+        let schedule = harness
+            .overdue_schedule(
+                Timing::At(Utc::now() - chrono::Duration::minutes(1)),
                 None,
                 chrono::Duration::minutes(1),
             )
@@ -4748,8 +4119,8 @@ mod tests {
                 .manager
                 .schedule_store()
                 .claim_occurrence(
-                    &job.id,
-                    job.next_fire_at,
+                    &schedule.id,
+                    schedule.next_fire_at,
                     "the-other-host",
                     now,
                     now + chrono::Duration::hours(1)
@@ -4758,92 +4129,20 @@ mod tests {
                 .expect("the other host claims")
         );
 
-        let wakeup = prepare(
+        let queued = prepare(
             &harness.manager,
             &harness.config,
             None,
             &NoResidents,
-            job,
+            schedule,
             Utc::now(),
         )
         .await
         .expect("prepare runs");
 
         assert!(
-            wakeup.is_none(),
+            queued.is_none(),
             "the reminder belongs to the host holding the lease"
-        );
-    }
-
-    /// A handback releases the occurrence *this* host holds, and nothing else.
-    ///
-    /// A whole-row upsert applied by id would let a host that lost the claim and was then refused
-    /// the session lock overwrite the winner's `next_fire_at` with a time already in the past,
-    /// bringing the job due on the very next tick while the winner is still running the turn. One
-    /// hourly occurrence would produce three gate runs and two agent turns that way.
-    ///
-    /// Scoping to the lease makes that structural rather than careful: the shape below is a host
-    /// whose lease expired and was taken over while it was still working, which is the only way two
-    /// hosts can now hold opinions about one job at once.
-    #[tokio::test]
-    async fn a_handback_does_not_reach_past_its_own_lease() {
-        let harness = SchedulerHarness::new().await;
-        let job = harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
-                None,
-                chrono::Duration::minutes(5),
-            )
-            .await;
-        let store = harness.manager.schedule_store();
-        let long_ago = Utc::now() - chrono::Duration::hours(2);
-
-        assert!(
-            store
-                .claim_occurrence(
-                    &job.id,
-                    job.next_fire_at,
-                    "host-a",
-                    long_ago,
-                    long_ago + chrono::Duration::minutes(1),
-                )
-                .await
-                .expect("claim"),
-            "host A takes the occurrence, and then takes far too long"
-        );
-        let now = Utc::now();
-        assert!(
-            store
-                .claim_occurrence(
-                    &job.id,
-                    job.next_fire_at,
-                    "host-b",
-                    now,
-                    now + chrono::Duration::hours(1)
-                )
-                .await
-                .expect("claim"),
-            "host B finds the lease expired and takes it over"
-        );
-
-        // Host A finally gives up and hands back what it thinks it holds.
-        store
-            .release_claim(&job.id, "host-a")
-            .await
-            .expect("release");
-
-        assert!(
-            !store
-                .claim_occurrence(
-                    &job.id,
-                    job.next_fire_at,
-                    "host-c",
-                    now,
-                    now + chrono::Duration::hours(1)
-                )
-                .await
-                .expect("claim"),
-            "host B still holds it: a stale release must not free an occurrence someone else owns"
         );
     }
 
@@ -4855,8 +4154,8 @@ mod tests {
     async fn a_late_write_does_not_land_on_another_hosts_occurrence() {
         let harness = SchedulerHarness::new().await;
         let planted = harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 Some(gate("echo state", GatePredicate::Changed, None)),
                 chrono::Duration::minutes(5),
             )
@@ -4895,7 +4194,6 @@ mod tests {
                 &planted.id,
                 "host-b",
                 Some(planted.next_fire_at + chrono::Duration::hours(1)),
-                None,
                 Some("theirs"),
             )
             .await
@@ -4903,28 +4201,35 @@ mod tests {
 
         // Host A finally finishes, and writes against the lease it thinks it holds.
         store
-            .complete_claim(
-                &planted.id,
+            .queue_fire(
+                &planted,
                 "host-a",
                 Some(planted.next_fire_at + chrono::Duration::hours(2)),
-                Some(Utc::now()),
                 Some("ours"),
+                crate::store::inbox::Fire {
+                    schedule_id: planted.id.clone(),
+                    gate_output: Some("ours".to_string()),
+                    occurrences: 1,
+                    due_at: planted.next_fire_at,
+                    fired_at: Utc::now(),
+                },
             )
             .await
-            .expect("complete");
+            .expect("the write runs");
 
-        let jobs = harness.jobs().await;
-        let job = jobs.first().expect("job survives");
+        let schedules = harness.schedules().await;
+        let schedule = schedules.first().expect("schedule survives");
         assert_eq!(
-            job.gate
+            schedule
+                .gate
                 .as_ref()
                 .and_then(|gate| gate.last_output.as_deref()),
             Some("theirs"),
             "a late baseline must not overwrite the one the lease holder recorded"
         );
         assert!(
-            job.last_fired_at.is_none(),
-            "and a late completion must not land on a row another host owns"
+            schedule.last_fired_at.is_none(),
+            "and a late fire must not land on a row another host owns"
         );
     }
 
@@ -4932,13 +4237,13 @@ mod tests {
     /// `to_rfc3339`, so the textual comparison matches in practice, but a row that reached the
     /// database any other way must still be claimable. The failure this guards against is the
     /// quietest one available: a compare-and-swap that matches nothing on every sweep, forever,
-    /// with the job simply never firing again and not a line said about it.
+    /// with the schedule simply never firing again and not a line said about it.
     #[tokio::test]
     async fn a_timestamp_stored_in_another_shape_is_still_claimable() {
         let harness = SchedulerHarness::new().await;
         let planted = harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 None,
                 chrono::Duration::minutes(5),
             )
@@ -4955,140 +4260,87 @@ mod tests {
             .expect("plant the timestamp");
 
         let due = store
-            .list_due_scheduled_jobs(Utc::now())
+            .list_due_schedules(Utc::now())
             .await
             .expect("list due");
-        let job = due.first().expect("still due");
+        let schedule = due.first().expect("still due");
         assert!(
             store
                 .claim_occurrence(
-                    &job.id,
-                    job.next_fire_at,
+                    &schedule.id,
+                    schedule.next_fire_at,
                     "host-a",
                     Utc::now(),
                     Utc::now() + chrono::Duration::hours(1)
                 )
                 .await
                 .expect("claim"),
-            "a job whose timestamp is not in Meka's own shape must still be claimable"
+            "a schedule whose timestamp is not in Meka's own shape must still be claimable"
         );
     }
 
-    /// A job that really fires records that it fired, and a recurring one past the grace period is
-    /// rescheduled rather than deleted.
+    /// A schedule that really fires records that it fired, and a recurring one past the grace
+    /// period is rescheduled rather than deleted.
     ///
     /// The store method has its own test, so this checks that `prepare` calls it: otherwise every
-    /// job would read as never-fired in `meka schedule list` and an interval schedule would
+    /// schedule would read as never-fired in `meka schedule list` and an interval schedule would
     /// re-anchor on `created_at` after a restart and replay everything since.
     ///
     /// And the `!recurring` term in `if !recurring && past_grace` needs a fixture that exercises
     /// it: `DEFAULT_MISSED_GRACE` is 24 hours and every other fixture in the suite is at most 6
-    /// hours overdue, so without one a laptop shut for a weekend could have every recurring job
-    /// silently retired.
+    /// hours overdue, so without one a laptop shut for a weekend could have every recurring
+    /// schedule silently retired.
     #[tokio::test]
-    async fn a_fire_is_recorded_and_a_long_outage_does_not_retire_a_recurring_job() {
+    async fn a_fire_is_recorded_and_a_long_outage_does_not_retire_a_recurring_schedule() {
         let harness = SchedulerHarness::new().await;
         // Well past `DEFAULT_MISSED_GRACE`, which is what makes the `!recurring` term the only
-        // thing standing between this job and deletion.
+        // thing standing between this schedule and deletion.
         let planted = harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
+            .overdue_schedule(
+                Timing::parse_every("1h").expect("parses"),
                 None,
                 chrono::Duration::days(3),
             )
             .await;
 
-        // Through a whole sweep rather than `prepare` alone, because the schedule is advanced and
-        // the fire recorded once the turn has actually been delivered. That ordering is the point
-        // of the lease: a crash before delivery costs a retry rather than the occurrence.
+        // Through a whole sweep, as a host runs one: the schedule is advanced and the fire recorded
+        // by the write that queues it, never before the gate has passed. That ordering is the
+        // point of the lease: a crash before it costs a retry rather than the occurrence.
         harness.tick().await;
 
         assert_eq!(
             harness.fired().len(),
             1,
-            "a recurring job is never past a grace period: its occurrences are one interval apart"
+            "a recurring schedule is never past a grace period: its occurrences are one interval apart"
         );
-        let job = harness
-            .jobs()
+        let schedule = harness
+            .schedules()
             .await
             .first()
             .cloned()
             .expect("and the row survives rather than being retired");
         assert!(
-            job.last_fired_at.is_some(),
-            "a job that fires has to record it, or a restart re-anchors on `created_at` and \
+            schedule.last_fired_at.is_some(),
+            "a schedule that fires has to record it, or a restart re-anchors on `created_at` and \
              replays every occurrence since"
         );
         assert!(
-            job.next_fire_at > Utc::now(),
+            schedule.next_fire_at > Utc::now(),
             "and be scheduled forward rather than left due"
         );
         assert_eq!(
-            (job.attempts, planted.attempts),
+            (schedule.attempts, planted.attempts),
             (0, 0),
             "and a delivered occurrence clears the crash count rather than accumulating one"
         );
     }
 
-    #[tokio::test]
-    async fn rendered_prompt_marks_the_turn_as_scheduled() {
-        let harness = SchedulerHarness::new().await;
-        let job = harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
-                None,
-                chrono::Duration::seconds(1),
-            )
-            .await;
-        let wakeup = Wakeup {
-            job,
-            gate_output: Some("ci-red".to_string()),
-            late_by: chrono::Duration::seconds(1),
-            coalesced: 0,
-        };
-        let rendered = wakeup.render_prompt();
-        assert!(rendered.starts_with("[Scheduled job "));
-        assert!(rendered.contains("do the thing"));
-        assert!(rendered.contains("[Gate output]\n> ci-red"));
-        assert!(
-            !rendered.contains("Late by"),
-            "a second of tick latency is not worth reporting"
-        );
-    }
-
-    /// A gate's output is whatever its command or tool read, a fetched page included, and the
-    /// fire is read in the user's role on a turn nobody watches: no line of it may pass for the
-    /// block's own header or for a second prompt.
-    #[tokio::test]
-    async fn a_gates_output_is_quoted_line_by_line_under_its_label() {
-        let harness = SchedulerHarness::new().await;
-        let job = harness
-            .overdue_job(
-                Schedule::parse_every("1h").expect("parses"),
-                None,
-                chrono::Duration::seconds(1),
-            )
-            .await;
-        let wakeup = Wakeup {
-            job,
-            gate_output: Some(format!("{}\n\u{1b}[2J", crate::text::FORGING_PAYLOAD)),
-            late_by: chrono::Duration::seconds(1),
-            coalesced: 0,
-        };
-        let rendered = wakeup.render_prompt();
-        crate::text::assert_payload_is_quoted(&rendered);
-        assert!(
-            !rendered.contains('\u{1b}'),
-            "a gate's output is sanitized as a report's is: {rendered:?}"
-        );
-    }
-
     #[test]
     fn is_recurring_separates_one_shots() {
-        assert!(!Schedule::At(at("2026-08-12T09:00:00Z")).is_recurring());
-        assert!(Schedule::parse_every("1h").expect("parses").is_recurring());
+        assert!(!Timing::At(at("2026-08-12T09:00:00Z")).is_recurring());
+        assert!(Timing::parse_every("1h").expect("parses").is_recurring());
         assert!(
-            Schedule::parse_cron("0 9 * * *", None)
+            Timing::parse_cron("0 9 * * *", None)
                 .expect("parses")
                 .is_recurring()
         );

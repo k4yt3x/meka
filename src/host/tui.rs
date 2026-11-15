@@ -304,14 +304,7 @@ pub(crate) async fn run_interactive(
             }
         },
     );
-    let mut resident = session_id.map(|id| {
-        crate::host::ResidentSession::from_parts(
-            id,
-            Arc::clone(&agent),
-            Arc::clone(&conversation),
-            cancel.clone(),
-        )
-    });
+    let mut resident = on_screen(session_id, &agent, &conversation, &cancel);
 
     // Persistent, cross-session recall in the store. On failure the composer walks nothing rather
     // than the run failing.
@@ -402,24 +395,43 @@ pub(crate) async fn run_interactive(
     // borrow it.
     let shared_session_id = Arc::new(std::sync::RwLock::new(session_id));
 
-    // Watcher, not a scheduler: it only tells the screen something is due. This loop owns the
-    // conversation, so it has to be the thing that evaluates gates and runs the turn.
+    // The sweep, for the session on screen, asked of its agent on every sweep so a `/resume` and a
+    // fresh session's first turn are followed: it checks a due schedule whatever the session is
+    // doing and queues its fire in the inbox, which a running turn reads at its next pause, and
+    // wakes the screen so an idle one gets a turn for it. Once the process is told to leave it
+    // takes no schedule, since nothing would read the fire.
+    let schedule_sweep = config.schedule.enabled.then(|| {
+        let on_screen = shared_agent.clone();
+        let ui = ui.clone();
+        crate::scheduler::spawn(
+            Arc::new(store.clone()),
+            config.schedule.clone(),
+            shared.gate_tools.clone(),
+            Arc::new(ScreenResidents {
+                agent: shared_agent.clone(),
+            }),
+            crate::scheduler::SchedulerScope::Schedules(Arc::new(
+                move |schedule: &crate::schedule::Schedule| {
+                    !INTERRUPT_RELAY.is_told_to_leave()
+                        && on_screen.get().session_id() == Some(schedule.session_id)
+                },
+            )),
+            move |_schedule, _queued| {
+                ui.send(UiEvent::Wake);
+                std::future::ready(())
+            },
+        )
+    });
+
+    // Watcher, not a driver: it only tells the screen something waits. This loop owns the
+    // conversation, so it has to be the thing that runs the turn.
     let schedule_watcher = {
         let store = store.clone();
         let shared_session_id = Arc::clone(&shared_session_id);
         let poll_interval = config.schedule.poll_interval;
-        let schedule_enabled = config.schedule.enabled;
         let background_enabled = config.background.enabled;
-        let watcher_schedule_config = config.schedule.clone();
-        let watcher_residents = ScreenResidents {
-            session_id: Arc::clone(&shared_session_id),
-            agent: shared_agent.clone(),
-        };
         let ui = ui.clone();
         tokio::spawn(async move {
-            if !schedule_enabled && !background_enabled {
-                return;
-            }
             let mut ticker = tokio::time::interval(poll_interval);
             ticker.tick().await;
             loop {
@@ -427,25 +439,15 @@ pub(crate) async fn run_interactive(
                 let Some(current) = *crate::sync::read(&shared_session_id) else {
                     continue;
                 };
-                let mut due = false;
-                if schedule_enabled {
-                    // The same question the fire door asks, as far as it can be answered without
-                    // running a gate probe; the weaker "is a row due" woke the prompt every
-                    // interval to run nothing.
-                    match crate::scheduler::wake_would_produce_work(
-                        &store,
-                        &watcher_schedule_config,
-                        &watcher_residents,
-                        current,
-                        chrono::Utc::now(),
-                    )
-                    .await
-                    {
-                        Ok(true) => due = true,
-                        Ok(false) => {}
-                        Err(error) => tracing::warn!("failed to poll the schedule: {error}"),
+                // Behind no switch, unlike the one below: the inbox exists whenever the screen
+                // does.
+                let mut due = match store.inbox_store().pending_count(current).await {
+                    Ok(pending) => pending > 0,
+                    Err(error) => {
+                        tracing::warn!("failed to poll the inbox: {error}");
+                        false
                     }
-                }
+                };
                 if background_enabled {
                     match store
                         .background_store()
@@ -510,41 +512,24 @@ pub(crate) async fn run_interactive(
                 record_session_cwd(&store, session.get(), &path).await;
             }
             HostEvent::Wake => {
+                // Sampled ahead of the drain, so a stop of a turn it opens is seen below.
+                let admission = cancel.admit();
                 if let Some(entry) = resident.clone() {
-                    let hooks = TuiHooks {
-                        entry: SessionEntry(entry.clone()),
-                        store: store.clone(),
-                        background_enabled: config.background.enabled,
-                        ui: ui.clone(),
-                    };
-                    // Gated on the switch, not just on having been woken: this arm is also
-                    // reached by a finished background task, and turning scheduling off must not
-                    // fire the jobs already in the database.
-                    if config.schedule.enabled
-                        && let Err(error) = crate::scheduler::run_due(
-                            &store,
-                            &config.schedule,
-                            shared.gate_tools.as_deref(),
-                            &hooks,
-                            &crate::scheduler::SchedulerScope::OneSession(entry.id),
-                            &|wakeup: crate::scheduler::Wakeup| {
-                                crate::host::scheduler::run_wakeup(&hooks, wakeup)
-                            },
-                        )
-                        .await
-                    {
-                        ui.error(&error);
-                    }
-                    if config.background.enabled {
+                    let hooks = TuiHooks::new(entry.clone(), &store, &config, &ui);
+                    hooks.drain_inbox().await;
+                    // Not after a stop, which may be the screen leaving: a turn opened then would
+                    // run with nothing left to show or stop it.
+                    if config.background.enabled && !cancel.canceled_since(admission) {
                         let sessions = crate::host::Sessions::<uuid::Uuid, SessionEntry>::new();
                         sessions
                             .write()
                             .await
                             .insert(entry.id, SessionEntry(entry.clone()));
-                        // The host is leaving, which here only a signal listener says (a hangup, a
-                        // termination, a SIGINT that is the ladder's last press): it sends the
-                        // `Exit` that ends the loop as interrupted, once the stopped background
-                        // tasks have had their moment.
+                        // The host is leaving (a hangup, a termination, a SIGINT that is the
+                        // ladder's last press, or the terminal found gone), and the `Exit` that
+                        // ends the loop as interrupted is on its way: a signal listener sends it
+                        // once the stopped background tasks have had their moment, and the screen
+                        // has sent its own.
                         if crate::host::scheduler::deliver_ready_outcomes(&hooks, &sessions)
                             .await
                             .is_break()
@@ -593,12 +578,28 @@ pub(crate) async fn run_interactive(
                     }
                     Err(error) => ui.error(&error),
                 }
+                drop(messages);
+                // Not after a stop, which may be the screen leaving: a turn opened then would run
+                // with nothing left to show or stop it.
+                if !cancel.canceled_since(admission)
+                    && let Some(entry) = on_screen(session_id, &agent, &conversation, &cancel)
+                {
+                    TuiHooks::new(entry, &store, &config, &ui)
+                        .drain_inbox()
+                        .await;
+                }
                 ui.done();
             }
             HostEvent::Command(command) => {
                 // Admitted here, as a prompt is: a command that opens a turn fetches what it sends
                 // first, and a Ctrl+C or a signal meanwhile counts against that turn.
                 let admission = cancel.admit();
+                let opens_a_turn = matches!(
+                    command,
+                    commands::SlashCommand::SkillInvoke { .. }
+                        | commands::SlashCommand::McpPrompt { .. }
+                        | commands::SlashCommand::Compact(_)
+                );
                 let mut messages = conversation.lock().await;
                 let opened = commands::answer(command, commands::HostCommandContext {
                     agent: &agent,
@@ -645,6 +646,16 @@ pub(crate) async fn run_interactive(
                     }
                     ui.reload();
                 }
+                // As after a typed prompt. Not after the other commands: one that reloads the
+                // screen would have the drain's turn drawn while the screen reads the log again.
+                if opens_a_turn
+                    && !cancel.canceled_since(admission)
+                    && let Some(entry) = on_screen(session_id, &agent, &conversation, &cancel)
+                {
+                    TuiHooks::new(entry, &store, &config, &ui)
+                        .drain_inbox()
+                        .await;
+                }
                 ui.done();
             }
             HostEvent::Exit { interrupted } => {
@@ -660,18 +671,25 @@ pub(crate) async fn run_interactive(
             if resident.is_some() {
                 frontend.forget_session_answers();
             }
-            resident = session_id.map(|id| {
-                crate::host::ResidentSession::from_parts(
-                    id,
-                    Arc::clone(&agent),
-                    Arc::clone(&conversation),
-                    cancel.clone(),
-                )
-            });
+            resident = on_screen(session_id, &agent, &conversation, &cancel);
         }
     }
 
     schedule_watcher.abort();
+    if let Some(sweep) = schedule_sweep {
+        sweep.abort();
+        // Waited for before the lease of a gate it was running is given back, so nothing the sweep
+        // writes lands after that; the gate is stopped with it. Left behind, that lease would hold
+        // its schedule until `claim_lease` runs out and count toward parking it.
+        if let Err(error) = sweep.await
+            && error.is_panic()
+        {
+            tracing::warn!("the schedule sweep panicked: {error}");
+        }
+        if let Err(error) = store.schedule_store().give_back_gates_cut_short().await {
+            tracing::warn!("{error}");
+        }
+    }
     expiry_sweeper.abort();
     // The screen gives the terminal back before anything below prints to it, and hands the log
     // queue back to stderr as it goes.
@@ -772,7 +790,25 @@ impl std::ops::Deref for SessionEntry {
     }
 }
 
-/// What the host does around a scheduled fire or an outcome delivery: it owns the session
+/// The session the loop is on, from the loop's own parts, or `None` before a fresh session's first
+/// turn has given it an id.
+fn on_screen(
+    session_id: Option<uuid::Uuid>,
+    agent: &Arc<Agent>,
+    conversation: &Arc<tokio::sync::Mutex<crate::conversation::Conversation>>,
+    cancel: &crate::host::CancelCell,
+) -> Option<crate::host::ResidentSession> {
+    session_id.map(|id| {
+        crate::host::ResidentSession::from_parts(
+            id,
+            Arc::clone(agent),
+            Arc::clone(conversation),
+            cancel.clone(),
+        )
+    })
+}
+
+/// What the host does around an outcome delivery or a turn on the inbox: it owns the session
 /// outright, so it never defers, and it reports through the screen like a typed turn does.
 struct TuiHooks {
     entry: SessionEntry,
@@ -781,16 +817,40 @@ struct TuiHooks {
     ui: Ui,
 }
 
-/// The host's one session as the watcher task sees it: resident whenever it is the loop's current
-/// session, at the level the permission cell of the session on screen holds.
+impl TuiHooks {
+    fn new(
+        entry: crate::host::ResidentSession,
+        store: &Store,
+        config: &ResolvedConfig,
+        ui: &Ui,
+    ) -> Self {
+        Self {
+            entry: SessionEntry(entry),
+            store: store.clone(),
+            background_enabled: config.background.enabled,
+            ui: ui.clone(),
+        }
+    }
+
+    /// Run turns on what waits in the inbox of the session on screen until nothing does: what the
+    /// inbox driver does for `meka serve` and `meka acp`, done by the host loop here because it
+    /// owns the conversation. Asked on a wake and after a turn the loop ran itself, so an item that
+    /// came too late for that turn's last pause is answered at once rather than at the watcher's
+    /// next tick. Nothing caps the screen's turns, so a drain never steps back for capacity.
+    async fn drain_inbox(&self) {
+        crate::host::scheduler::run_inbox_turns(self, self.entry.id).await;
+    }
+}
+
+/// The host's one session as the sweep sees it: resident whenever it is the session on screen, at
+/// the level its permission cell holds.
 struct ScreenResidents {
-    session_id: Arc<std::sync::RwLock<Option<uuid::Uuid>>>,
     agent: SharedAgent,
 }
 
 /// The agent of the session on screen, which `/resume` replaces with the one it opens: the one
-/// place the screen, the schedule watcher and the signal listeners read a session's cells from, so
-/// a switch leaves none of them on the session it let go of.
+/// place the screen, the schedule sweep and the signal listeners read a session's cells from, so a
+/// switch leaves none of them on the session it let go of.
 #[derive(Clone)]
 pub(crate) struct SharedAgent(Arc<std::sync::RwLock<Arc<Agent>>>);
 
@@ -815,8 +875,8 @@ impl crate::scheduler::ResidentPermissions for ScreenResidents {
         &self,
         session_id: uuid::Uuid,
     ) -> Option<crate::permission::Permission> {
-        (*crate::sync::read(&self.session_id) == Some(session_id))
-            .then(|| self.agent.get().cells().permission.get())
+        let agent = self.agent.get();
+        (agent.session_id() == Some(session_id)).then(|| agent.cells().permission.get())
     }
 }
 
@@ -845,10 +905,43 @@ impl crate::host::scheduler::HostHooks for TuiHooks {
         crate::agent::TurnCancellation::new()
     }
 
+    async fn inbox_deferred(
+        &self,
+        _entry: &Self::Entry,
+        items: &[crate::store::inbox::InboxItem],
+        not_before: chrono::DateTime<chrono::Utc>,
+        _error: &crate::error::MekaError,
+    ) {
+        self.ui
+            .note(crate::host::scheduler::deferral_notice(items, not_before));
+    }
+
+    async fn inbox_given_up(
+        &self,
+        _entry: &Self::Entry,
+        item: &crate::store::inbox::InboxItem,
+        reason: &str,
+        _error: Option<&crate::error::MekaError>,
+    ) {
+        self.ui.send(UiEvent::InboxWithdrawn {
+            item_ids: vec![item.id],
+        });
+        self.ui.item(model::Item::Notice {
+            level: crate::frontend::NoticeLevel::Warn,
+            text: crate::host::scheduler::give_up_notice(item, reason),
+        });
+    }
+
+    async fn inbox_withdrawn(&self, _entry: &Self::Entry, item_id: uuid::Uuid) {
+        self.ui.send(UiEvent::InboxWithdrawn {
+            item_ids: vec![item_id],
+        });
+    }
+
     async fn finished(
         &self,
         entry: &Self::Entry,
-        _job: Option<&crate::schedule::ScheduledJob>,
+        _origin: &crate::host::scheduler::TurnStarter,
         outcome: &Result<(), crate::error::MekaError>,
     ) {
         match outcome {
@@ -869,12 +962,15 @@ impl crate::host::scheduler::HostHooks for TuiHooks {
         &self.store
     }
 
-    /// From the hangup, the termination or the SIGINT that ends the ladder on, while its listener
-    /// waits on the background tasks before it sends the exit. A sweep in flight or served
-    /// meanwhile would fire the occurrence that stop handed back, the next job due, or the outcome
-    /// of a task it stopped, each as a turn nothing stops.
+    /// From the hangup, the termination, the terminal found gone or the SIGINT that ends the ladder
+    /// on, while the exit is on its way. A drain or a delivery begun meanwhile would run a turn
+    /// nothing stops, on what waits in the inbox or on the outcome of a task the stop ended.
     fn shutting_down(&self) -> bool {
         crate::host::terminal::INTERRUPT_RELAY.is_told_to_leave()
+    }
+
+    fn draws_its_log(&self) -> bool {
+        true
     }
 }
 

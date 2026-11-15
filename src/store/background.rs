@@ -222,10 +222,10 @@ impl BackgroundStore {
     /// be redelivered on every restart, turning one bad result into a boot loop. Losing one report
     /// is the cheaper failure.
     ///
-    /// [`crate::store::schedule::ScheduleStore::complete_claim`] writes *after* the turn, because a
-    /// lease plus an attempt ceiling gives it the same boot-loop protection without paying an
-    /// occurrence for every crash. A background outcome has no lease to hold, so it keeps the
-    /// cruder rule.
+    /// A schedule's occurrence is spent only once its fire is in the inbox
+    /// ([`crate::store::schedule::ScheduleStore::queue_fire`]), because a lease plus an attempt
+    /// ceiling gives it the same boot-loop protection without paying an occurrence for every
+    /// crash. A background outcome has no lease to hold, so it keeps the cruder rule.
     pub(crate) async fn mark_background_tasks_delivered(
         &self,
         ids: &[String],
@@ -468,9 +468,9 @@ impl BackgroundStore {
 
     /// Resolve a full or unique-prefix task id within a session. An ambiguous prefix is an error
     /// rather than an arbitrary pick, matching
-    /// [`crate::store::schedule::ScheduleStore::cancel_scheduled_job`] in behavior and in error
+    /// [`crate::store::schedule::ScheduleStore::cancel_schedule`] in behavior and in error
     /// variant, so a tool, the screen's `/task` and `meka` name a prefix the same way for tasks
-    /// and jobs. The HTTP routes take a task's full id ([`Self::background_task_by_id`]).
+    /// and schedules. The HTTP routes take a task's full id ([`Self::background_task_by_id`]).
     pub(crate) async fn resolve_background_task(
         &self,
         session_id: Uuid,
@@ -496,7 +496,7 @@ impl BackgroundStore {
         }
     }
 
-    /// Shared row decoder, mirroring `ScheduleStore::query_scheduled_jobs`: one unreadable row is
+    /// Shared row decoder, mirroring `ScheduleStore::query_schedules`: one unreadable row is
     /// skipped with a warning rather than failing every other task in the query.
     pub(crate) async fn query_background_tasks(
         &self,
@@ -727,7 +727,7 @@ pub(crate) struct BackgroundTask {
 }
 impl BackgroundTask {
     /// Short id for display, matching the width `task_cancel` accepts. Same convention as
-    /// [`crate::schedule::ScheduledJob::short_id`].
+    /// [`crate::schedule::Schedule::short_id`].
     pub(crate) fn short_id(&self) -> &str {
         self.id.get(..crate::text::ID_PREFIX).unwrap_or(&self.id)
     }

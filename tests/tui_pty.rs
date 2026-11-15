@@ -914,9 +914,9 @@ fn an_always_answer_does_not_survive_a_fork() {
     );
 }
 
-/// A scheduled fire is announced above the reply it triggers, as a stage direction naming the job
-/// and the opening of its prompt, so the answer that appears while the user is idle is not the
-/// model speaking unprompted. The prompt the model is given is not echoed, the way no tool's
+/// A scheduled fire is announced above the reply it triggers, as a stage direction naming the
+/// schedule and the opening of its prompt, so the answer that appears while the user is idle is not
+/// the model speaking unprompted. The prompt the model is given is not echoed, the way no tool's
 /// output is.
 #[test]
 fn a_scheduled_fire_is_announced_as_a_stage_direction_above_its_reply() {
@@ -935,9 +935,9 @@ fn a_scheduled_fire_is_announced_as_a_stage_direction_above_its_reply() {
     let announced = rows
         .iter()
         .position(|row| {
-            row.starts_with("• Scheduled job ") && row.ends_with(" fired: SCREEN_DELIVERED_MARKER")
+            row.starts_with("• Schedule ") && row.ends_with(" fired: SCREEN_DELIVERED_MARKER")
         })
-        .unwrap_or_else(|| panic!("the fire is a stage direction naming the job: {rows:#?}"));
+        .unwrap_or_else(|| panic!("the fire is a stage direction naming the schedule: {rows:#?}"));
     let replied = rows
         .iter()
         .position(|row| row.contains("SCREEN_SCHEDULED_REPLY"))
@@ -947,126 +947,145 @@ fn a_scheduled_fire_is_announced_as_a_stage_direction_above_its_reply() {
         "the direction is above the reply it accounts for: {rows:#?}"
     );
     assert!(
-        !rows.iter().any(|row| row.contains("[Scheduled job")),
+        !rows.iter().any(|row| row.contains("[Schedule")),
         "the model's prompt is not echoed: {rows:#?}"
     );
     assert_set_off_by_one_blank(rows, announced, announced, "the fire's direction");
 }
 
-/// A termination that lands while the screen is serving a sweep ends the sweep there: the fire it
-/// cuts short is handed back, and the next job due is not fired as a turn nothing would stop.
+/// The screen checks a schedule while a turn runs: a fire due while the turn is held in a tool
+/// call is queued then and read behind the call's results, said as a stage direction where it
+/// lands, and the turn goes on to its reply with no turn of the fire's own.
 #[test]
-fn a_termination_mid_sweep_fires_no_further_job() {
-    const TWO_JOBS: &str = r#"[
+fn a_fire_due_during_a_turn_is_read_at_the_round_it_lands_behind() {
+    const HELD: &str = r#"[
  [{"type":"tool_use_start","id":"t1","name":"schedule_create"},
-  {"type":"tool_use_end","input":{"prompt":"FIRST_JOB","at":"1s"}},
+  {"type":"tool_use_end","input":{"prompt":"SCREEN_FIRE_MARKER","at":"2s"}},
   {"type":"message_end","stop_reason":"tool_use"}],
- [{"type":"tool_use_start","id":"t2","name":"schedule_create"},
-  {"type":"tool_use_end","input":{"prompt":"SECOND_JOB","at":"1s"}},
+ [{"type":"tool_use_start","id":"t2","name":"shell_execute"},
+  {"type":"tool_use_end","input":{"command":"while [ ! -e released ]; do sleep 0.05; done"}},
   {"type":"message_end","stop_reason":"tool_use"}],
- [{"type":"text","text":"scheduled"},
-  {"type":"message_end","stop_reason":"end_turn"}],
- [{"type":"text","text":"FIRST_FIRE_RUNNING"},
-  {"type":"sleep","ms":60000},
-  {"type":"message_end","stop_reason":"end_turn"}],
- [{"type":"text","text":"SECOND_FIRE_RAN"},
+ [{"type":"text","text":"SCREEN_FIRE_REPLY"},
   {"type":"message_end","stop_reason":"end_turn"}]
 ]"#;
-    let install = screen_install("read", "", "\n[schedule]\npoll_interval = \"200ms\"\n");
-    install.write_script(TWO_JOBS);
-    let mut master: RawFd = -1;
-    let size = libc::winsize {
-        ws_row: ROWS,
-        ws_col: COLUMNS,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    let prepared = PreparedExec::meka(&install, &["-c"]);
-    // SAFETY: as in `drive_run`.
-    let pid = unsafe {
-        libc::forkpty(
-            &mut master,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &size as *const libc::winsize as *mut libc::winsize,
-        )
-    };
-    assert!(pid >= 0, "forkpty failed");
-    if pid == 0 {
-        // SAFETY: the child of a threaded process, so only what `PreparedExec::exec` promises.
-        unsafe { prepared.exec() }
-    }
-    keep_master_here(master);
-    // The second input sends nothing: it holds the driver until the first fire is on the screen,
-    // where the fire then waits out its minute.
-    let until_the_fire_runs = format!("{AWAITED}FIRST_FIRE_RUNNING{AWAITED}{KEYS_ONLY}");
-    let (.., rows) = pump(
-        master,
-        &["schedule two", &until_the_fire_runs],
-        false,
-        COLUMNS,
+    let install = screen_install(
+        "unrestricted",
+        "",
+        "\n[schedule]\npoll_interval = \"200ms\"\n",
     );
-    assert!(
-        rows.iter().any(|row| row.contains("FIRST_FIRE_RUNNING")),
-        "the first fire is running when the signal lands: {rows:#?}"
-    );
-    // SAFETY: `pid` is the child forked above, signaled and reaped here and nowhere else, and
-    // `master` is open until the close below.
-    let exit = unsafe {
-        libc::kill(pid, libc::SIGTERM);
-        let mut status = 0;
-        let mut written = [0u8; 65536];
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let exit = loop {
-            if libc::waitpid(pid, &mut status, libc::WNOHANG) == pid {
-                break Some(if libc::WIFEXITED(status) {
-                    libc::WEXITSTATUS(status)
-                } else {
-                    -1
-                });
+    let database = install.database();
+    let released = install.work_dir().join("released");
+    // Lets the tool call go once the fire is queued, which is what the screen's own sweep does
+    // while the turn holds the session.
+    let releaser = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "the fire was not queued while the turn held its session"
+            );
+            if let Ok(connection) = rusqlite::Connection::open(&database)
+                && connection
+                    .query_row(
+                        "SELECT count(*) FROM inbox_items WHERE schedule_id IS NOT NULL \
+                         AND appended_at IS NULL",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .is_ok_and(|count| count > 0)
+            {
+                break;
             }
-            if Instant::now() > deadline {
-                break None;
-            }
-            // The terminal is read while the screen leaves: on macOS a process cannot finish
-            // exiting while its terminal holds output nobody has read, a kill included.
-            let mut poll = libc::pollfd {
-                fd: master,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            if libc::poll(&mut poll, 1, 50) > 0 && poll.revents & libc::POLLIN != 0 {
-                libc::read(master, written.as_mut_ptr().cast(), written.len());
-            }
-        };
-        // Closed ahead of the kill, for the same reason: the terminal gone, nothing is left to
-        // wait on.
-        libc::close(master);
-        if exit.is_none() {
-            libc::kill(pid, libc::SIGKILL);
-            libc::waitpid(pid, &mut status, 0);
+            std::thread::sleep(Duration::from_millis(50));
         }
-        exit
-    };
-    assert_eq!(exit, Some(130), "the screen leaves on the signal");
+        std::fs::write(&released, "").expect("release the tool call");
+    });
+    let until_answered = format!("{AWAITED}SCREEN_FIRE_REPLY{AWAITED}/exit");
+    let screens = run_screen(&install, HELD, &["remind me, then wait", &until_answered]);
+    releaser.join().expect("the fire was queued");
 
-    let connection = rusqlite::Connection::open(install.database()).expect("open the store");
-    let fires: Vec<Option<String>> = connection
-        .prepare("SELECT cancel_reason FROM turns WHERE source = 'schedule' ORDER BY rowid")
-        .expect("prepare")
-        .query_map([], |row| row.get(0))
-        .expect("query")
-        .collect::<Result<_, _>>()
-        .expect("the fires' turns");
-    assert_eq!(
-        fires,
-        [Some("server_shutdown".to_string())],
-        "one fire, stopped by the leaving, and none begun after it"
+    let rows = final_screen(&screens);
+    let position = |what: &str, found: &dyn Fn(&String) -> bool| {
+        rows.iter()
+            .position(found)
+            .unwrap_or_else(|| panic!("no row shows {what}: {rows:#?}"))
+    };
+    let called = position("the held round", &|row: &String| row.starts_with("▸ "));
+    let fired = position("the fire's direction", &|row: &String| {
+        row.starts_with("• Schedule ") && row.ends_with(" fired: SCREEN_FIRE_MARKER")
+    });
+    let replied = position("the reply", &|row: &String| {
+        row.contains("SCREEN_FIRE_REPLY")
+    });
+    assert!(
+        called < fired && fired < replied,
+        "the fire is said behind the call it landed after, above the reply: {rows:#?}"
     );
-    let jobs: i64 = connection
-        .query_row("SELECT count(*) FROM scheduled_jobs", [], |row| row.get(0))
-        .expect("count the jobs");
-    assert_eq!(jobs, 2, "both occurrences are there for the next start");
+    let connection = rusqlite::Connection::open(install.database()).expect("open the store");
+    let fires: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM turns WHERE source = 'schedule'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count the fires' turns");
+    assert_eq!(fires, 0, "no turn of the fire's own");
+}
+
+/// Leaving while a due schedule's gate runs gives the schedule back: the gate is stopped with the
+/// sweep, and the schedule is due again at the next start rather than held for `claim_lease`, with
+/// no attempt counted toward parking it.
+#[test]
+fn leaving_while_a_gate_runs_gives_its_schedule_back() {
+    const MARKER: &str = "sleep 300.323";
+    let install = screen_install(
+        "unrestricted",
+        "",
+        "\n[schedule]\npoll_interval = \"200ms\"\n",
+    );
+    install.write_script(format!(
+        r#"[
+ [{{"type":"tool_use_start","id":"t1","name":"schedule_create"}},
+  {{"type":"tool_use_end","input":{{"prompt":"NEVER_FIRED","every":"2s",
+    "gate":{{"check":{{"command":"{MARKER}"}},"when":"succeeded"}}}}}},
+  {{"type":"message_end","stop_reason":"tool_use"}}],
+ [{{"type":"text","text":"WATCH_SET"}},
+  {{"type":"message_end","stop_reason":"end_turn"}}]
+]"#
+    ));
+    let (pid, master) = spawn_screen(&install, false);
+    let until_set = format!("{AWAITED}WATCH_SET{AWAITED}{KEYS_ONLY}");
+    let (screens, ..) = pump(master, &["watch the deploy", &until_set], false, COLUMNS);
+    let database = install.database();
+    let claim = || -> Option<(bool, i64)> {
+        rusqlite::Connection::open(&database)
+            .and_then(|connection| {
+                connection.query_row(
+                    "SELECT claimed_by IS NOT NULL, attempts FROM schedules",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .ok()
+    };
+    support::wait_until("the gate to run", Duration::from_secs(30), || {
+        claim().is_some_and(|(claimed, _)| claimed) && !processes_running(MARKER).is_empty()
+    });
+    let exit = reap(pid, Some((master, "/exit\r")));
+    let survivors = processes_running(MARKER);
+    for survivor in &survivors {
+        // SAFETY: a pid this test's own gate command marks, found just above.
+        unsafe {
+            libc::kill(*survivor, libc::SIGKILL);
+        }
+    }
+    assert_eq!(exit, Some(0), "{screens:#?}");
+    assert!(survivors.is_empty(), "the gate was stopped with the sweep");
+    assert_eq!(
+        claim(),
+        Some((false, 0)),
+        "the schedule is given back, and its claim not counted"
+    );
 }
 
 /// A followup still held when a termination lands is not sent: the turn the termination stops
@@ -1126,7 +1145,7 @@ fn a_held_followup_is_not_sent_once_the_process_is_terminated() {
         rows.iter().any(|row| row.contains("(followup, waiting)")),
         "the followup is held when the signal lands: {rows:#?}"
     );
-    // SAFETY: as in `a_termination_mid_sweep_fires_no_further_job`.
+    // SAFETY: as in `a_termination_mid_sweep_fires_no_further_schedule`.
     let exit = unsafe {
         libc::kill(pid, libc::SIGTERM);
         let mut status = 0;
@@ -1735,6 +1754,339 @@ fn a_message_typed_during_a_turn_is_a_steer_the_turn_reads() {
     assert_eq!(delivered, 1, "the steer went through the inbox");
 }
 
+/// An item waiting for the session on screen while it is idle opens a turn: the item is drawn as
+/// the prompt it is, and the reply under it.
+#[test]
+fn an_item_waiting_for_the_idle_session_on_screen_opens_a_turn() {
+    let install = screen_install("read", "", "\n[schedule]\npoll_interval = \"200ms\"\n");
+    let session = seed_session(&install, &install.work_dir(), "seed");
+    let item = support::plant_inbox_item(
+        &install.database(),
+        &session,
+        "followup",
+        "SCREEN_INBOX_WORDS",
+    );
+    install.write_script(
+        r#"[
+ [{"type":"text","text":"SCREEN_INBOX_REPLY"},
+  {"type":"message_end","stop_reason":"end_turn"}]
+]"#,
+    );
+    let until_answered = format!("{AWAITED}SCREEN_INBOX_REPLY{AWAITED}/exit");
+    let screens = drive(&install, &[&until_answered]);
+    let rows = final_screen(&screens);
+    let position = |needle: &str| {
+        rows.iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("no row contains {needle:?}: {rows:#?}"))
+    };
+    assert!(
+        position("SCREEN_INBOX_WORDS") < position("SCREEN_INBOX_REPLY"),
+        "{rows:#?}"
+    );
+    let connection = rusqlite::Connection::open(install.database()).expect("open the store");
+    let delivered: Option<String> = connection
+        .query_row(
+            "SELECT delivered_at FROM inbox_items WHERE id = ?1",
+            [&item],
+            |row| row.get(0),
+        )
+        .expect("the item");
+    assert!(delivered.is_some(), "the turn delivered the item");
+}
+
+/// Once a turn that carries `carried` has opened, plant a followup saying `words` for its session,
+/// then write `planted` in the work directory, which the first round of the tests' scripts waits
+/// for: the item lands after the turn's opening has read the inbox and before its last pause.
+/// Answers the item's id.
+fn plant_a_followup_while_it_runs(
+    install: &Install,
+    carried: &str,
+    words: &str,
+) -> std::thread::JoinHandle<String> {
+    let database = install.database();
+    let planted = install.work_dir().join("planted");
+    let carried = format!("%{carried}%");
+    let words = words.to_string();
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let session_id = loop {
+            assert!(Instant::now() < deadline, "the turn never opened");
+            if let Ok(connection) = rusqlite::Connection::open(&database)
+                && let Ok(id) = connection.query_row(
+                    "SELECT session_id FROM messages WHERE content LIKE ?1",
+                    [&carried],
+                    |row| row.get::<_, String>(0),
+                )
+            {
+                break id;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let item = support::plant_inbox_item(&database, &session_id, "followup", &words);
+        std::fs::write(&planted, "").expect("the signal");
+        item
+    })
+}
+
+/// A followup left waiting when a typed turn ends, since a turn's pauses read steers alone, opens a
+/// turn as that turn ends, before the screen is handed back: the watcher's ticker, an hour here,
+/// has no part in it.
+#[test]
+fn a_followup_left_by_a_typed_turn_opens_a_turn_as_it_ends() {
+    let install = screen_install("unrestricted", "", "\n[schedule]\npoll_interval = \"1h\"\n");
+    assert_a_followup_left_by_the_turn_opens_one(&install, "TYPED_PROMPT", "TYPED_PROMPT");
+}
+
+/// The same after a turn a command opened, a skill's here.
+#[test]
+fn a_followup_left_by_a_skill_s_turn_opens_a_turn_as_it_ends() {
+    let install = screen_install("unrestricted", "", "\n[schedule]\npoll_interval = \"1h\"\n");
+    let skill = install.config_dir().join("skills").join("waiting");
+    std::fs::create_dir_all(&skill).expect("skill dir");
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: waiting\ndescription: Waits\n---\nSKILL_BODY_WORDS\n",
+    )
+    .expect("seed the skill");
+    assert_a_followup_left_by_the_turn_opens_one(&install, "/skill waiting", "SKILL_BODY_WORDS");
+}
+
+/// Send `opening`, whose turn carries `carried`, plant a followup while that turn runs, and see a
+/// turn opened on the followup the moment it ends.
+fn assert_a_followup_left_by_the_turn_opens_one(install: &Install, opening: &str, carried: &str) {
+    const SCRIPT: &str = r#"[
+ [{"type":"tool_use_start","id":"t1","name":"shell_execute"},
+  {"type":"tool_use_end","input":{"command":"while [ ! -e planted ]; do sleep 0.05; done"}},
+  {"type":"message_end","stop_reason":"tool_use"}],
+ [{"type":"text","text":"FIRST_REPLY"},
+  {"type":"message_end","stop_reason":"end_turn"}],
+ [{"type":"text","text":"FOLLOWUP_REPLY"},
+  {"type":"message_end","stop_reason":"end_turn"}]
+]"#;
+    let player = plant_a_followup_while_it_runs(install, carried, "FOLLOWUP_WORDS");
+    let until_answered = format!("{AWAITED}FOLLOWUP_REPLY{AWAITED}/exit");
+    let screens = run_screen(install, SCRIPT, &[opening, &until_answered]);
+    let item = player.join().expect("the item was planted");
+
+    let rows = final_screen(&screens);
+    let position = |needle: &str| {
+        rows.iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("no row contains {needle:?}: {rows:#?}"))
+    };
+    assert!(
+        position("FIRST_REPLY") < position("FOLLOWUP_WORDS")
+            && position("FOLLOWUP_WORDS") < position("FOLLOWUP_REPLY"),
+        "{rows:#?}"
+    );
+    let connection = rusqlite::Connection::open(install.database()).expect("open the store");
+    let sources: Vec<String> = connection
+        .prepare("SELECT source FROM turns ORDER BY rowid")
+        .expect("prepare")
+        .query_map([], |row| row.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("the turns");
+    assert_eq!(sources, ["client", "inbox"], "{rows:#?}");
+    let delivered: Option<String> = connection
+        .query_row(
+            "SELECT delivered_at FROM inbox_items WHERE id = ?1",
+            [&item],
+            |row| row.get(0),
+        )
+        .expect("the item");
+    assert!(delivered.is_some(), "the second turn delivered the item");
+}
+
+/// The screen says what the driver decided when an inbox turn fails: an item whose turn failed in a
+/// way waiting can change is tried again, at a time it names, and one no retry would help is given
+/// up on, with the reason. Each is said once: the driver's own log of it is not a second row.
+#[test]
+fn the_screen_says_when_an_item_waits_for_another_try_and_when_it_is_given_up() {
+    let install = screen_install("read", "", "\n[schedule]\npoll_interval = \"200ms\"\n");
+    let session = seed_session(&install, &install.work_dir(), "seed");
+    let database = install.database();
+    let first = support::plant_inbox_item(&database, &session, "followup", "FIRST_WORDS");
+    install.write_script(
+        r#"[
+ [{"type":"fail_exhausted","message":"insufficient_quota","resets_after_secs":3600}],
+ [{"type":"fail","message":"401 authentication_error"}]
+]"#,
+    );
+    // The second item waits for the first's deferral, so the two turns take the rounds in order.
+    let player = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "the first item was never deferred"
+            );
+            let attempts: u32 = rusqlite::Connection::open(&database)
+                .and_then(|connection| {
+                    connection.query_row(
+                        "SELECT attempts FROM inbox_items WHERE id = ?1",
+                        [&first],
+                        |row| row.get(0),
+                    )
+                })
+                .unwrap_or(0);
+            if attempts > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        support::plant_inbox_item(&database, &session, "followup", "SECOND_WORDS");
+    });
+    let until_given_up = format!("{AWAITED}Gave up on a message{AWAITED}/exit");
+    let screens = drive(&install, &[&until_given_up]);
+    player.join().expect("the second item was planted");
+
+    let rows = final_screen(&screens);
+    let position = |needle: &str| {
+        rows.iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("no row contains {needle:?}: {rows:#?}"))
+    };
+    assert!(
+        position("• Trying the message again at ") < position("! Gave up on a message: "),
+        "{rows:#?}"
+    );
+    let logged: Vec<&String> = rows
+        .iter()
+        .filter(|row| {
+            row.contains("nbox turn on session") || row.contains("iving up on inbox item")
+        })
+        .collect();
+    assert!(logged.is_empty(), "{rows:#?}");
+}
+
+/// Leaving while a typed turn runs opens no turn on what waits in the inbox: the leave stops the
+/// turn first and is read only once the turn is over, so a turn opened in between would run with
+/// nothing left to show or stop it.
+#[test]
+fn leaving_during_a_typed_turn_opens_no_turn_on_what_waits() {
+    const SCRIPT: &str = r#"[
+ [{"type":"tool_use_start","id":"t1","name":"shell_execute"},
+  {"type":"tool_use_end","input":{"command":"while [ ! -e planted ]; do sleep 0.05; done"}},
+  {"type":"message_end","stop_reason":"tool_use"}],
+ [{"type":"text","text":"TYPED_RUNNING"},
+  {"type":"sleep","ms":60000},
+  {"type":"message_end","stop_reason":"end_turn"}],
+ [{"type":"text","text":"NEVER_ANSWERED"},
+  {"type":"message_end","stop_reason":"end_turn"}]
+]"#;
+    let install = screen_install("unrestricted", "", "\n[schedule]\npoll_interval = \"1h\"\n");
+    install.write_script(SCRIPT);
+    let player = plant_a_followup_while_it_runs(&install, "TYPED_PROMPT", "FOLLOWUP_WORDS");
+    let until_running = format!("{AWAITED}TYPED_RUNNING{AWAITED}/exit");
+    let run = drive_run(&install, &["TYPED_PROMPT", &until_running], false);
+    let item = player.join().expect("the item was planted");
+    assert_eq!(run.exit, Some(0), "{:#?}", run.screens);
+    assert_turns_left_the_item_unread(&install, &["client"], &item, &run);
+}
+
+/// Leaving while an inbox turn runs opens no further one on what arrived meanwhile: a stop ends the
+/// drain as well as the turn.
+#[test]
+fn leaving_during_an_inbox_turn_opens_no_turn_on_what_arrived_meanwhile() {
+    const SCRIPT: &str = r#"[
+ [{"type":"tool_use_start","id":"t1","name":"shell_execute"},
+  {"type":"tool_use_end","input":{"command":"while [ ! -e planted ]; do sleep 0.05; done"}},
+  {"type":"message_end","stop_reason":"tool_use"}],
+ [{"type":"text","text":"FIRST_RUNNING"},
+  {"type":"sleep","ms":60000},
+  {"type":"message_end","stop_reason":"end_turn"}],
+ [{"type":"text","text":"NEVER_ANSWERED"},
+  {"type":"message_end","stop_reason":"end_turn"}]
+]"#;
+    let install = screen_install(
+        "unrestricted",
+        "",
+        "\n[schedule]\npoll_interval = \"200ms\"\n",
+    );
+    let session = seed_session(&install, &install.work_dir(), "seed");
+    support::plant_inbox_item(&install.database(), &session, "followup", "FIRST_WORDS");
+    install.write_script(SCRIPT);
+    let player = plant_a_followup_while_it_runs(&install, "FIRST_WORDS", "SECOND_WORDS");
+    let until_running = format!("{AWAITED}FIRST_RUNNING{AWAITED}/exit");
+    let run = drive_run(&install, &[&until_running], false);
+    let item = player.join().expect("the item was planted");
+    assert_eq!(run.exit, Some(0), "{:#?}", run.screens);
+    assert_turns_left_the_item_unread(&install, &["client", "inbox"], &item, &run);
+}
+
+/// Leaving while an inbox turn runs opens no turn on a background outcome that became ready
+/// meanwhile: the stop ends what the wake that opened the drain would do next.
+#[test]
+fn leaving_during_an_inbox_turn_opens_no_turn_on_an_outcome_ready_meanwhile() {
+    const SCRIPT: &str = r#"[
+ [{"type":"text","text":"FIRST_RUNNING"},
+  {"type":"sleep","ms":60000},
+  {"type":"message_end","stop_reason":"end_turn"}],
+ [{"type":"text","text":"NEVER_ANSWERED"},
+  {"type":"message_end","stop_reason":"end_turn"}]
+]"#;
+    let install = screen_install(
+        "unrestricted",
+        "",
+        "\n[background]\nenabled = true\n\n[schedule]\npoll_interval = \"200ms\"\n",
+    );
+    let session = seed_session(&install, &install.work_dir(), "seed");
+    support::plant_inbox_item(&install.database(), &session, "followup", "FIRST_WORDS");
+    install.write_script(SCRIPT);
+    let (pid, master) = spawn_screen(&install, false);
+    let until_running = format!("{AWAITED}FIRST_RUNNING{AWAITED}{KEYS_ONLY}");
+    let (screens, ..) = pump(master, &[&until_running], false, COLUMNS);
+    // Ready once the drain's turn is past the last pause that would have read it.
+    let connection = rusqlite::Connection::open(install.database()).expect("open the store");
+    connection
+        .execute(
+            "INSERT INTO background_tasks \
+             (id, session_id, tool, label, status, outcome, started_at, finished_at) \
+             VALUES ('7f3a1c22-0000-4000-8000-000000000000', ?1, 'shell_execute', 'make', \
+             'completed', 'ok', ?2, ?2)",
+            rusqlite::params![session, chrono::Utc::now().to_rfc3339()],
+        )
+        .expect("a finished task");
+    let exit = reap(pid, Some((master, "/exit\r")));
+    assert_eq!(exit, Some(0), "{screens:#?}");
+    let sources: Vec<String> = connection
+        .prepare("SELECT source FROM turns ORDER BY rowid")
+        .expect("prepare")
+        .query_map([], |row| row.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("the turns");
+    assert_eq!(sources, ["client", "inbox"], "{screens:#?}");
+}
+
+/// The turns the store holds are `sources`, by who opened them, and `item` never reached a
+/// conversation.
+fn assert_turns_left_the_item_unread(install: &Install, sources: &[&str], item: &str, run: &Run) {
+    let connection = rusqlite::Connection::open(install.database()).expect("open the store");
+    let recorded: Vec<String> = connection
+        .prepare("SELECT source FROM turns ORDER BY rowid")
+        .expect("prepare")
+        .query_map([], |row| row.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("the turns");
+    assert_eq!(recorded, sources, "{:#?}", run.screens);
+    let appended: Option<String> = connection
+        .query_row(
+            "SELECT appended_at FROM inbox_items WHERE id = ?1",
+            [item],
+            |row| row.get(0),
+        )
+        .expect("the item");
+    assert_eq!(
+        appended, None,
+        "the item reached a turn: {:#?}",
+        run.screens
+    );
+}
+
 /// A turn that would run for twenty seconds, for the tests that act on it from the keyboard.
 const LONG_TURN: &str = r#"[
  [{"type":"text","text":"Starting."},
@@ -2110,6 +2462,41 @@ fn a_terminal_that_dies_without_a_signal_leaves_the_same_way() {
     assert!(survivors.is_empty(), "the command died with the screen");
 }
 
+/// A terminal that dies with no signal to say so while an inbox turn runs is the process leaving,
+/// as a hangup is, and not a person stopping the turn: the item the turn was opened on waits for
+/// the next start rather than being withdrawn.
+#[test]
+fn a_terminal_that_dies_during_an_inbox_turn_leaves_its_item_waiting() {
+    // Nothing streams ahead of the wait, so the stop leaves nothing of a reply to keep.
+    const SCRIPT: &str = r#"[
+ [{"type":"sleep","ms":60000},
+  {"type":"text","text":"NEVER_ANSWERED"},
+  {"type":"message_end","stop_reason":"end_turn"}]
+]"#;
+    let install = screen_install("read", "", "\n[schedule]\npoll_interval = \"200ms\"\n");
+    let session = seed_session(&install, &install.work_dir(), "seed");
+    let item = support::plant_inbox_item(&install.database(), &session, "followup", "ITEM_WORDS");
+    install.write_script(SCRIPT);
+    let (pid, master) = spawn_screen(&install, true);
+    let until_running = format!("{AWAITED}ITEM_WORDS{AWAITED}{KEYS_ONLY}");
+    let (screens, ..) = pump(master, &[&until_running], false, COLUMNS);
+    // SAFETY: closing the master takes the terminal away; nothing reads it after.
+    unsafe {
+        libc::close(master);
+    }
+    let exit = reap(pid, None);
+    assert_eq!(exit, Some(130), "{screens:#?}");
+    let stamps: (Option<String>, Option<String>) = rusqlite::Connection::open(install.database())
+        .expect("open the store")
+        .query_row(
+            "SELECT appended_at, withdrawn_at FROM inbox_items WHERE id = ?1",
+            [&item],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("the item");
+    assert_eq!(stamps, (None, None), "the item waits: {screens:#?}");
+}
+
 /// A resize repaints the whole screen as one synchronized update: the clear ratatui writes at a new
 /// size lands inside it, so a terminal that honors one never shows the cleared screen, and nothing
 /// the terminal held before survives the frame after it, whatever its reflow left.
@@ -2339,6 +2726,92 @@ fn processes_running(marker: &str) -> Vec<i32> {
             command.contains(marker).then(|| pid.parse().ok()).flatten()
         })
         .collect()
+}
+
+/// Start the screen with `-c` on a pty of its own: its pid and the master. With `detached`, the
+/// child lets go of the terminal as its controlling one first, as in `terminal_taken_away`.
+fn spawn_screen(install: &Install, detached: bool) -> (libc::pid_t, RawFd) {
+    let mut master: RawFd = -1;
+    let size = libc::winsize {
+        ws_row: ROWS,
+        ws_col: COLUMNS,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let prepared = PreparedExec::meka(install, &["-c"]);
+    // SAFETY: as in `drive_run`.
+    let pid = unsafe {
+        libc::forkpty(
+            &mut master,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &size as *const libc::winsize as *mut libc::winsize,
+        )
+    };
+    assert!(pid >= 0, "forkpty failed");
+    if pid == 0 {
+        // SAFETY: as in `terminal_taken_away`.
+        unsafe {
+            if detached {
+                libc::signal(libc::SIGHUP, libc::SIG_IGN);
+                libc::ioctl(0, libc::TIOCNOTTY);
+                libc::signal(libc::SIGHUP, libc::SIG_DFL);
+            }
+            prepared.exec()
+        }
+    }
+    keep_master_here(master);
+    (pid, master)
+}
+
+/// Wait for the screen `pid` to exit: the status it exited with, or `None` when it had to be
+/// killed. With a master and keys, the keys are typed first and the terminal is read while the
+/// screen leaves, since on macOS a process cannot finish exiting while its terminal holds output
+/// nobody has read, and the master is closed once it has; without, the terminal is already gone.
+fn reap(pid: libc::pid_t, typed: Option<(RawFd, &str)>) -> Option<i32> {
+    if let Some((master, keys)) = typed {
+        write_all(master, keys.as_bytes());
+    }
+    // SAFETY: `pid` is a child this process forked, reaped here and nowhere else, and a master
+    // handed in is open until the close below.
+    unsafe {
+        let mut status = 0;
+        let mut written = [0u8; 65536];
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let exit = loop {
+            if libc::waitpid(pid, &mut status, libc::WNOHANG) == pid {
+                break Some(if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else {
+                    -1
+                });
+            }
+            if Instant::now() > deadline {
+                break None;
+            }
+            match typed {
+                Some((master, _)) => {
+                    let mut poll = libc::pollfd {
+                        fd: master,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    if libc::poll(&mut poll, 1, 50) > 0 && poll.revents & libc::POLLIN != 0 {
+                        libc::read(master, written.as_mut_ptr().cast(), written.len());
+                    }
+                }
+                None => std::thread::sleep(Duration::from_millis(50)),
+            }
+        };
+        if let Some((master, _)) = typed {
+            libc::close(master);
+        }
+        if exit.is_none() {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, &mut status, 0);
+        }
+        exit
+    }
 }
 
 const TWO_WRITES_AT_ONCE: &str = r#"[

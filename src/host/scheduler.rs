@@ -1,10 +1,10 @@
-//! What every host does when the scheduler fires a job or the background poller finds finished
-//! work: find the session, take its runtime, publish a token, fold undelivered outcomes into the
-//! prompt, run the turn, and report. One driver, so the hosts cannot disagree on whether a job
-//! waits behind a turn, whether a canceled fire counts as failed, or who announces outcomes and
-//! when; what differs is asked through [`HostHooks`].
+//! What every host does when its sessions' inboxes hold items waiting or the background poller
+//! finds finished work: find the session, take its runtime, publish a token, fold undelivered
+//! outcomes into the prompt, run the turn, and report. One driver, so the hosts cannot disagree on
+//! whether an item waits behind a turn, whether a canceled turn's items count as failed, or who
+//! announces outcomes and when; what differs is asked through [`HostHooks`].
 
-use std::ops::ControlFlow;
+use std::{ops::ControlFlow, sync::Arc};
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -13,9 +13,11 @@ use crate::{
     background::only_what_was_won,
     error::MekaError,
     host::{ResidentSession, Sessions, claim_undelivered_outcomes},
-    schedule::ScheduledJob,
-    scheduler::{FireOutcome, Wakeup},
-    store::{Store, background::BackgroundTask},
+    store::{
+        Store,
+        background::BackgroundTask,
+        inbox::{InboxItem, InboxOrigin},
+    },
 };
 
 /// Who started a turn, for the host's own accounting: `serve` names it on the session feed's
@@ -26,8 +28,11 @@ pub(crate) enum TurnStarter {
     Client,
     /// The inbox driver, on these items.
     Inbox { item_ids: Vec<uuid::Uuid> },
-    /// A scheduled job firing.
-    Schedule { job_id: String },
+    /// The inbox driver, on these items, every one a fire of these schedules.
+    Schedule {
+        item_ids: Vec<uuid::Uuid>,
+        schedule_ids: Vec<String>,
+    },
     /// Finished background work delivered as a turn of its own.
     Background,
     /// `POST /v1/sessions/{id}/compact`: the checkpoint turn a compaction runs.
@@ -68,8 +73,12 @@ impl TurnStarter {
             Self::Inbox { item_ids } => {
                 object.insert("item_ids".into(), serde_json::json!(item_ids));
             }
-            Self::Schedule { job_id } => {
-                object.insert("job_id".into(), serde_json::json!(job_id));
+            Self::Schedule {
+                item_ids,
+                schedule_ids,
+            } => {
+                object.insert("item_ids".into(), serde_json::json!(item_ids));
+                object.insert("schedule_ids".into(), serde_json::json!(schedule_ids));
             }
             Self::Parent {
                 parent_id,
@@ -88,7 +97,6 @@ impl TurnStarter {
 }
 
 /// First wait before a turn that failed on inbox items is tried again; doubles per attempt.
-/// Also the wait for a session another process holds, asked again at this pace until it lets go.
 const INBOX_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(10);
 /// Longest wait between two attempts, and the wait for a session that could not be brought up
 /// at all, which no backoff from a first try would fit.
@@ -139,6 +147,54 @@ fn ceiling_reason(attempts: u32, ceiling: std::time::Duration) -> String {
     )
 }
 
+/// What the screen and an editor tell the person watching when the items a failed turn opened on
+/// wait for their next attempt at `not_before`. The failure itself was shown as the turn ended.
+pub(crate) fn deferral_notice(
+    items: &[InboxItem],
+    not_before: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let at = crate::text::format_timestamp(not_before, crate::text::Precision::Seconds);
+    if let [item] = items {
+        return format!("Trying {} again at {at}", one_item(item));
+    }
+    let fires = items
+        .iter()
+        .filter(|item| matches!(item.origin, InboxOrigin::Fire(_)))
+        .count();
+    let counted: Vec<String> = [
+        (items.len() - fires, "message", "messages"),
+        (fires, "fire", "fires"),
+    ]
+    .into_iter()
+    .filter(|(count, ..)| *count > 0)
+    .map(|(count, one, many)| format!("{count} {}", if count == 1 { one } else { many }))
+    .collect();
+    format!("Trying the {} again at {at}", counted.join(" and "))
+}
+
+/// What the screen and an editor tell the person watching when `item` is given up on for
+/// `reason`.
+pub(crate) fn give_up_notice(item: &InboxItem, reason: &str) -> String {
+    let given_up = match &item.origin {
+        InboxOrigin::Sent { .. } => "a message".to_string(),
+        InboxOrigin::Fire(_) => one_item(item),
+    };
+    format!("Gave up on {given_up}: {reason}")
+}
+
+/// One item as a notice names it: the message, or the fire of the schedule it is.
+fn one_item(item: &InboxItem) -> String {
+    match &item.origin {
+        InboxOrigin::Sent { .. } => "the message".to_string(),
+        InboxOrigin::Fire(fire) => format!(
+            "schedule {}'s fire",
+            fire.schedule_id
+                .get(..crate::text::ID_PREFIX)
+                .unwrap_or(&fire.schedule_id)
+        ),
+    }
+}
+
 /// A `std` duration as `chrono` measures one, saturating rather than failing on one too long.
 fn chrono_duration(duration: std::time::Duration) -> chrono::Duration {
     chrono::Duration::from_std(duration).unwrap_or(chrono::Duration::MAX)
@@ -166,26 +222,26 @@ fn past_ceiling(
     at >= inbox_deadline(item, ceiling)
 }
 
-/// What differs between hosts around a scheduled or outcome-driven turn.
+/// What differs between hosts around a turn an inbox item or a background outcome opens.
 ///
 /// A host also answers for the live level of every session it holds, through
-/// [`crate::scheduler::ResidentPermissions`], so the fire door reads a resident session's cell
+/// [`crate::scheduler::ResidentPermissions`], so the scheduler reads a resident session's cell
 /// rather than the row that cell may not have reached yet.
 #[async_trait]
 pub(crate) trait HostHooks: crate::scheduler::ResidentPermissions {
     type Entry: std::ops::Deref<Target = ResidentSession> + Clone + Send + Sync + 'static;
 
-    /// The resident session a job or outcome belongs to. `Ok(None)` when this host cannot run it
-    /// now, which defers the fire: ACP serves only sessions the editor has open, and `serve`
-    /// declines a session another process holds.
+    /// The resident session an inbox item or outcome belongs to. `Ok(None)` when this host cannot
+    /// run it now, which leaves the items as they are: ACP serves only sessions the editor has
+    /// open, and `serve` declines a session another process holds.
     async fn resident(&self, session_id: uuid::Uuid) -> anyhow::Result<Option<Self::Entry>>;
 
     /// Whether `entry` is still the session this host holds under its id, asked once the
-    /// conversation lock has been won. The entry a fire found can outlive the session: ACP's
+    /// conversation lock has been won. The entry a driver found can outlive the session: ACP's
     /// `session/close` and `serve`'s idle eviction remove the entry and wait on or skip the same
-    /// lock, and the fire then ran a whole turn against a session the editor had closed, pushing
-    /// its transcript to a session id the client no longer had. Hosts with a map answer from
-    /// the map; the screen's one session is never released while it runs.
+    /// lock, and a turn run then would run against a session the editor had closed, pushing its
+    /// transcript to a session id the client no longer had. Hosts with a map answer from the map;
+    /// the screen's one session is never released while it runs.
     async fn still_resident(&self, _entry: &Self::Entry) -> bool {
         true
     }
@@ -204,14 +260,14 @@ pub(crate) trait HostHooks: crate::scheduler::ResidentPermissions {
 
     /// What the host does with the session before a turn, under the conversation lock. The two
     /// servers move the agent onto the profile the row records, through
-    /// `crate::host::apply_recorded_bindings`; an error here makes the fire unrunnable rather than
-    /// failed.
+    /// `crate::host::apply_recorded_bindings`; an error here puts the items off rather than
+    /// failing them.
     async fn prepare(&self, _entry: &Self::Entry) -> anyhow::Result<()> {
         Ok(())
     }
 
-    /// A refusal as this host words it for whoever reads a job's report or the reason an inbox
-    /// item was given up: the shell's sentence, or `serve`'s own where the remedy is a route.
+    /// A refusal as this host words it for whoever reads the reason an inbox item was given up: the
+    /// shell's sentence, or `serve`'s own where the remedy is a route.
     fn refusal_sentence(&self, refusal: &MekaError) -> String {
         refusal.sentence()
     }
@@ -234,8 +290,8 @@ pub(crate) trait HostHooks: crate::scheduler::ResidentPermissions {
     fn begin_turn(&self, _entry: &Self::Entry, _turn_id: uuid::Uuid, _origin: TurnStarter) {}
 
     /// An out-of-band turn has ended, before [`Self::finished`] announces it. `serve` records the
-    /// terminal on the feed, closes the turn there, and posts the turn webhooks an inbox turn
-    /// alone has nothing else to carry.
+    /// terminal on the feed, closes the turn there, and posts the turn webhooks for a turn the
+    /// inbox opened.
     async fn turn_closed(
         &self,
         _entry: &Self::Entry,
@@ -247,7 +303,8 @@ pub(crate) trait HostHooks: crate::scheduler::ResidentPermissions {
     }
 
     /// An inbox item was given up on and withdrawn, for `reason`, which `error` decided when it
-    /// was a failed turn's. `serve` tells the feed and the webhooks.
+    /// was a failed turn's. `serve` tells the feed and the webhooks; the screen and an editor tell
+    /// the person watching.
     async fn inbox_given_up(
         &self,
         _entry: &Self::Entry,
@@ -258,7 +315,8 @@ pub(crate) trait HostHooks: crate::scheduler::ResidentPermissions {
     }
 
     /// A turn on `items` failed with `error` in a way waiting can change, and they wait for the
-    /// next attempt at `not_before`. `serve` tells the feed and the webhooks.
+    /// next attempt at `not_before`. `serve` tells the feed and the webhooks; the screen and an
+    /// editor tell the person watching.
     async fn inbox_deferred(
         &self,
         _entry: &Self::Entry,
@@ -283,177 +341,33 @@ pub(crate) trait HostHooks: crate::scheduler::ResidentPermissions {
     /// feed, as it does for a withdrawal a client asked for.
     async fn inbox_withdrawn(&self, _entry: &Self::Entry, _item_id: uuid::Uuid) {}
 
-    /// Whether the host is leaving, after which no fire and no outcome delivery starts. Where
-    /// turns are stopped one by one (`meka acp`, the screen), a turn begun then is one nothing
-    /// stops.
+    /// Whether the host is leaving, after which no inbox turn and no outcome delivery starts.
+    /// Where turns are stopped one by one (`meka acp`, the screen), a turn begun then is one
+    /// nothing stops.
     fn shutting_down(&self) -> bool {
         false
     }
 
-    /// After an out-of-band turn, whichever way it went. `job` is `None` for an outcome delivery.
+    /// Whether the host draws its log where it says what became of a failed inbox turn. The
+    /// screen does: a `warn!` is a row of the transcript its retry and give-up notices are in, so
+    /// one logged there says the same thing twice.
+    fn draws_its_log(&self) -> bool {
+        false
+    }
+
+    /// After an out-of-band turn that ran, whichever way it went; `origin` is what opened it. Not
+    /// after one whose items were all withdrawn while it started, which opened nothing.
     async fn finished(
         &self,
         _entry: &Self::Entry,
-        _job: Option<&ScheduledJob>,
+        _origin: &TurnStarter,
         _outcome: &Result<(), MekaError>,
     ) {
     }
 
-    /// A job whose session could not be reached at all. The occurrence is not spent: the claim is
-    /// left to expire and retried, as an unresolvable profile is, since the cause is as likely a
-    /// transient store failure as anything permanent.
-    fn failed_before_running(&self, _job: &ScheduledJob, _error: &anyhow::Error) {}
-
     fn background_enabled(&self) -> bool;
 
     fn store(&self) -> &Store;
-}
-
-/// Fire one scheduled job in its session.
-///
-/// A fire never waits for the runtime, gated or not: one that finds its session mid-turn defers,
-/// handing the occurrence back with its gate baseline unwritten, since the sweep awaits each fire
-/// and a wait here would hold every other session's jobs for as long as the turn runs. A fire the
-/// host's leaving cut short is deferred, so the occurrence runs again on the next start.
-#[allow(
-    clippy::significant_drop_tightening,
-    reason = "the conversation guard is the fire's exclusivity and lives to the end on purpose"
-)]
-pub(crate) async fn run_wakeup<H: HostHooks>(hooks: &H, wakeup: Wakeup) -> FireOutcome {
-    let job = &wakeup.job;
-    let job_id = job.short_id().to_string();
-    // Ahead of everything: an occurrence handed back by a fire the leaving cut short is due again
-    // at once, and the sweep that follows would otherwise run it as a new turn.
-    if hooks.shutting_down() {
-        tracing::debug!("scheduled job {job_id} came due while the host is leaving; deferring");
-        return FireOutcome::Deferred;
-    }
-    let entry = match hooks.resident(job.session_id).await {
-        Ok(Some(entry)) => entry,
-        Ok(None) => {
-            tracing::debug!(
-                "scheduled job {job_id} belongs to a session this process cannot run now; deferring"
-            );
-            return FireOutcome::Deferred;
-        }
-        Err(error) => {
-            // Unrunnable rather than run: `Ran` completed the occurrence, which for a one-shot
-            // deleted the job, on what may have been one `SQLITE_BUSY` from a sibling process.
-            tracing::warn!(
-                "scheduled job {job_id} did not run: failed to reach its session: {error}"
-            );
-            hooks.failed_before_running(job, &error);
-            return FireOutcome::Unrunnable(crate::schedule::Unrunnable::SessionUnreachable(
-                error.to_string(),
-            ));
-        }
-    };
-    entry.touch();
-    // Mid-turn here only when a turn began after the sweep found the session free, while the
-    // occurrence was claimed and its gate ran: the scopes of `serve` and ACP decline a busy
-    // session, and the screen sweeps between turns.
-    let Ok(mut conversation) = entry.conversation.try_lock() else {
-        tracing::debug!("scheduled job {job_id} found its session mid-turn; deferring");
-        return FireOutcome::Deferred;
-    };
-    if !hooks.still_resident(&entry).await {
-        tracing::debug!(
-            "scheduled job {job_id} won its session's lock after the session was closed; deferring"
-        );
-        return FireOutcome::Deferred;
-    }
-    let busy = match hooks.admit(&entry) {
-        Ok(busy) => busy,
-        Err(refused) => {
-            tracing::debug!(
-                "scheduled job {job_id} waits: the process is at its cap of {cap} concurrent \
-                 turns; deferring",
-                cap = refused.cap
-            );
-            return FireOutcome::Deferred;
-        }
-    };
-    if let Err(error) = hooks.prepare(&entry).await {
-        tracing::warn!(
-            "scheduled job {job_id} did not run: its session's profile did not resolve \
-             ({error}); restore the profile in config.toml or move the session onto another"
-        );
-        hooks.failed_before_running(job, &error);
-        return FireOutcome::Unrunnable(crate::schedule::Unrunnable::BindingsUnresolved(
-            reportable_cause(&error, |refusal| hooks.refusal_sentence(refusal)),
-        ));
-    }
-    let cancellation = hooks.cancellation();
-    let turn_id = uuid::Uuid::new_v4();
-    let _published = entry
-        .cancel
-        .publish_turn(cancellation.clone(), busy.admission, turn_id);
-
-    // Admitted before any outcome is claimed. A claim is one-way, so a prompt refused after it
-    // would leave the batch stamped delivered and never handed out again.
-    let input = match crate::agent::TurnInput::scheduled(
-        job.id.clone(),
-        job.prompt.clone(),
-        wakeup.render_prompt(),
-        wakeup.lateness(),
-    ) {
-        Ok(input) => input
-            .retaining(job.prompt_retention())
-            .originating(crate::provider::TurnOrigin::Scheduled)
-            .identified(turn_id),
-        Err(empty) => {
-            tracing::warn!("scheduled job {job_id} rendered no prompt: {empty}");
-            return FireOutcome::Unrunnable(crate::schedule::Unrunnable::EmptyPrompt);
-        }
-    };
-
-    // An outcome that did not warrant a turn of its own rides on this one, ahead of the job's
-    // prompt rather than as a message of its own: see `background::render_outcomes_riding`.
-    let riding = if hooks.background_enabled() {
-        claim_undelivered_outcomes(&entry.agent, hooks.store(), job.session_id).await
-    } else {
-        Vec::new()
-    };
-    if !riding.is_empty() {
-        // The batch is already claimed, so a veto here cannot hold it back; it is delivered into
-        // this turn regardless and the refusal is logged, as `submit_turn` logs its own.
-        if !hooks.announce(&riding).await {
-            tracing::warn!(
-                "scheduled job {job_id} carries {outcomes} background outcome(s) a webhook \
-                 rejected; delivering them anyway, since they are claimed",
-                outcomes = riding.len()
-            );
-        }
-    }
-    let input = input.riding(riding);
-
-    let origin = TurnStarter::Schedule {
-        job_id: job.id.clone(),
-    };
-    hooks.begin_turn(&entry, turn_id, origin.clone());
-    let outcome = entry
-        .agent
-        .run_turn(&mut conversation, input, cancellation.clone())
-        .await;
-    entry.touch();
-    hooks
-        .turn_closed(&entry, turn_id, &origin, &outcome, &cancellation)
-        .await;
-    let outcome = outcome.map(|_| ());
-    // Before `finished`, not after: a fire the drain cut short is deferred and fires again on the
-    // next start, so telling a webhook it failed announced one occurrence twice.
-    if deferred_by_the_drain(&cancellation, &outcome) {
-        tracing::info!(
-            "scheduled job {job_id} was cut short by the shutdown; deferring the occurrence"
-        );
-        return FireOutcome::Deferred;
-    }
-    hooks.finished(&entry, Some(job), &outcome).await;
-    match &outcome {
-        Ok(()) => tracing::info!("scheduled job {job_id} completed"),
-        Err(error) => tracing::warn!("scheduled job {job_id} failed: {error}"),
-    }
-    FireOutcome::Ran
 }
 
 /// Deliver finished background outcomes on every tick until `shutdown` fires or the sweep says
@@ -495,28 +409,100 @@ where
     })
 }
 
-/// Why a session's bindings did not resolve, as a job's reporting surfaces may say it: the model
-/// reads it in `[Scheduled]` and an API client in `GET /v1/jobs`. A refusal is Meka's own sentence
-/// about the configuration, in the host's `wording`; a fault's text names the operator's files or
-/// the store, so it stays in the log line beside this.
-fn reportable_cause(error: &anyhow::Error, wording: impl Fn(&MekaError) -> String) -> String {
-    match error.downcast_ref::<MekaError>() {
-        Some(refusal) if refusal.kind() != crate::error::ErrorKind::Internal => wording(refusal),
-        _ => "the cause is in the Meka log".to_string(),
-    }
-}
-
-/// Whether a fire's occurrence is handed back for the next start rather than completed: only when
-/// the host's leaving cut the turn short, as the reason the turn was stopped for says on every
-/// host. A fire someone stopped is spent as stopped. A turn that finished, or failed on its own,
-/// while the drain began is complete, its messages persisted; deferring it too makes a one-shot
-/// reminder deliver twice.
-fn deferred_by_the_drain(
-    cancellation: &crate::agent::TurnCancellation,
-    outcome: &Result<(), MekaError>,
-) -> bool {
-    cancellation.reason() == Some(crate::store::turns::CancelReason::ServerShutdown)
-        && matches!(outcome, Err(MekaError::Interrupted))
+/// Run turns on the sessions whose inbox holds an item a turn may take now, until `shutdown`
+/// fires: the one driver both servers spawn, so the supervision, the deduplication and the
+/// self-wake are written once. The screen's host loop owns its conversation and drains the inbox
+/// itself.
+///
+/// One sweep for the process, woken by `wake` (an enqueue, every turn's end) and by a ticker for
+/// what the wakes cannot carry: a deferred retry coming due, an item another process wrote, a
+/// session revived after a restart. `is_ours` is asked of every session with work on every pass,
+/// ahead of anything of it being read or written: a session another process holds is that
+/// process's to drive. Each session with work gets a task of its own, so one long inbox turn does
+/// not hold every other session's items, deduplicated so a wake mid-drain does not start a second
+/// drain on the same session. The turns themselves run through [`run_inbox_turns`].
+pub(crate) fn spawn_inbox_driver<H>(
+    hooks: Arc<H>,
+    wake: Arc<tokio::sync::Notify>,
+    poll_interval: std::time::Duration,
+    shutdown: CancellationToken,
+    is_ours: impl Fn(uuid::Uuid) -> bool + Send + 'static,
+) -> tokio::task::JoinHandle<()>
+where
+    H: HostHooks + 'static,
+{
+    tokio::spawn(async move {
+        let draining = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let mut ticker = tokio::time::interval(poll_interval);
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = wake.notified() => {}
+                _ = ticker.tick() => {}
+            }
+            let sessions = match hooks
+                .store()
+                .inbox_store()
+                .sessions_with_work(chrono::Utc::now())
+                .await
+            {
+                Ok(sessions) => sessions,
+                Err(error) => {
+                    tracing::warn!("failed to list sessions with inbox work: {error}");
+                    continue;
+                }
+            };
+            for session_id in sessions {
+                if !is_ours(session_id) || !crate::sync::lock(&draining).insert(session_id) {
+                    continue;
+                }
+                tokio::spawn({
+                    let hooks = Arc::clone(&hooks);
+                    let wake = Arc::clone(&wake);
+                    let draining = Arc::clone(&draining);
+                    async move {
+                        // Supervised for the reason the outcome poller is: this runs a whole agent
+                        // turn, and a panic in the tool loop must not take the driver with it.
+                        let drain =
+                            std::panic::AssertUnwindSafe(run_inbox_turns(&*hooks, session_id));
+                        let ended = match futures::FutureExt::catch_unwind(drain).await {
+                            Ok(ended) => ended,
+                            Err(panic) => {
+                                tracing::warn!(
+                                    "inbox driver for session {session_id} panicked ({panic}); \
+                                     continuing",
+                                    panic = crate::error::panic_message(&*panic)
+                                );
+                                InboxDrain::Done
+                            }
+                        };
+                        crate::sync::lock(&draining).remove(&session_id);
+                        // Not when the drain stepped back for capacity: the items are pending on
+                        // purpose, and a wake over them would spin until a slot freed. The turn
+                        // whose end frees one wakes the driver itself.
+                        // Nor once the host is leaving: every drain returns at once then, and
+                        // a wake over what it left would spin until the process is gone.
+                        if ended == InboxDrain::AtCapacity || hooks.shutting_down() {
+                            return;
+                        }
+                        // A wake for an item enqueued during the drain found the id still in the
+                        // set and was spent on nothing; one more look, and a wake of its own if
+                        // there is work, rather than leaving it to the tick.
+                        match hooks.store().inbox_store().pending_count(session_id).await {
+                            Ok(0) => {}
+                            Ok(_) => wake.notify_one(),
+                            Err(error) => {
+                                tracing::warn!(
+                                    "failed to count inbox items for {session_id}: {error}"
+                                );
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    })
 }
 
 /// Deliver finished background work to every resident session that can take a turn for it.
@@ -658,7 +644,9 @@ where
             )
             .await;
         let outcome = outcome.map(|_| ());
-        hooks.finished(&entry, None, &outcome).await;
+        hooks
+            .finished(&entry, &TurnStarter::Background, &outcome)
+            .await;
         if let Err(error) = outcome {
             tracing::warn!("background outcome turn for session {session_id} failed: {error}");
         }
@@ -689,7 +677,7 @@ async fn defer_session_inbox<H: HostHooks>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InboxDrain {
     /// Nothing waits that this driver could run now: the inbox is empty, the session is busy or
-    /// gone, or a turn failed and its items were put off.
+    /// gone, a turn failed and its items were put off, or a turn was stopped.
     Done,
     /// The process is at its concurrent-turn cap. The items are untouched and wait for a turn's
     /// end, which wakes the driver, or the next tick; a driver that woke itself over them would
@@ -698,7 +686,7 @@ pub(crate) enum InboxDrain {
 }
 
 /// Run turns on a session's waiting inbox items until nothing is waiting, the session is busy,
-/// or a turn fails.
+/// or a turn fails or is stopped.
 ///
 /// A busy session is waited for: the running turn reads steers itself at its round boundaries,
 /// and what it leaves pending opens a turn the moment it ends. Turns are chained while items keep
@@ -717,23 +705,21 @@ pub(crate) enum InboxDrain {
 pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::Uuid) -> InboxDrain {
     let entry = match hooks.resident(session_id).await {
         Ok(Some(entry)) => entry,
-        // Put off rather than left due, in both arms: the sweeper wakes itself whenever due items
-        // remain after a pass, so a return that leaves them due is asked again at once, and a
-        // session another process keeps for an hour would be probed in a hot loop for the hour.
-        // The holder's own turns drain the inbox while it has the session, so its items wait the
-        // short interval; a session that cannot be brought up is not a provider blip and waits the
-        // longest. Each wait counts as an attempt, so neither holds an item past the ceiling.
+        // Another process took the session, or the editor closed it, after the driver found it
+        // this host's. The items are left as they are: whoever holds the session drives it. The
+        // driver wakes itself when items remain due after a drain, and its next pass finds the
+        // session is not this host's and starts nothing, so this cannot spin.
         Ok(None) => {
-            tracing::debug!(
-                "session {session_id} is held elsewhere; its inbox waits {INBOX_RETRY_BASE:?}"
-            );
-            defer_session_inbox(hooks, session_id, INBOX_RETRY_BASE).await;
+            tracing::debug!("session {session_id} left this host before its inbox was read");
             return InboxDrain::Done;
         }
+        // Put off rather than left due: the driver wakes itself whenever due items remain after a
+        // pass, so a session that cannot be brought up would be asked again at once, in a hot loop
+        // for as long as it stays that way. It is not a provider blip and waits the longest; each
+        // wait counts as an attempt, so it holds no item past the ceiling.
         Err(error) => {
             tracing::warn!(
-                "inbox items for session {session_id} wait {INBOX_RETRY_LONGEST_WAIT:?}: session \
-                 unavailable: {error}"
+                "inbox items for session {session_id} wait {INBOX_RETRY_LONGEST_WAIT:?}: {error}"
             );
             defer_session_inbox(hooks, session_id, INBOX_RETRY_LONGEST_WAIT).await;
             return InboxDrain::Done;
@@ -772,7 +758,7 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
         let now = chrono::Utc::now();
         let items = match inbox.take_pending(session_id, &[], now).await {
             Ok(items) => items,
-            // Put off like the arms above, or the sweeper asks again at once for as long as the
+            // Put off like the arm above, or the sweeper asks again at once for as long as the
             // read keeps failing.
             Err(error) => {
                 tracing::warn!(
@@ -801,6 +787,17 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
         }
         let attempts = items.iter().map(|item| item.attempts).max().unwrap_or(0);
         let item_ids: Vec<uuid::Uuid> = items.iter().map(|item| item.id).collect();
+        // From the items the input is built on, by the rule that input's origin follows, so the
+        // turn's row and its `turn.started` name the same source.
+        let origin = match crate::store::inbox::fired_schedules(&items) {
+            Some(schedule_ids) => TurnStarter::Schedule {
+                item_ids: item_ids.clone(),
+                schedule_ids,
+            },
+            None => TurnStarter::Inbox {
+                item_ids: item_ids.clone(),
+            },
+        };
         // Kept for the failure arms below, which name the items a turn could not carry.
         let offered = items.clone();
 
@@ -842,16 +839,23 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
                 outcomes = riding.len()
             );
         }
-        let input = input.riding(riding);
-        let origin = TurnStarter::Inbox {
-            item_ids: item_ids.clone(),
-        };
+        let opened_on = crate::agent::OpenedOn::default();
+        let input = input.riding(riding).telling(opened_on.clone());
         hooks.begin_turn(&entry, turn_id, origin.clone());
         let outcome = entry
             .agent
             .run_turn(&mut conversation, input, cancellation.clone())
             .await;
         entry.touch();
+        // Every item it opened on was withdrawn while it was starting: it opened nothing, and
+        // nothing failed. It closes as a turn somebody stopped, since somebody took back what it
+        // was opened on, nothing more is said of it, and the drain reads again what waits now.
+        let opened_nothing = matches!(outcome, Err(MekaError::EmptyPrompt));
+        let outcome = if opened_nothing {
+            Err(MekaError::Interrupted)
+        } else {
+            outcome
+        };
         hooks
             .turn_closed(&entry, turn_id, &origin, &outcome, &cancellation)
             .await;
@@ -859,11 +863,43 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
         if hooks.shutting_down() {
             return InboxDrain::Done;
         }
-        hooks.finished(&entry, None, &outcome).await;
+        if opened_nothing {
+            continue;
+        }
+        // What a stop or a failure deals with is what the turn was about and left waiting: the
+        // items its opening took, if it opened, else the ones it was handed, either way as they
+        // are now, since an occurrence that joined a fire while the turn was starting gave it
+        // another id. What the turn carried into the conversation is not waiting, and what
+        // arrived since is not this turn's.
+        let (item_ids, offered) = if outcome.is_err() {
+            let opened = opened_on.ids();
+            match inbox
+                .take_pending(session_id, &[], chrono::Utc::now())
+                .await
+            {
+                Ok(mut waiting) => {
+                    waiting.retain(|item| {
+                        if opened.is_empty() {
+                            crate::agent::stands_for_any(item, &offered)
+                        } else {
+                            opened.contains(&item.id)
+                        }
+                    });
+                    (waiting.iter().map(|item| item.id).collect(), waiting)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "failed to read the inbox of session {session_id} after its turn: {error}"
+                    );
+                    (item_ids, offered)
+                }
+            }
+        } else {
+            (item_ids, offered)
+        };
+        hooks.finished(&entry, &origin, &outcome).await;
         match outcome {
             Ok(()) => tracing::info!("inbox turn on session {session_id} completed"),
-            // Every item it opened on was withdrawn while it was starting; nothing failed.
-            Err(MekaError::EmptyPrompt) => {}
             Err(MekaError::Interrupted) => {
                 // Withdrawn rather than re-run: the withdrawal put them back pending, and a
                 // driver that opened the same turn again would undo the cancel.
@@ -885,6 +921,10 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
                         }
                     }
                 }
+                // And the drain ends: a stop on the screen may be the person leaving, and a turn
+                // the drain opened next would run with nothing left to show or stop it. A driver
+                // that wakes itself takes up what else waits at once.
+                return InboxDrain::Done;
             }
             Err(error) => {
                 // Only what the withdrawal put back is pending; what a tool round kept is in the
@@ -894,7 +934,10 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
                         "the turn opened on it failed, and waiting would not change that: {}",
                         hooks.refusal_sentence(&error)
                     );
-                    tracing::warn!("inbox turn on session {session_id} failed: {error}");
+                    log_inbox_failure(
+                        hooks,
+                        format_args!("inbox turn on session {session_id} failed: {error}"),
+                    );
                     for item in &offered {
                         give_up_inbox_item(hooks, &entry, item, reason.clone(), Some(&error)).await;
                     }
@@ -914,9 +957,12 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
                 if retried.is_empty() {
                     return InboxDrain::Done;
                 }
-                tracing::warn!(
-                    "inbox turn on session {session_id} failed: {error}; trying again in \
-                     {delay:?}"
+                log_inbox_failure(
+                    hooks,
+                    format_args!(
+                        "inbox turn on session {session_id} failed: {error}; trying again in \
+                         {delay:?}"
+                    ),
                 );
                 let retried_ids: Vec<uuid::Uuid> = retried.iter().map(|item| item.id).collect();
                 let record = hooks.inbox_error_record(&error);
@@ -947,6 +993,17 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
     }
 }
 
+/// Log what became of a failed inbox turn: at `warn!`, an operator's trace of work nobody was
+/// watching, or at `info!` on a host that draws its log beside the notice saying the same
+/// ([`HostHooks::draws_its_log`]).
+fn log_inbox_failure<H: HostHooks>(hooks: &H, message: std::fmt::Arguments<'_>) {
+    if hooks.draws_its_log() {
+        tracing::info!("{message}");
+    } else {
+        tracing::warn!("{message}");
+    }
+}
+
 /// Withdraw `item` for `reason` and tell the host, with the error that decided it when one did.
 async fn give_up_inbox_item<H: HostHooks>(
     hooks: &H,
@@ -971,7 +1028,10 @@ async fn give_up_inbox_item<H: HostHooks>(
         .await
     {
         Ok(crate::store::inbox::Withdrawal::Withdrawn) => {
-            tracing::warn!("giving up on inbox item {item_id}: {reason}");
+            log_inbox_failure(
+                hooks,
+                format_args!("giving up on inbox item {item_id}: {reason}"),
+            );
             hooks.inbox_given_up(entry, item, &reason, error).await;
         }
         Ok(_) => {}
@@ -1042,7 +1102,7 @@ mod tests {
             id: uuid::Uuid::nil(),
             session_id: uuid::Uuid::nil(),
             class: crate::conversation::InboxClass::Steer,
-            source: None,
+            origin: crate::store::inbox::InboxOrigin::Sent { source: None },
             body: "hi".to_string(),
             created_at,
             attempts: 0,
@@ -1085,6 +1145,63 @@ mod tests {
                 std::time::Duration::MAX
             ),
             "and is not reached in a thousand years"
+        );
+    }
+
+    /// The notices name a fire as its schedule's, never as a message, and count each kind when a
+    /// turn opened on several.
+    #[test]
+    fn a_notice_names_a_fire_by_its_schedule_and_counts_each_kind() {
+        let item = |origin| crate::store::inbox::InboxItem {
+            id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::nil(),
+            class: crate::conversation::InboxClass::Steer,
+            origin,
+            body: "check the deploy".to_string(),
+            created_at: chrono::Utc::now(),
+            attempts: 0,
+            not_before: None,
+            last_error: None,
+            appended_at: None,
+            delivered_at: None,
+            withdrawn_at: None,
+            failure: None,
+        };
+        let message = || item(InboxOrigin::Sent { source: None });
+        let fire = || {
+            item(InboxOrigin::Fire(crate::store::inbox::Fire {
+                schedule_id: "1a2b3c4d-0000-4000-8000-000000000000".to_string(),
+                gate_output: None,
+                occurrences: 1,
+                due_at: chrono::Utc::now(),
+                fired_at: chrono::Utc::now(),
+            }))
+        };
+        let at = chrono::Utc::now();
+        let when = crate::text::format_timestamp(at, crate::text::Precision::Seconds);
+        assert_eq!(
+            deferral_notice(&[message()], at),
+            format!("Trying the message again at {when}")
+        );
+        assert_eq!(
+            deferral_notice(&[fire()], at),
+            format!("Trying schedule 1a2b3c4d's fire again at {when}")
+        );
+        assert_eq!(
+            deferral_notice(&[message(), message(), fire()], at),
+            format!("Trying the 2 messages and 1 fire again at {when}")
+        );
+        assert_eq!(
+            deferral_notice(&[fire(), fire()], at),
+            format!("Trying the 2 fires again at {when}")
+        );
+        assert_eq!(
+            give_up_notice(&message(), "down"),
+            "Gave up on a message: down"
+        );
+        assert_eq!(
+            give_up_notice(&fire(), "down"),
+            "Gave up on schedule 1a2b3c4d's fire: down"
         );
     }
 
@@ -1159,10 +1276,25 @@ mod tests {
         assert!(admitted < stamped, "and ahead of the one-way stamp");
     }
 
-    /// A host holding one session, for driving a fire directly.
-    struct OneSessionHooks {
+    /// What a test host does between the driver's read and the turn's opening.
+    enum Meanwhile {
+        /// Withdraw every item waiting, as a client's `DELETE` or a schedule's cancel does.
+        Withdraw,
+        /// Queue one more occurrence of this fire's schedule, once, which joins the fire that
+        /// waits.
+        Join(std::sync::Mutex<Option<crate::store::inbox::Fire>>),
+    }
+
+    /// A host holding one session, whose bindings step does something to the inbox between the
+    /// driver's read and the turn's opening, and which records what it is told of the turn.
+    struct MeanwhileHooks {
         entry: HeldSession,
         store: Store,
+        meanwhile: Meanwhile,
+        /// The id the fire has once an occurrence joined it.
+        joined: std::sync::Mutex<Option<uuid::Uuid>>,
+        closed: std::sync::Mutex<Vec<Result<(), String>>>,
+        finished: std::sync::Mutex<usize>,
     }
 
     #[derive(Clone)]
@@ -1177,7 +1309,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl crate::scheduler::ResidentPermissions for OneSessionHooks {
+    impl crate::scheduler::ResidentPermissions for MeanwhileHooks {
         async fn live_permission_of(
             &self,
             _session_id: uuid::Uuid,
@@ -1187,11 +1319,62 @@ mod tests {
     }
 
     #[async_trait]
-    impl HostHooks for OneSessionHooks {
+    impl HostHooks for MeanwhileHooks {
         type Entry = HeldSession;
 
         async fn resident(&self, _session_id: uuid::Uuid) -> anyhow::Result<Option<HeldSession>> {
             Ok(Some(self.entry.clone()))
+        }
+
+        async fn prepare(&self, entry: &HeldSession) -> anyhow::Result<()> {
+            match &self.meanwhile {
+                Meanwhile::Withdraw => {
+                    let inbox = self.store.inbox_store();
+                    for item in inbox
+                        .take_pending(entry.id, &[], chrono::Utc::now())
+                        .await?
+                    {
+                        inbox.withdraw(item.id, None, None).await?;
+                    }
+                }
+                Meanwhile::Join(fire) => {
+                    let fire = crate::sync::lock(fire).take();
+                    if let Some(fire) = fire {
+                        let queued = self
+                            .store
+                            .schedule_store()
+                            .queue_fire_for_test(entry.id, "Check.", fire)
+                            .await?;
+                        *crate::sync::lock(&self.joined) = Some(queued.item_id);
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        async fn turn_closed(
+            &self,
+            _entry: &HeldSession,
+            _turn_id: uuid::Uuid,
+            _origin: &TurnStarter,
+            outcome: &Result<crate::agent::TurnOutcome, MekaError>,
+            _cancellation: &crate::agent::TurnCancellation,
+        ) {
+            crate::sync::lock(&self.closed).push(
+                outcome
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|error| format!("{error:?}")),
+            );
+        }
+
+        async fn finished(
+            &self,
+            _entry: &HeldSession,
+            _origin: &TurnStarter,
+            _outcome: &Result<(), MekaError>,
+        ) {
+            *crate::sync::lock(&self.finished) += 1;
         }
 
         fn background_enabled(&self) -> bool {
@@ -1203,11 +1386,105 @@ mod tests {
         }
     }
 
-    /// A fire never waits for its session, gated or not: one that finds a turn holding the
-    /// conversation defers at once, so the sweep it runs in goes on to every other session's jobs.
+    /// A turn whose every item was withdrawn while it started opened nothing, and nothing failed:
+    /// it closes as a turn somebody stopped, and no host is told of a failure, which the screen
+    /// and an editor would show.
     #[tokio::test]
-    async fn a_gated_fire_on_a_session_mid_turn_defers_without_waiting() {
+    async fn a_turn_whose_items_were_withdrawn_as_it_opened_is_said_to_have_failed_nowhere() {
         let store = Store::for_test().await;
+        let (session_id, session) = held_session(&store).await;
+        store
+            .inbox_store()
+            .enqueue(
+                crate::store::inbox::NewInboxItem::from_parts(
+                    session_id,
+                    crate::conversation::InboxClass::Steer,
+                    None,
+                    "taken back",
+                )
+                .expect("an item"),
+            )
+            .await
+            .expect("enqueue");
+        let hooks = MeanwhileHooks {
+            entry: session,
+            store,
+            meanwhile: Meanwhile::Withdraw,
+            joined: std::sync::Mutex::new(None),
+            closed: std::sync::Mutex::new(Vec::new()),
+            finished: std::sync::Mutex::new(0),
+        };
+
+        assert_eq!(run_inbox_turns(&hooks, session_id).await, InboxDrain::Done);
+        assert_eq!(
+            *crate::sync::lock(&hooks.closed),
+            [Err("Interrupted".to_string())],
+            "the turn closes as one somebody stopped"
+        );
+        assert_eq!(
+            *crate::sync::lock(&hooks.finished),
+            0,
+            "and no host is told how it went"
+        );
+    }
+
+    /// A fire an occurrence joined while its turn was starting has another id by the time the
+    /// turn fails, and the driver deals with it under that one: it is given up or put off, not
+    /// left due to open the same turn again at once.
+    #[tokio::test]
+    async fn a_fire_joined_while_its_turn_starts_is_dealt_with_under_the_id_it_has_then() {
+        let store = Store::for_test().await;
+        let (session_id, session) = held_session(&store).await;
+        let now = chrono::Utc::now();
+        let fire = crate::store::inbox::Fire {
+            schedule_id: "1a2b3c4d-0000-4000-8000-000000000000".to_string(),
+            gate_output: None,
+            occurrences: 1,
+            due_at: now,
+            fired_at: now,
+        };
+        let first = store
+            .schedule_store()
+            .queue_fire_for_test(session_id, "Check.", fire.clone())
+            .await
+            .expect("queue")
+            .item_id;
+        let hooks = MeanwhileHooks {
+            entry: session,
+            store: store.clone(),
+            meanwhile: Meanwhile::Join(std::sync::Mutex::new(Some(fire))),
+            joined: std::sync::Mutex::new(None),
+            closed: std::sync::Mutex::new(Vec::new()),
+            finished: std::sync::Mutex::new(0),
+        };
+
+        assert_eq!(run_inbox_turns(&hooks, session_id).await, InboxDrain::Done);
+        let joined = crate::sync::lock(&hooks.joined).expect("an occurrence joined the fire");
+        assert_ne!(joined, first, "the joined fire has another id");
+        let closed = crate::sync::lock(&hooks.closed).clone();
+        assert!(
+            matches!(closed.as_slice(), [Err(error)] if error != "Interrupted"),
+            "the turn opened on the fire and failed: {closed:?}"
+        );
+        let item = store
+            .inbox_store()
+            .get(joined)
+            .await
+            .expect("get")
+            .expect("the fire");
+        assert!(
+            item.state() == crate::store::inbox::InboxState::Withdrawn
+                || item.not_before.is_some_and(|at| at > chrono::Utc::now()),
+            "the fire is given up or put off, under the id it has now: {item:?}"
+        );
+    }
+
+    /// A session this process holds, with an agent no provider will answer.
+    async fn held_session(store: &Store) -> (uuid::Uuid, HeldSession) {
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("a session");
         let cells = crate::session::SessionCells::for_test(
             crate::permission::SharedPermission::new(
                 crate::permission::Permission::Unrestricted,
@@ -1224,7 +1501,7 @@ mod tests {
         )
         .await
         .expect("the agent builds");
-        let session_id = uuid::Uuid::new_v4();
+        agent.cells().session_id.set(session_id);
         let session = ResidentSession::from_parts(
             session_id,
             std::sync::Arc::new(agent),
@@ -1233,113 +1510,7 @@ mod tests {
             )),
             crate::host::CancelCell::default(),
         );
-        let hooks = OneSessionHooks {
-            entry: HeldSession(session.clone()),
-            store,
-        };
-        let now = chrono::Utc::now();
-        let wakeup = Wakeup {
-            job: ScheduledJob {
-                id: "gated".to_string(),
-                session_id,
-                schedule: crate::schedule::Schedule::At(now),
-                prompt: "check".to_string(),
-                gate: Some(crate::schedule::Gate {
-                    probe: crate::schedule::GateProbe::Shell {
-                        command: "true".to_string(),
-                    },
-                    predicate: crate::schedule::GatePredicate::Succeeded,
-                    last_output: None,
-                    permission: crate::permission::Permission::Unrestricted,
-                }),
-                created_at: now,
-                last_fired_at: None,
-                next_fire_at: now,
-                attempts: 0,
-            },
-            gate_output: Some(String::new()),
-            late_by: chrono::Duration::zero(),
-            coalesced: 0,
-        };
-
-        let _turn = session
-            .conversation
-            .try_lock()
-            .expect("nothing holds it yet");
-        assert_eq!(
-            futures::FutureExt::now_or_never(run_wakeup(&hooks, wakeup)),
-            Some(FireOutcome::Deferred),
-            "the fire waited on the turn, holding every other session's jobs"
-        );
-    }
-
-    /// A fire that completed before the drain reached it is complete: its reply is in the store,
-    /// and a deferred occurrence would deliver it again on the next start. Only the host's leaving
-    /// hands the occurrence back, on every host, and a fire someone stopped first is spent.
-    #[test]
-    fn only_a_fire_the_drain_cut_short_is_deferred() {
-        use super::deferred_by_the_drain;
-        use crate::{agent::TurnCancellation, error::MekaError, store::turns::CancelReason};
-        // `meka serve`'s fires stop with its shutdown token; `meka acp` and the screen stop theirs
-        // through the session's cell.
-        let shutdown = CancellationToken::new();
-        let served = TurnCancellation::child_of(&shutdown, CancelReason::ServerShutdown);
-        shutdown.cancel();
-        let held = TurnCancellation::new();
-        held.cancel(CancelReason::ServerShutdown);
-        for left in [served, held] {
-            assert!(deferred_by_the_drain(&left, &Err(MekaError::Interrupted)));
-            assert!(!deferred_by_the_drain(&left, &Ok(())));
-            assert!(!deferred_by_the_drain(
-                &left,
-                &Err(MekaError::Provider("down".to_string()))
-            ));
-        }
-
-        let shutdown = CancellationToken::new();
-        let stopped = TurnCancellation::child_of(&shutdown, CancelReason::ServerShutdown);
-        stopped.cancel(CancelReason::Client);
-        shutdown.cancel();
-        assert!(
-            !deferred_by_the_drain(&stopped, &Err(MekaError::Interrupted)),
-            "a fire someone stopped before the host left is spent"
-        );
-    }
-
-    /// The cause a job is reported held with is what a caller may read: a refusal's own sentence,
-    /// and for a fault only where to look, since its text names the operator's files.
-    #[test]
-    fn a_reported_cause_names_a_refusal_and_withholds_a_fault() {
-        use super::reportable_cause;
-        use crate::error::MekaError;
-        let refusal = anyhow::Error::new(MekaError::ProfileNotConfigured {
-            name: "work".to_string(),
-            known: vec!["home".to_string()],
-        });
-        let reported = reportable_cause(&refusal, MekaError::sentence);
-        assert!(reported.contains("'work'"), "{reported}");
-        // The remedy is the host's to word: `serve` names its route where the shell names a
-        // command.
-        let login = anyhow::Error::new(MekaError::AccountLoginRequired {
-            account: "work".to_string(),
-        });
-        let served = reportable_cause(&login, crate::host::http::errors::api_wording);
-        assert!(
-            served.contains("POST /v1/accounts/work/login") && !served.contains("meka account"),
-            "{served}"
-        );
-        for fault in [
-            anyhow::Error::new(MekaError::Installation(
-                "failed to read ca_cert_file '/etc/ssl/corp.pem'".to_string(),
-            )),
-            anyhow::anyhow!("failed to open '/var/lib/meka/meka.db'"),
-        ] {
-            let reported = reportable_cause(&fault, MekaError::sentence);
-            assert!(
-                !reported.contains('/') && reported.contains("log"),
-                "a fault's text stays in the log: {reported}"
-            );
-        }
+        (session_id, HeldSession(session))
     }
 
     /// Asserted against the source, and weaker than a behavioral test: nothing in the suite drives
@@ -1395,32 +1566,28 @@ mod tests {
 
     /// The prompt is admitted before any outcome is claimed to ride on it, in both places that
     /// fold a batch into a prompt. Asserted against the source for the reason the test above is:
-    /// neither `render_prompt` nor the editor can produce an empty prompt today, so the refusal
-    /// is unreachable and a behavioral test cannot see the order. The claim is one-way, so the
-    /// order is what stops a refused prompt from leaving a batch stamped and never delivered.
+    /// neither a drain nor the editor can produce an empty prompt today, so the refusal is
+    /// unreachable and a behavioral test cannot see the order. The claim is one-way, so the order
+    /// is what stops a refused prompt from leaving a batch stamped and never delivered.
     #[test]
     fn a_prompt_is_admitted_before_the_outcomes_that_ride_it_are_claimed() {
-        let wakeup = include_str!("scheduler.rs")
-            .split("pub(crate) async fn run_wakeup<")
+        let drain = include_str!("scheduler.rs")
+            .split("pub(crate) async fn run_inbox_turns<")
             .nth(1)
             .expect("the function this test is about")
-            .split("\npub(crate) async fn deliver_ready_outcomes<")
+            .split("\n}\n")
             .next()
             .expect("splitting always yields a first part");
-        let admitted = wakeup
-            .find("TurnInput::scheduled(")
-            .expect("the fire admits its prompt");
-        let claimed = wakeup
+        let admitted = drain
+            .find("TurnInput::inbox(")
+            .expect("the drain admits its prompt");
+        let claimed = drain
             .find("claim_undelivered_outcomes(")
-            .expect("the fire claims the outcomes that ride it");
+            .expect("the drain claims the outcomes that ride it");
         assert!(
             admitted < claimed,
-            "a scheduled fire must admit its prompt before claiming outcomes; found \
+            "an inbox turn must admit its prompt before claiming outcomes; found \
              admit@{admitted} claim@{claimed}"
-        );
-        assert!(
-            wakeup.contains(".originating(crate::provider::TurnOrigin::Scheduled)"),
-            "a fired job's words are typed by nobody, so the fire must restate their origin"
         );
 
         let typed = include_str!("tui.rs")

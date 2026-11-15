@@ -93,16 +93,16 @@ pub(super) fn render_world_state_full(current: &WorldSnapshot) -> String {
     sections.join("\n")
 }
 
-/// Ceiling on how many jobs the `[Scheduled]` index lists. Low on purpose: this renders on turns
-/// that have nothing to do with scheduling, and a handful is enough to stop the model
+/// Ceiling on how many schedules the `[Scheduled]` index lists. Low on purpose: this renders on
+/// turns that have nothing to do with scheduling, and a handful is enough to stop the model
 /// double-booking a reminder. `schedule_list` is there for the rest.
 pub(super) const SCHEDULE_INDEX_MAX_ENTRIES: usize = 20;
 
-/// Ceiling on how many jobs the world-state *diff* names when their status changes at once.
+/// Ceiling on how many schedules the world-state *diff* names when their status changes at once.
 ///
 /// Lower than the index above, because this is one line rather than a section and the whole set
-/// flips together: dropping a session to `none` withholds every job it has, each contributing the
-/// same sentence. Past this the count carries the fact.
+/// flips together: dropping a session to `none` withholds every schedule it has, each contributing
+/// the same sentence. Past this the count carries the fact.
 pub(super) const SCHEDULE_STATUS_MAX_ENTRIES: usize = 5;
 
 /// The `[Background]` section: what is still running, and nothing else.
@@ -142,29 +142,29 @@ pub(super) const BACKGROUND_INDEX_MAX_ENTRIES: usize = 20;
 
 /// Render the `[Scheduled]` index.
 ///
-/// Deliberately omits next-fire times. They move every time a job fires, and [`WorldSnapshot`] is
-/// diffed by equality, so including them would re-render the whole section on most turns of any
+/// Deliberately omits next-fire times. They move every time a schedule fires, and [`WorldSnapshot`]
+/// is diffed by equality, so including them would re-render the whole section on most turns of any
 /// session with a short interval, paying tokens on every turn to tell the model something it
-/// almost never needs. What it does need is that a job exists, so it does not schedule a second
-/// copy of one the user already asked for.
-pub(super) fn render_schedule_section(jobs: &[ScheduledIndexEntry]) -> String {
+/// almost never needs. What it does need is that a schedule exists, so it does not schedule a
+/// second copy of one the user already asked for.
+pub(super) fn render_schedule_section(schedules: &[ScheduledIndexEntry]) -> String {
     let mut out = String::from(
-        "[Scheduled]\nJobs scheduled in this session; `schedule_list` for exact fire times, gates \
+        "[Scheduled]\nThis session's schedules; `schedule_list` for exact fire times, gates \
          and prompts.\n\n",
     );
-    for entry in jobs.iter().take(SCHEDULE_INDEX_MAX_ENTRIES) {
+    for entry in schedules.iter().take(SCHEDULE_INDEX_MAX_ENTRIES) {
         out.push_str(&format!(
             "- **{}** ({}): {}\n",
-            entry.short_id, entry.schedule, entry.summary
+            entry.short_id, entry.timing, entry.summary
         ));
-        // A held job is otherwise indistinguishable from a healthy one that has nothing to report,
-        // which is the normal resting state of a watcher. Without this the model could cancel a
-        // job it had no way of knowing was dead.
+        // A held schedule is otherwise indistinguishable from a healthy one that has nothing to
+        // report, which is the normal resting state of a watcher. Without this the model could
+        // cancel a schedule it had no way of knowing was dead.
         if let Some(reason) = &entry.withheld {
             out.push_str(&format!("  NOT FIRING: {reason}\n"));
         }
     }
-    let hidden = jobs.len().saturating_sub(SCHEDULE_INDEX_MAX_ENTRIES);
+    let hidden = schedules.len().saturating_sub(SCHEDULE_INDEX_MAX_ENTRIES);
     if hidden > 0 {
         out.push_str(&format!(
             "\n{hidden} more not shown here; use `schedule_list` to see them.\n"
@@ -926,7 +926,7 @@ pub(super) fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldS
     // A move between projects changes which tier the session sees and writes into, so the whole
     // section is restated under a line naming the project rather than announced memory by
     // memory: the model reads a new view, not a batch of edits to the old one. The tools, skills
-    // and jobs below diff as on any turn.
+    // and schedules below diff as on any turn.
     let mut restated_memories: Option<String> = None;
     if current.project != previous.project {
         lines.push(match &current.project {
@@ -1116,13 +1116,13 @@ pub(super) fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldS
         ));
     }
 
-    // Jobs the model did not create itself still have to be announced: `meka schedule cancel` and a
-    // second attached client both change this behind its back, and a job it believes still exists
-    // is one it will not recreate. By id, not by whole entry. A job is immutable once created
-    // except for whether its gate can currently fire, so comparing the whole struct would report
-    // a job that had merely gone held as newly scheduled, announcing an appearance that never
-    // happened, and burying the thing that did change.
-    let added_jobs: Vec<String> = current
+    // Schedules the model did not create itself still have to be announced: `meka schedule cancel`
+    // and a second attached client both change this behind its back, and a schedule it believes
+    // still exists is one it will not recreate. By id, not by whole entry. A schedule is immutable
+    // once created except for whether its gate can currently fire, so comparing the whole struct
+    // would report a schedule that had merely gone held as newly scheduled, announcing an
+    // appearance that never happened, and burying the thing that did change.
+    let added_schedules: Vec<String> = current
         .scheduled
         .iter()
         .filter(|entry| {
@@ -1131,9 +1131,9 @@ pub(super) fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldS
                 .iter()
                 .any(|candidate| candidate.short_id == entry.short_id)
         })
-        .map(|entry| format!("{} ({}): {}", entry.short_id, entry.schedule, entry.summary))
+        .map(|entry| format!("{} ({}): {}", entry.short_id, entry.timing, entry.summary))
         .collect();
-    let removed_jobs: Vec<&String> = previous
+    let removed_schedules: Vec<&String> = previous
         .scheduled
         .iter()
         .filter(|entry| {
@@ -1144,9 +1144,9 @@ pub(super) fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldS
         })
         .map(|entry| &entry.short_id)
         .collect();
-    // A job that is still there but has changed whether it can fire. Neither an appearance nor a
-    // disappearance, and reporting it as either would be a lie; it gets its own line because it is
-    // the moment the model can act on, and the only one it would otherwise have to infer.
+    // A schedule that is still there but has changed whether it can fire. Neither an appearance nor
+    // a disappearance, and reporting it as either would be a lie; it gets its own line because it
+    // is the moment the model can act on, and the only one it would otherwise have to infer.
     let gate_changes: Vec<String> = current
         .scheduled
         .iter()
@@ -1158,7 +1158,7 @@ pub(super) fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldS
             if before.withheld == entry.withheld {
                 return None;
             }
-            // Three transitions, not two. A job whose reason merely changed (a session
+            // Three transitions, not two. A schedule whose reason merely changed (a session
             // dropping from `read` to `none` under a shell gate swaps one refusal for another)
             // would read as "can no longer fire", asserting a transition from firing that never
             // happened and inviting the model to act on a change of state rather than a change of
@@ -1177,25 +1177,25 @@ pub(super) fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldS
             })
         })
         .collect();
-    if !added_jobs.is_empty() {
-        lines.push(format!("- Jobs scheduled: {}", added_jobs.join("; ")));
+    if !added_schedules.is_empty() {
+        lines.push(format!("- Schedules added: {}", added_schedules.join("; ")));
     }
-    if !removed_jobs.is_empty() {
+    if !removed_schedules.is_empty() {
         lines.push(format!(
-            "- Jobs no longer scheduled: {}",
-            join_names(removed_jobs.into_iter())
+            "- Schedules removed: {}",
+            join_names(removed_schedules.into_iter())
         ));
     }
     if !gate_changes.is_empty() {
         // Budgeted like every other line in this function. Lowering a session to `none` flips every
-        // job at once, and the snapshot holds all of them (the 20-entry cap applies only to the
-        // rendered section), so at the default `max_jobs = 50` this would be one ~7 KB line of the
-        // same sentence fifty times. Past the cap the count carries the fact, which is the part the
-        // model acts on.
+        // schedule at once, and the snapshot holds all of them (the 20-entry cap applies only to
+        // the rendered section), so at the default `max_schedules = 50` this would be one ~7 KB
+        // line of the same sentence fifty times. Past the cap the count carries the fact, which is
+        // the part the model acts on.
         let shown = gate_changes.len().min(SCHEDULE_STATUS_MAX_ENTRIES);
         let hidden = gate_changes.len() - shown;
         let mut line = format!(
-            "- Scheduled job status: {}",
+            "- Schedule status: {}",
             gate_changes.get(..shown).unwrap_or_default().join("; ")
         );
         if hidden > 0 {
@@ -1230,7 +1230,7 @@ pub(super) fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldS
     }
 
     let mut out = String::from(
-        "[Context changes]\nThese updates replace the corresponding tool, skill, memory, job, \
+        "[Context changes]\nThese updates replace the corresponding tool, skill, memory, schedule, \
          or server facts stated earlier.\n",
     );
     if !lines.is_empty() {

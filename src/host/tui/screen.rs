@@ -176,7 +176,7 @@ enum PanelKind {
     /// A tool call waiting on the answer.
     Approval(ApprovalRequest),
     /// The command line each choice runs, in the order drawn: a skill to run, a memory, a task
-    /// or a job to show.
+    /// or a schedule to show.
     Run(Vec<String>),
     /// The configured MCP servers offered, in the order drawn; the pick offers what to do with
     /// one.
@@ -1179,6 +1179,9 @@ impl Screen {
                     self.ask_host(HostEvent::Wake);
                 }
             }
+            UiEvent::InboxWithdrawn { item_ids } => {
+                self.launch.transcript.mark_withdrawn(&item_ids);
+            }
             UiEvent::Leave => self.leaving = true,
             UiEvent::Reload => self.reload(),
             // A page read for the session let go of is no page of this one.
@@ -1931,8 +1934,10 @@ impl Screen {
     /// The terminal is gone, noticed by a read or a write that failed rather than by the signal
     /// the host listens for: macOS reports a closed pty to the write first, and a terminal held
     /// through another process sends no signal at all. Every way of noticing ends the same way,
-    /// as the signal does: the turn stopped and the interrupted status.
+    /// as the signal does: the process marked as leaving before the turn is stopped, so the inbox
+    /// items a stopped turn was opened on wait for the next start, and the interrupted status.
     fn hang_up(&mut self) {
+        INTERRUPT_RELAY.tell_to_leave();
         self.leave_with(true);
     }
 
@@ -2409,32 +2414,28 @@ impl Screen {
                 self.listing_panel(printed, outcome);
             }
             SlashCommand::ScheduleList => match session_id {
-                Some(id) => match self
-                    .launch
-                    .store
-                    .schedule_store()
-                    .list_scheduled_jobs(id)
-                    .await
-                {
-                    Ok(jobs) if jobs.is_empty() => self.reply("No scheduled jobs"),
-                    Ok(jobs) => {
-                        let shown =
-                            crate::text::unique_prefix_len(jobs.iter().map(|job| job.id.as_str()));
-                        let jobs = crate::cli::schedule::with_levels(
+                Some(id) => match self.launch.store.schedule_store().list_schedules(id).await {
+                    Ok(schedules) if schedules.is_empty() => self.reply("No schedules"),
+                    Ok(schedules) => {
+                        let shown = crate::text::unique_prefix_len(
+                            schedules.iter().map(|schedule| schedule.id.as_str()),
+                        );
+                        let schedules = crate::cli::schedule::with_levels(
                             &self.launch.store,
                             &self.launch.schedule,
-                            jobs,
+                            schedules,
                         )
                         .await;
                         let memory = self.launch.store.scheduler_memory();
-                        let rows = jobs
+                        let rows = schedules
                             .iter()
-                            .map(|(job, level)| {
-                                let id = job.id.get(..shown).unwrap_or(&job.id).to_string();
-                                // The one fact a row carries beyond what the job is: whether it
-                                // can fire, since a job that cannot is the one to look at.
-                                let held = match crate::schedule::job_withheld(
-                                    memory, job, *level, None,
+                            .map(|(schedule, level)| {
+                                let id =
+                                    schedule.id.get(..shown).unwrap_or(&schedule.id).to_string();
+                                // The one fact a row carries beyond what the schedule is: whether
+                                // it can fire, since a schedule that cannot is the one to look at.
+                                let held = match crate::schedule::schedule_withheld(
+                                    memory, schedule, *level, None,
                                 ) {
                                     crate::schedule::Withheld::Yes(_) => "  held",
                                     crate::schedule::Withheld::Undetermined => "  held?",
@@ -2444,8 +2445,8 @@ impl Screen {
                                     id.clone(),
                                     Some(format!(
                                         "{}  {}{held}",
-                                        job.schedule.describe(),
-                                        one_line(&job.prompt, 120)
+                                        schedule.timing.describe(),
+                                        one_line(&schedule.prompt, 120)
                                     )),
                                     format!("/schedule show {id}"),
                                 )
@@ -2511,14 +2512,14 @@ impl Screen {
                         .launch
                         .store
                         .schedule_store()
-                        .cancel_scheduled_job(session, &id)
+                        .cancel_schedule(session, &id)
                         .await
                     {
                         Ok(Some(canceled)) => self.push(Item::note(format!(
-                            "Canceled job {}",
-                            &canceled[..8.min(canceled.len())]
+                            "Canceled schedule {}",
+                            &canceled.id[..8.min(canceled.id.len())]
                         ))),
-                        Ok(None) => self.reply(format!("No scheduled job matching '{id}'")),
+                        Ok(None) => self.reply(format!("No schedule matching '{id}'")),
                         Err(error) => self.reply(error.to_string()),
                     }
                 }

@@ -256,21 +256,23 @@ fn thinking_preview_runs(thinking: &str) -> Vec<markdown::OwnedCompound> {
     markdown::inline_runs(&sanitize_to_line(&collapse_to_line(thinking), usize::MAX))
 }
 
-/// How much of a scheduled job's prompt the stage direction quotes, in columns: enough to
-/// recognize the job the person wrote, short enough that the line fits a terminal with the
+/// How much of a schedule's prompt the stage direction quotes, in columns: enough to
+/// recognize the schedule the person wrote, short enough that the line fits a terminal with the
 /// lateness note on.
 const FIRE_DIRECTION_PROMPT_COLUMNS: usize = 40;
 
-/// The stage direction the screen prints where a scheduled fire's turn begins: the job, its
-/// lateness when that is material, and the opening of its prompt, which the person wrote and
-/// needs only to recognize. A fire read back from the log carries no lateness: it is news as it
-/// happens, and a replay is not the time for it.
+/// The stage direction the screen prints where a scheduled fire lands, opening a turn or read by
+/// one already running: the schedule, its lateness when that is material, and the opening of its
+/// prompt, which the person wrote and needs only to recognize. A fire read back from the log
+/// carries no lateness: it is news as it happens, and a replay is not the time for it.
 pub(crate) fn fire_direction(
-    job_id: &str,
+    schedule_id: &str,
     prompt: &str,
     late: Option<crate::frontend::FireLateness>,
 ) -> String {
-    let short_id = job_id.get(..crate::text::ID_PREFIX).unwrap_or(job_id);
+    let short_id = schedule_id
+        .get(..crate::text::ID_PREFIX)
+        .unwrap_or(schedule_id);
     let prompt = crate::text::sanitize_to_line(prompt, FIRE_DIRECTION_PROMPT_COLUMNS);
     match late {
         Some(late) => {
@@ -278,13 +280,13 @@ pub(crate) fn fire_direction(
             // the prompt the model gets counts it.
             let occurrences = late.coalesced + 1;
             format!(
-                "Scheduled job {short_id} fired {} late, replacing {occurrences} missed \
+                "Schedule {short_id} fired {} late, replacing {occurrences} missed \
                  occurrence{}: {prompt}",
                 crate::scheduler::format_late(late.late_by),
                 if occurrences == 1 { "" } else { "s" }
             )
         }
-        None => format!("Scheduled job {short_id} fired: {prompt}"),
+        None => format!("Schedule {short_id} fired: {prompt}"),
     }
 }
 
@@ -292,41 +294,38 @@ pub(crate) fn fire_direction(
 mod direction_tests {
     use super::*;
 
-    /// A wakeup's direction counts the occurrence being delivered among the ones it stands in
-    /// for, as the prompt the model gets does, and says nothing of a lateness a tick explains.
+    /// A fire's direction counts the occurrence being delivered among the ones it stands in for,
+    /// as the prompt the model gets does, and says nothing of a lateness a tick explains.
     #[test]
-    fn a_wakeups_direction_counts_the_occurrence_it_delivers() {
-        let job = crate::schedule::ScheduledJob {
-            id: "1a2b3c4d-0000-4000-8000-000000000000".to_string(),
-            session_id: uuid::Uuid::nil(),
-            schedule: crate::schedule::Schedule::At(chrono::Utc::now()),
-            prompt: "remind me to stretch".to_string(),
-            gate: None,
-            created_at: chrono::Utc::now(),
-            last_fired_at: None,
-            next_fire_at: chrono::Utc::now(),
-            attempts: 0,
+    fn a_fires_direction_counts_the_occurrence_it_delivers() {
+        let fire = |late_by: chrono::Duration, occurrences: u32| {
+            let fired_at = chrono::Utc::now();
+            crate::store::inbox::Fire {
+                schedule_id: "1a2b3c4d-0000-4000-8000-000000000000".to_string(),
+                gate_output: None,
+                occurrences,
+                due_at: fired_at - late_by,
+                fired_at,
+            }
         };
-        let late = crate::scheduler::Wakeup {
-            job: job.clone(),
-            gate_output: None,
-            late_by: chrono::Duration::hours(2),
-            coalesced: 2,
-        };
+        let late = fire(chrono::Duration::hours(2), 3);
         assert_eq!(
-            fire_direction(&job.id, &job.prompt, late.lateness()),
-            "Scheduled job 1a2b3c4d fired 2h late, replacing 3 missed occurrences: remind me to \
+            fire_direction(
+                &late.schedule_id,
+                "remind me to stretch",
+                crate::frontend::FireLateness::of(&late)
+            ),
+            "Schedule 1a2b3c4d fired 2h late, replacing 3 missed occurrences: remind me to \
              stretch"
         );
-        let on_time = crate::scheduler::Wakeup {
-            job: job.clone(),
-            gate_output: None,
-            late_by: chrono::Duration::seconds(5),
-            coalesced: 0,
-        };
+        let on_time = fire(chrono::Duration::seconds(5), 1);
         assert_eq!(
-            fire_direction(&job.id, &job.prompt, on_time.lateness()),
-            "Scheduled job 1a2b3c4d fired: remind me to stretch"
+            fire_direction(
+                &on_time.schedule_id,
+                "remind me to stretch",
+                crate::frontend::FireLateness::of(&on_time)
+            ),
+            "Schedule 1a2b3c4d fired: remind me to stretch"
         );
     }
 
@@ -341,7 +340,7 @@ mod direction_tests {
                 "remind me to stretch",
                 None
             ),
-            "Scheduled job 1a2b3c4d fired: remind me to stretch"
+            "Schedule 1a2b3c4d fired: remind me to stretch"
         );
         assert_eq!(
             fire_direction(
@@ -349,7 +348,7 @@ mod direction_tests {
                 "remind me to stretch",
                 late(chrono::Duration::hours(2), 2)
             ),
-            "Scheduled job 1a2b3c4d fired 2h late, replacing 3 missed occurrences: remind me to \
+            "Schedule 1a2b3c4d fired 2h late, replacing 3 missed occurrences: remind me to \
              stretch"
         );
         assert!(
@@ -359,7 +358,7 @@ mod direction_tests {
         let long = fire_direction("1a2b3c4d", &"check the build\n".repeat(20), None);
         assert!(!long.contains('\n'), "{long}");
         assert!(
-            long.len() < "Scheduled job 1a2b3c4d fired: ".len() + FIRE_DIRECTION_PROMPT_COLUMNS + 4,
+            long.len() < "Schedule 1a2b3c4d fired: ".len() + FIRE_DIRECTION_PROMPT_COLUMNS + 4,
             "{long}"
         );
     }
@@ -546,9 +545,9 @@ mod tests {
 
     /// Every id family answers the same way to the same prefix, whatever case it is typed in.
     ///
-    /// Sessions resolve through SQL `LIKE`, which is ASCII-case-insensitive; jobs and tasks
+    /// Sessions resolve through SQL `LIKE`, which is ASCII-case-insensitive; schedules and tasks
     /// resolve through `str::starts_with`, which is not. A pasted uppercase id therefore found a
-    /// session and was reported as no such job -- the two commands disagreeing about the same
+    /// session and was reported as no such schedule -- the two commands disagreeing about the same
     /// string. `is_usable_id_prefix` accepts `A-F`, so the folding has to happen somewhere.
     #[test]
     fn an_uppercase_prefix_matches_the_lowercase_id_it_was_copied_from() {
@@ -567,15 +566,15 @@ mod tests {
 
     /// The empty string is a prefix of every id, which is a destructive answer to give.
     ///
-    /// `meka schedule cancel "$JOB"` with the variable unset would otherwise resolve to "the only
-    /// job" and delete it, and read as correct for as long as the store held one of anything. Every
-    /// resolver asks this, so the answer cannot differ between the command that shows a job and the
-    /// command that destroys it.
+    /// `meka schedule cancel "$SCHEDULE"` with the variable unset would otherwise resolve to "the
+    /// only schedule" and delete it, and read as correct for as long as the store held one of
+    /// anything. Every resolver asks this, so the answer cannot differ between the command that
+    /// shows a schedule and the command that destroys it.
     #[test]
     fn an_empty_or_impossible_prefix_matches_nothing_rather_than_everything() {
         assert!(
             !crate::text::is_usable_id_prefix(""),
-            "an unset shell variable must not name the only session, job or task"
+            "an unset shell variable must not name the only session, schedule or task"
         );
         assert!(!crate::text::is_usable_id_prefix("  "));
         assert!(

@@ -1,7 +1,7 @@
 //! SQLite-backed session store. The tables this module owns are `sessions` and `messages` for the
 //! conversation, `scratchpad_entries` for results too large to keep inline (referenced from the
 //! conversation by handle), `account_credentials` and `mcp_credentials` for secrets, and
-//! `scheduled_jobs` and `background_tasks` for work the agent starts and does not wait for. They
+//! `schedules` and `background_tasks` for work the agent starts and does not wait for. They
 //! are not the whole database, and this module does not define them: they and the memory store's
 //! tables are created by [`migrations`], the single ledger that also brings an older store forward.
 //! `initialize_schema` runs it, then hands the memory search index to
@@ -81,9 +81,9 @@ pub(crate) struct Store {
     /// this store drops, not the first: `Store` is cloned into sub-agents and tool
     /// builders, and any of those may still be locking sessions.
     _ephemeral_lock_dir: Option<Arc<EphemeralLockDir>>,
-    /// What this handle's scheduler has learned about the jobs in this database. Here rather than
-    /// on the scheduler because the readers that explain a held job, and the delete that has to
-    /// forget one, hold the store and not the scheduler.
+    /// What this handle's scheduler has learned about the schedules in this database. Here rather
+    /// than on the scheduler because the readers that explain a held schedule, and the delete that
+    /// has to forget one, hold the store and not the scheduler.
     scheduler_memory: Arc<crate::schedule::SchedulerMemory>,
     /// The rows this build could not read and has said so about. Shared by every clone, since a
     /// resume's hydration and the screen's page read meet the same rows.
@@ -504,7 +504,7 @@ impl Store {
         }
     }
 
-    /// The scheduled-jobs table, on this store's connection.
+    /// The schedules table, on this store's connection.
     pub(crate) fn schedule_store(&self) -> crate::store::schedule::ScheduleStore {
         crate::store::schedule::ScheduleStore::new(
             Arc::clone(&self.connection),
@@ -512,7 +512,7 @@ impl Store {
         )
     }
 
-    /// What this handle's scheduler has learned about the jobs in this database.
+    /// What this handle's scheduler has learned about the schedules in this database.
     pub(crate) fn scheduler_memory(&self) -> &crate::schedule::SchedulerMemory {
         &self.scheduler_memory
     }
@@ -860,7 +860,7 @@ mod tests {
             .connection
             .call(|connection| {
                 connection.query_row(
-                    "SELECT count(*) FROM pragma_table_info('scheduled_jobs') WHERE name = 'claimed_by'",
+                    "SELECT count(*) FROM pragma_table_info('schedules') WHERE name = 'claimed_by'",
                     [],
                     |row| row.get(0),
                 )

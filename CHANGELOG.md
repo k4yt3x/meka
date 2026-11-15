@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The screen and `meka acp` open a turn when a session's inbox has an item waiting.
+- The screen and an editor say when a failed inbox item will be tried again, or was given up.
+- `GET /v1/sessions/{id}/inbox` lists a waiting fire with its `schedule_id` and `occurrences`.
+- The session feed carries `schedule.fired`.
+
 ### Changed
 
 - **Breaking:** An import takes this installation's level and approvals; see the upgrade guide.
@@ -14,18 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `meka --permission <level> session import` brings an archive's sessions in at that level.
 - **Breaking:** A gate on an MCP tool sees repeated structured content once; see the upgrade guide.
 - `file_search` skips a file it finds a NUL byte in, and says how many it skipped.
-- A scheduled fire's gate output and a background report's task output are quoted with `> `.
-- A scheduled job's gate output has terminal control characters removed.
+- A fire's gate output and a background report's task output are quoted with `> `.
+- A schedule's gate output has terminal control characters removed.
 - An MCP image in a format providers do not take, such as BMP or TIFF, arrives converted to PNG.
 - On Unix a `!command` has no terminal, so one that asks for a password fails at once.
 - A shell gate whose command exits while something it started holds its output answers 2 s later.
 - A `PATCH /v1/sessions/{id}` naming a level, approvals or directory refuses a bad body first.
-- Session archives are `format_version` 29; older archives are brought forward on import.
+- Session archives are `format_version` 30; older archives are brought forward on import.
 - A memory export lists tags and references one per line and quotes only what YAML requires.
 - `meka skill get --format json` and `show --format json` print the description as the file has it.
 - **Breaking:** `tool_call.completed` gives a large result as history does; see the upgrade guide.
 - An ACP `tool_call_update` no longer carries a large result whole; see the upgrade guide.
-- A gated job due while its session is mid-turn runs its gate once the session is free.
 - MCP tools follow the built-in ones in a request, sorted by name, whichever server answers first.
 - On the screen, a large result that did not stream shows its opening, as a resumed session does.
 - After the screen's `/resume`, the context gauge shows the session's own last measurement.
@@ -34,6 +40,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - With `--permission` given, `MEKA_PERMISSION` is not read, so a misspelled one stops nothing.
 - `MEKA_PERMISSION` is read trimmed, and an empty one is unset without a warning.
 - The `scratchpad_*` and `checklist_*` tools and `context_replace` ignore a `scratchpad` argument.
+- **Breaking:** Scheduled jobs are schedules: `/v1/jobs` is `/v1/schedules`; see the upgrade guide.
+- **Breaking:** A schedule's `schedule` field is `timing`, and every `job_id` is `schedule_id`.
+- **Breaking:** `[schedule].max_jobs` is `max_schedules`; the old key is refused by name.
+- **Breaking:** `meka schedule list --format json` prints `schedules`; its table says "Timing".
+- Meka says "schedule" for a scheduled job in its tools, its context block, messages and help.
+- **Breaking:** A schedule fires when due, mid-turn or not; its fire waits in the session's inbox.
+- A running turn reads a fire at its next pause; an idle session gets a turn for it at once.
+- A schedule has one waiting fire: a later occurrence joins it, and it says how many it stands for.
+- **Breaking:** `schedule.fired` is sent when a fire is queued, and names its inbox item.
+- **Breaking:** `schedule.fired` has no `status`; see the upgrade guide.
+- **Breaking:** `turn.started` names `item_ids` and `schedule_ids` for a turn opened on fires.
+- An inbox turn opens on the items `turn.started` names; later ones wait for a pause or its end.
+- A turn opened on a fire posts `turn.finished` or `turn.failed` to webhooks.
+- A fire whose turn fails in a way waiting can change is tried again, as an inbox item is.
+- After a restart, `meka serve` no longer reruns a fire whose turn the model had begun to answer.
+- A host killed during a fire's turn no longer fires it again; the session's next turn reads it.
+- Canceling a schedule withdraws its unread fires; a server that cancels it says `inbox.withdrawn`.
+- `meka serve` leaves the inbox of a session another process holds to that process.
+- On the screen, a steer typed too late for its turn is answered as soon as that turn ends.
+
+### Removed
+
+- **Breaking:** `[schedule].max_consecutive_fires`; a config that sets it is refused by name.
 
 ### Fixed
 
@@ -77,11 +106,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A subscription login that must be redone answers HTTP 422 naming its login route, not a 502.
 - Over ACP, a subscription login that must be redone is an `InvalidParams` naming the command.
 - A turn or compaction that failed on a login to redo names the login wherever it is read back.
-- A scheduled job whose session or profile cannot be loaded is retried each lease, never parked.
-- A job whose last fire could not run says why in `[Scheduled]`, `schedule_list`, `GET /v1/jobs`.
-- A scheduled fire cut short by `meka acp` exiting, or by SIGTERM or SIGHUP on the screen, reruns.
+- A schedule whose session or profile cannot be loaded is not parked; its fire waits in the inbox.
+- A fire cut short before a reply waits, as `meka acp` exits or the screen is signaled or cut off.
+- `/exit` during the screen's scheduled turn no longer starts a turn for a finished task.
 - The screen sent SIGTERM or SIGHUP starts no further scheduled or background-outcome turn.
-- `meka schedule cancel` cancels a job this build cannot read, as the warning about it says.
+- `meka schedule cancel` cancels a schedule this build cannot read, as its warning says.
 - A refused store upgrade no longer leaves a new copy of the store on every retry.
 - A compaction on `openai-chat-completions` streams when the session's turns do.
 - A Chat Completions reply that is not a completion is reported with what the endpoint sent.
@@ -96,7 +125,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The screen's `/resume` and `/fork` are refused while a background task runs, keeping its report.
 - The screen's `/resume` runs the session under its own directory's `[instructions].files`.
 - After the screen's `/resume`, the context block no longer counts the last session's compactions.
-- A scheduled job whose session is mid-turn no longer holds back other sessions' jobs.
+- A schedule whose session is mid-turn no longer holds back other sessions' schedules.
+- An inbox turn whose items were all withdrawn as it opened no longer shows as a failed turn.
 - `meka serve` no longer keeps every event of a running turn in memory until the turn ends.
 - An MCP server listing its tools again keeps their place, so a reconnect keeps the prompt cache.
 - A server's deferred tools no longer reach one request undeferred while its listing is applied.

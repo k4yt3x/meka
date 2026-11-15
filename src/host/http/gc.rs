@@ -74,7 +74,7 @@ async fn evict_idle(state: &ServerState, idle_timeout: Duration, delete_on_idle:
         entry.frontend.close_feed();
     }
 
-    // By the retention sweep's rule: a pin or a scheduled job anywhere in the tree keeps it.
+    // By the retention sweep's rule: a pin or a schedule anywhere in the tree keeps it.
     if delete_on_idle {
         for (id, _entry) in &evicted {
             let tree =

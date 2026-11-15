@@ -361,7 +361,7 @@ pub(crate) const COMMANDS: &[HostCommand] = &[
     },
     HostCommand {
         name: "schedule",
-        help: "List this session's scheduled jobs, show one, or cancel one by id",
+        help: "List this session's schedules, show one, or cancel one by id",
         arg_hint: "[show|cancel <id>]",
         editor_help: None,
     },

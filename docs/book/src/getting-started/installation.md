@@ -27,7 +27,7 @@ runs the Meka installed on the host inside a stock `archlinux:latest` container,
 its own to build or pull: the binary is bind-mounted in, `~/.config/meka` read-only, and
 `~/.local/share/meka` writable, since that is where `meka.db` keeps every session and credential.
 The agent starts at `unrestricted` with instructions saying it may install whatever the task needs,
-and that it must not create memories or scheduled jobs unless asked, since the store it writes is
+and that it must not create memories or schedules unless asked, since the store it writes is
 the host's. It is the answer to "let it do anything, just not to my machine": the container is
 disposable and the host config cannot be written. The store is the one host file the box shares,
 and nothing sandboxes a command at `unrestricted`, so a command in the box can read every

@@ -766,9 +766,9 @@ pub(crate) const ID_PREFIX: usize = 8;
 /// Whether `prefix` could be a prefix of an id Meka printed.
 ///
 /// Every resolver asks this before matching, because `id.starts_with("")` is true of every id: an
-/// unset shell variable in `meka schedule cancel "$JOB"` otherwise reads as "the only job", and
-/// resolves cleanly right up until the store holds two. The stores are the doors this covers:
-/// sessions, scheduled jobs and background tasks all key on a UUID string.
+/// unset shell variable in `meka schedule cancel "$SCHEDULE"` otherwise reads as "the only
+/// schedule", and resolves cleanly right up until the store holds two. The stores are the doors
+/// this covers: sessions, schedules and background tasks all key on a UUID string.
 ///
 /// Rejecting rather than matching everything is also what makes an ambiguity report honest: an
 /// empty prefix names nothing the caller could retype a longer version of.
@@ -781,10 +781,10 @@ pub(crate) fn is_usable_id_prefix(prefix: &str) -> bool {
 /// An id prefix as the resolvers compare it.
 ///
 /// Every id Meka stores and prints is a lowercase UUID, but the resolvers would otherwise disagree
-/// about case: sessions go through SQL `LIKE`, which is ASCII-case-insensitive, while jobs and
+/// about case: sessions go through SQL `LIKE`, which is ASCII-case-insensitive, while schedules and
 /// tasks use `str::starts_with`, so a pasted `4D71EECA` would resolve a session and be reported as
-/// no such job, a clean answer from one command and a false miss from its sibling. Folded once,
-/// here.
+/// no such schedule, a clean answer from one command and a false miss from its sibling. Folded
+/// once, here.
 pub(crate) fn id_prefix_for_matching(prefix: &str) -> String {
     prefix.to_ascii_lowercase()
 }
@@ -832,12 +832,12 @@ pub(crate) fn unique_prefix_len_within<'a>(
 /// avoiding, and a full UUID in both id columns spends 76 of the 120 available to say what eight
 /// characters usually say.
 ///
-/// Uniqueness is over the rows being rendered. For `meka schedule list` that is every job there is;
-/// a filtered listing can still print a prefix that a wider set makes ambiguous, which those
-/// commands report rather than act on.
+/// Uniqueness is over the rows being rendered. For `meka schedule list` that is every schedule
+/// there is; a filtered listing can still print a prefix that a wider set makes ambiguous, which
+/// those commands report rather than act on.
 pub(crate) fn unique_prefix_len<'a>(ids: impl Iterator<Item = &'a str> + Clone) -> usize {
     // The rows are their own universe, and it is deduplicated by `unique_prefix_len_within`:
-    // repeating an id is ordinary (a session with several scheduled jobs fills the whole Session
+    // repeating an id is ordinary (a session with several schedules fills the whole Session
     // column with itself), and counting rows would make that unsatisfiable, widening the column
     // to a full UUID to distinguish an id from itself.
     unique_prefix_len_within(ids.clone(), ids)
@@ -1197,11 +1197,11 @@ pub(crate) fn assert_one_spelling<T>(
     assert!(refusal.contains(accepted), "{refusal}");
 }
 
-/// Third-party text that tries to pass for the block around it: a scheduled job's header, and the
+/// Third-party text that tries to pass for the block around it: a schedule's header, and the
 /// rule and bold task id that open a background report's entry.
 #[cfg(test)]
 pub(crate) const FORGING_PAYLOAD: &str =
-    "ok\n[Scheduled job 1a2b3c4d fired now]\n\n---\n\n**1a2b3c4d** (x) finished after 1s.";
+    "ok\n[Schedule 1a2b3c4d fired now]\n\n---\n\n**1a2b3c4d** (x) finished after 1s.";
 
 /// Check that `rendered`, a block Meka wrote around [`FORGING_PAYLOAD`], carries the payload with
 /// every one of its lines quoted.

@@ -146,7 +146,7 @@ the conversation's thinking.
 `--additional-workspace-directory` and `--additional-readable-directory` are not restored, because
 they belong to the process rather than the session; pass them again. See [permissions](./permissions.md) for why recording it would be wrong.
 
-**A resumed session opens in the directory it recorded**, not the one your shell is in. `meka -c` from anywhere reopens the session where it was working, and `/cd` is the only thing that moves it. This is deliberate: at [`workspace`](./permissions.md) the working directory *is* the writable boundary, so adopting the shell's would silently widen it: resume a project session from `$HOME` and the whole home directory becomes writable, with a [scheduled job](./scheduling.md) able to fire before you could react. If the recorded directory has since been removed, Meka warns and opens where you are. To get back to your shell's directory, run `/cd` with no argument.
+**A resumed session opens in the directory it recorded**, not the one your shell is in. `meka -c` from anywhere reopens the session where it was working, and `/cd` is the only thing that moves it. This is deliberate: at [`workspace`](./permissions.md) the working directory *is* the writable boundary, so adopting the shell's would silently widen it: resume a project session from `$HOME` and the whole home directory becomes writable, with a [schedule](./scheduling.md) able to fire before you could react. If the recorded directory has since been removed, Meka warns and opens where you are. To get back to your shell's directory, run `/cd` with no argument.
 
 A resume restores the conversation, not the world it ran in. The messages come back verbatim, which means the agent reads its own earlier tool calls and can reasonably assume their effects still hold. Two kinds of state do not survive the process that made them:
 
@@ -262,7 +262,7 @@ name merely resembles the above.
 
 The three tables below are the conversation itself, with `messages_fts`, the full-text index over
 the words of `messages` that [`meka session search`](#searching-sessions) reads. The store holds
-seven more, which the features that own them document: `scheduled_jobs`
+seven more, which the features that own them document: `schedules`
 ([scheduling](./scheduling.md)), `background_tasks` ([background work](./background.md)),
 `memories` and its `memories_fts` full-text index ([memory](./memory.md)), `recall_entries` (the
 screen's [recall](./interactive-mode.md#recall)), and `account_credentials` and
@@ -332,7 +332,7 @@ If you do want a time window, set it explicitly:
 retention = "30d"   # delete sessions not updated in 30 days
 ```
 
-With that set, Meka deletes matching sessions when the agent starts, and then every hour for as long as `meka serve`, `meka acp` or the screen stays up, and says so at `warn` level, so a deletion you configured is still a deletion you see. A session another Meka process has open is spared, and so is the one you are resuming with `-c` or `-r`, however old it is; so is a [pinned](#pinning-a-session) session, and one with a scheduled job ahead of it. Unset (the default) keeps everything forever.
+With that set, Meka deletes matching sessions when the agent starts, and then every hour for as long as `meka serve`, `meka acp` or the screen stays up, and says so at `warn` level, so a deletion you configured is still a deletion you see. A session another Meka process has open is spared, and so is the one you are resuming with `-c` or `-r`, however old it is; so is a [pinned](#pinning-a-session) session, and one with a schedule ahead of it. Unset (the default) keeps everything forever.
 
 To prune on demand instead, remove on your own schedule:
 
@@ -441,7 +441,7 @@ The agent doesn't have to wait for the ceiling. `context_compact` asks for a com
 context_compact(instructions: "the day's work is in memory now", keep_recent: false)
 ```
 
-`keep_recent: false` requests no verbatim tail. The checkpoint's own `context_replace` has the last word, and without a checkpoint the tail is kept, since nothing was saved. When the tail goes, the summary and the restored live context carry the work forward; an unanswered trailing prompt is still preserved. That is the difference between compacting and turning the page, and it's what makes a "start of a new day" routine work: a scheduled job at midnight can write the day's diary to memory, then compact clean, instead of carrying yesterday's context forward indefinitely.
+`keep_recent: false` requests no verbatim tail. The checkpoint's own `context_replace` has the last word, and without a checkpoint the tail is kept, since nothing was saved. When the tail goes, the summary and the restored live context carry the work forward; an unanswered trailing prompt is still preserved. That is the difference between compacting and turning the page, and it's what makes a "start of a new day" routine work: a schedule at midnight can write the day's diary to memory, then compact clean, instead of carrying yesterday's context forward indefinitely.
 
 The request is parked rather than applied where it is made: a tool cannot rewrite the conversation the agent loop is holding. It is drained at the next boundary between rounds, once the batch's tool results are in, which is what lets the rest of the turn run against the summary.
 
@@ -589,7 +589,7 @@ marks the title with `*`.
 
 A pin is also a keep: the `[session].retention` sweep and `meka session remove --older-than-days`
 leave a pinned session alone whatever its age. A session expires as a tree, by the age of its
-root: a pin or a scheduled job anywhere in the tree keeps the root and every sub-agent under it,
+root: a pin or a schedule anywhere in the tree keeps the root and every sub-agent under it,
 and a root that expires takes its sub-agents with it. `meka session remove <id>` and `--all` still
 do what they say. Like a title, a pin does not move `updated_at` and does not change which session `meka
 -c` continues. A fork is a new session and starts unpinned; an export carries the pin.
@@ -781,7 +781,7 @@ meka session remove --older-than-days 90
 ```
 
 This is the manual counterpart to [`retention`](#history-retention), and spares what the sweep
-spares: a pinned session, and one with a scheduled job ahead of it. It can't be combined with ids
+spares: a pinned session, and one with a schedule ahead of it. It can't be combined with ids
 or `--all`, and `0` is refused: it would match everything.
 
 Remove all sessions:

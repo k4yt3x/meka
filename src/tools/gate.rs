@@ -8,10 +8,12 @@ use super::*;
 /// Two lookup paths because the two tool families differ in one respect that matters here. An MCP
 /// adapter wraps a shared server connection and is independent of any session, so it comes straight
 /// from the process-wide manager's snapshot. A built-in bakes cwd, permission and frontend in at
-/// construction (`register_core_tools`), so it is built per call against the job's own session.
+/// construction (`register_core_tools`), so it is built per call against the schedule's own
+/// session.
 ///
-/// Built once per host and shared by every job, which is why it holds the config slice rather than
-/// a prebuilt registry: the registry cannot be shared, because the cwd belongs to the job.
+/// Built once per host and shared by every schedule, which is why it holds the config slice rather
+/// than a prebuilt registry: the registry cannot be shared, because the cwd belongs to the
+/// schedule.
 pub(crate) struct GateToolset {
     pub(super) mcp: Option<std::sync::Arc<crate::mcp::McpClientManager>>,
     pub(super) core: crate::session::CoreMaterials,
@@ -73,7 +75,7 @@ impl GateToolset {
         )
     }
 
-    /// Build the per-call built-in registry, rooted at the job's directory.
+    /// Build the per-call built-in registry, rooted at the schedule's directory.
     ///
     /// Only [`crate::schedule::GateTools::call`] needs this. Resolution goes through
     /// [`Self::resolution_registry`] instead, because what a tool *requires* does not depend on
@@ -97,8 +99,8 @@ impl GateToolset {
     /// The registry that answers what a built-in *requires*, built once and reused.
     ///
     /// Separate from [`Self::builtins`] because resolution is asked far more often than dispatch:
-    /// once per gated job per agent turn, once per `schedule_list`, and once per scheduler sweep.
-    /// A directory of `.` is fine here, since nothing about a permission depends on the cwd.
+    /// once per gated schedule per agent turn, once per `schedule_list`, and once per scheduler
+    /// sweep. A directory of `.` is fine here, since nothing about a permission depends on the cwd.
     pub(super) fn resolution_registry(&self) -> &ToolRegistry {
         self.resolution
             .get_or_init(|| self.builtins(None).map(std::sync::Arc::new).ok())

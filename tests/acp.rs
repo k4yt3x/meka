@@ -6436,14 +6436,14 @@ enabled = ["read", "unrestricted"]
 poll_interval = "1s"
 "#;
 
-/// A scheduled job fires in an ACP session and its turn reaches the editor unsolicited: no
+/// A schedule fires in an ACP session and its turn reaches the editor unsolicited: no
 /// `session/prompt` is outstanding when the notifications arrive.
 ///
 /// This is the property the whole ACP host rests on. Zed's `handle_session_notification` dispatches
 /// on session id with no in-flight-prompt check, so an agent-initiated turn renders; if that ever
 /// stopped being true the feature would run invisibly, and this test is what would notice.
 #[test]
-fn acp_scheduled_job_fires_without_a_prompt() {
+fn acp_schedule_fires_without_a_prompt() {
     let script = serde_json::json!([
         // Turn 1: the agent schedules a one-shot two seconds out.
         [
@@ -6476,8 +6476,8 @@ fn acp_scheduled_job_fires_without_a_prompt() {
 
     // Nothing is outstanding now: the prompt above has been answered. Anything that arrives from
     // here is agent-initiated. Wait for the scheduled turn to have written its reply rather than
-    // a fixed span past the job's due time: the reply's notifications are sent before the row is
-    // written, so once the row exists they are already queued ahead of the `session/list` the
+    // a fixed span past the schedule's due time: the reply's notifications are sent before the row
+    // is written, so once the row exists they are already queued ahead of the `session/list` the
     // drain below terminates on.
     let replied_by = Instant::now() + Duration::from_secs(45);
     loop {
@@ -6495,7 +6495,7 @@ fn acp_scheduled_job_fires_without_a_prompt() {
         }
         assert!(
             Instant::now() < replied_by,
-            "the scheduled job never fired, or its reply was never written"
+            "the schedule never fired, or its reply was never written"
         );
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -6516,10 +6516,10 @@ fn acp_scheduled_job_fires_without_a_prompt() {
     let user_text = text_of("user_message_chunk");
     assert!(
         user_text.contains("ACP_DELIVERED_MARKER"),
-        "the job's prompt must be pushed as a user message; updates were:\n{updates:#?}",
+        "the schedule's prompt must be pushed as a user message; updates were:\n{updates:#?}",
     );
     assert!(
-        user_text.contains("Scheduled job"),
+        user_text.contains("Schedule"),
         "and it must be marked as scheduled; updates were:\n{updates:#?}",
     );
 
@@ -6531,8 +6531,9 @@ fn acp_scheduled_job_fires_without_a_prompt() {
 }
 
 /// A scheduled turn has no `session/prompt` response to carry its outcome, so when it fails the
-/// editor would otherwise show the job's prompt and nothing under it. The failure is said as a
-/// `[Meka warn]` chunk, the way the screen shows it and `meka serve` posts a `failed` webhook.
+/// editor would otherwise show the schedule's prompt and nothing under it. The failure is said as a
+/// `[Meka warn]` chunk naming the schedule, the way the screen shows it and `meka serve` posts a
+/// `turn.failed` webhook.
 #[test]
 fn acp_reports_a_failed_scheduled_turn_as_a_warn_notice() {
     let script = serde_json::json!([
@@ -6591,7 +6592,7 @@ fn acp_reports_a_failed_scheduled_turn_as_a_warn_notice() {
         .find(|chunk| chunk.starts_with("[Meka warn]"))
         .expect("checked by the loop");
     assert!(
-        notice.contains("Scheduled job") && notice.contains("failed"),
+        notice.contains("Schedule") && notice.contains("failed"),
         "the notice must say which turn failed: {notice}"
     );
     assert!(
@@ -6659,12 +6660,226 @@ fn acp_withholds_a_failed_fires_upstream_text_when_relaying_is_off() {
         .find(|chunk| chunk.starts_with("[Meka warn]"))
         .expect("checked by the loop");
     assert!(
-        notice.contains("Scheduled job") && notice.contains("failed"),
+        notice.contains("Schedule") && notice.contains("failed"),
         "the notice must still say which turn failed: {notice}"
     );
     assert!(
         !notice.contains("ACP_PROVIDER_DOWN"),
         "the upstream's words stay in the log when relaying is off: {notice}"
+    );
+}
+
+/// The inbox driver's settings for an editor: the mock profile, and a ticker fast enough that an
+/// item planted in the store is found at once.
+fn acp_inbox_config() -> String {
+    format!("{ACP_UNRESTRICTED_CONFIG}\n[schedule]\npoll_interval = \"200ms\"\n")
+}
+
+/// An item waiting in the inbox of a session the editor has open opens a turn with no
+/// `session/prompt` outstanding: the editor is shown the item as the user turn it is, then the
+/// reply. An item for a session the editor does not have open is left as it was.
+#[test]
+fn acp_an_item_waiting_for_an_open_session_opens_a_turn() {
+    let script = serde_json::json!([[
+        { "type": "text", "text": "ACP_INBOX_REPLY" },
+        { "type": "message_end", "stop_reason": "end_turn" }
+    ]]);
+    let mut harness = AcpTestHarness::builder()
+        .config(&acp_inbox_config())
+        .script(script)
+        .window(Duration::from_secs(45))
+        .build();
+    let closed = harness.new_session();
+    harness.close_session(&closed);
+    let open = harness.new_session();
+    let database = harness.database();
+    let left = support::plant_inbox_item(&database, &closed, "followup", "ACP_CLOSED_WORDS");
+    support::plant_inbox_item(&database, &open, "followup", "ACP_INBOX_WORDS");
+
+    let replied_by = Instant::now() + Duration::from_secs(40);
+    loop {
+        let connection = rusqlite::Connection::open(&database).expect("open the store");
+        let replies: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM messages WHERE session_id = ?1 AND kind = 'assistant' \
+                 AND content LIKE '%ACP_INBOX_REPLY%'",
+                rusqlite::params![&open],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if replies > 0 {
+            break;
+        }
+        assert!(Instant::now() < replied_by, "no turn opened on the item");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let updates = harness.drain_unsolicited_updates(&open);
+    let position = |kind: &str, needle: &str| {
+        updates
+            .iter()
+            .map(|update| &update["params"]["update"])
+            .position(|update| {
+                update["sessionUpdate"] == kind
+                    && update["content"]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(needle))
+            })
+            .unwrap_or_else(|| panic!("no {kind} carries {needle}; updates were:\n{updates:#?}"))
+    };
+    assert!(
+        position("user_message_chunk", "ACP_INBOX_WORDS")
+            < position("agent_message_chunk", "ACP_INBOX_REPLY"),
+        "the item is shown above its reply; updates were:\n{updates:#?}"
+    );
+
+    let connection = rusqlite::Connection::open(&database).expect("open the store");
+    let sessions: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sessions WHERE id = ?1",
+            [&closed],
+            |row| row.get(0),
+        )
+        .expect("count");
+    assert_eq!(sessions, 1, "the closed session is still in the store");
+    let untouched: (u32, Option<String>, Option<String>, Option<String>) = connection
+        .query_row(
+            "SELECT attempts, not_before, appended_at, withdrawn_at FROM inbox_items WHERE id = ?1",
+            [&left],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("the closed session's item");
+    assert_eq!(untouched, (0, None, None, None));
+}
+
+/// A turn's end wakes the inbox driver: a followup that arrives while the editor's own prompt runs,
+/// which no pause of that turn reads, opens a turn as the prompt's turn ends, with no tick of the
+/// driver's in between (an hour here).
+#[test]
+fn acp_a_followup_left_by_an_editor_s_turn_opens_a_turn_as_it_ends() {
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "t1", "name": "shell_execute" },
+            { "type": "tool_use_end", "input": {
+                "command": support::wait_for_file_command("planted")
+            }},
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "ACP_EDITOR_REPLY" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "text", "text": "ACP_FOLLOWUP_REPLY" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let config = format!("{ACP_UNRESTRICTED_CONFIG}\n[schedule]\npoll_interval = \"1h\"\n");
+    let mut harness = AcpTestHarness::builder()
+        .config(&config)
+        .script(script)
+        .window(Duration::from_secs(45))
+        .build();
+    let session_id = harness.new_session();
+    let database = harness.database();
+    let id = harness.prompt(&session_id, "ACP_EDITOR_PROMPT");
+    // The turn is running once its prompt is in the store, and its command waits for the file.
+    let opened_by = Instant::now() + Duration::from_secs(40);
+    loop {
+        let connection = rusqlite::Connection::open(&database).expect("open the store");
+        let opened: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM messages WHERE session_id = ?1 \
+                 AND content LIKE '%ACP_EDITOR_PROMPT%'",
+                rusqlite::params![&session_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if opened > 0 {
+            break;
+        }
+        assert!(Instant::now() < opened_by, "the editor's turn never opened");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let item = support::plant_inbox_item(&database, &session_id, "followup", "ACP_FOLLOWUP_WORDS");
+    std::fs::write(harness.work_dir().join("planted"), "").expect("the signal");
+    let (_updates, response) = harness.collect_updates(&session_id, id);
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+
+    let delivered_by = Instant::now() + Duration::from_secs(40);
+    loop {
+        let connection = rusqlite::Connection::open(&database).expect("open the store");
+        let delivered: Option<String> = connection
+            .query_row(
+                "SELECT delivered_at FROM inbox_items WHERE id = ?1",
+                [&item],
+                |row| row.get(0),
+            )
+            .expect("the item");
+        if delivered.is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < delivered_by,
+            "no turn opened on the followup"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// An inbox turn has no `session/prompt` response to carry its outcome, so the editor is told what
+/// the driver decided: an item a failed turn leaves waiting is tried again, at a time it names, and
+/// one no retry would help is given up on, with the reason.
+#[test]
+fn acp_says_when_an_item_waits_for_another_try_and_when_it_is_given_up() {
+    let script = serde_json::json!([
+        [{ "type": "fail_exhausted", "message": "insufficient_quota", "resets_after_secs": 3600 }],
+        [{ "type": "fail", "message": "401 authentication_error" }]
+    ]);
+    let mut harness = AcpTestHarness::builder()
+        .config(&acp_inbox_config())
+        .script(script)
+        .window(Duration::from_secs(45))
+        .build();
+    let session_id = harness.new_session();
+    let mut chunks: Vec<String> = Vec::new();
+    let mut read_chunks_until = |harness: &mut AcpTestHarness, prefix: &str| {
+        let deadline = Instant::now() + Duration::from_secs(40);
+        while !chunks.iter().any(|chunk| chunk.starts_with(prefix)) {
+            assert!(
+                Instant::now() < deadline,
+                "no chunk starts with {prefix:?}; chunks were:\n{chunks:#?}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+            chunks.extend(
+                harness
+                    .drain_unsolicited_updates(&session_id)
+                    .iter()
+                    .map(|update| &update["params"]["update"])
+                    .filter(|update| update["sessionUpdate"] == "agent_message_chunk")
+                    .filter_map(|update| update["content"]["text"].as_str())
+                    .map(str::to_string),
+            );
+        }
+        chunks.clone()
+    };
+
+    let database = harness.database();
+    support::plant_inbox_item(&database, &session_id, "followup", "ACP_FIRST_WORDS");
+    let deferred = read_chunks_until(&mut harness, "[Meka] Trying the message again at ");
+    assert!(
+        deferred
+            .iter()
+            .any(|chunk| chunk.starts_with("[Meka warn] The inbox turn failed: ")),
+        "the failure is said as the inbox turn's: {deferred:#?}"
+    );
+    support::plant_inbox_item(&database, &session_id, "followup", "ACP_SECOND_WORDS");
+    let given_up = read_chunks_until(&mut harness, "[Meka warn] Gave up on a message: ");
+    assert!(
+        given_up.iter().any(
+            |chunk| chunk.starts_with("[Meka warn] Gave up on a message: ")
+                && chunk.contains("waiting would not change that")
+        ),
+        "{given_up:#?}"
     );
 }
 
@@ -7850,13 +8065,13 @@ vision = false
 ///
 /// A fire is the entry point most exposed to a parked profile: with only `session/prompt` draining
 /// one, a fire would go on billing the account the user had left.
-/// `an_acp_turn_follows_the_provider_its_row_names` covers the prompt path; this covers
-/// `run_wakeup`.
+/// `an_acp_turn_follows_the_provider_its_row_names` covers the prompt path; this covers the turn
+/// the inbox driver opens on a fire.
 ///
 /// The row is moved to a profile that is not configured, because that is the one difference a
 /// scripted provider cannot hide: the mock stands in for every profile, so a fire on the wrong one
 /// is indistinguishable from a fire on the right one *unless* the right one cannot resolve. With
-/// the fix the job defers and nothing reaches the editor; without it the turn runs on whatever the
+/// the fix the fire waits and nothing reaches the editor; without it the turn runs on whatever the
 /// agent was assembled with and the reply arrives.
 #[test]
 fn an_acp_scheduled_fire_refuses_a_profile_the_row_no_longer_names() {
@@ -8159,12 +8374,12 @@ enabled = ["read", "unrestricted"]
 /// An ACP scheduled fire carries a cancellation that was waiting, as `meka serve`'s does.
 ///
 /// The ACP half of the third door, and the half with no coverage: deleting the fold there left the
-/// suite green. The job row is seeded directly so the fire is due immediately; what is under test
-/// is what the turn's prompt carries, not the scheduler's arithmetic.
+/// suite green. The schedule row is seeded directly so the fire is due immediately; what is under
+/// test is what the turn's prompt carries, not the scheduler's arithmetic.
 #[test]
 fn an_acp_scheduled_fire_carries_a_cancellation_that_was_waiting() {
     let script = serde_json::json!([[
-        { "type": "text", "text": "ran the job" },
+        { "type": "text", "text": "ran the schedule" },
         { "type": "message_end", "stop_reason": "end_turn" }
     ]]);
     let config_toml = r#"
@@ -8201,7 +8416,7 @@ poll_interval = "200ms"
         // Due a minute ago, so the very next sweep fires it.
         connection
             .execute(
-                "INSERT INTO scheduled_jobs \
+                "INSERT INTO schedules \
                  (id, session_id, kind, spec, prompt, gate_kind, gate_spec_json, gate_last_output, \
                   gate_permission, created_at, last_fired_at, next_fire_at) \
                  VALUES (?1, ?2, 'every', '60s', 'PROBE_ACP_FIRE', NULL, NULL, NULL, NULL, ?3, \
@@ -8213,7 +8428,7 @@ poll_interval = "200ms"
                     (now - chrono::Duration::seconds(60)).to_rfc3339(),
                 ],
             )
-            .expect("seed the due job");
+            .expect("seed the due schedule");
     }
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -8230,137 +8445,115 @@ poll_interval = "200ms"
         if let Some(text) = fired {
             assert!(
                 text.contains("was canceled"),
-                "the job's prompt must carry the outcome that was waiting: {text}"
+                "the schedule's prompt must carry the outcome that was waiting: {text}"
             );
             return;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "the scheduled job never fired"
+            "the schedule never fired"
         );
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
 
-/// A job whose session is mid-turn is held over ahead of its gate while another session's job
-/// fires, as `meka serve` holds one, and fires through its gate once the turn is over: the scope
-/// the ACP scheduler sweeps declines a busy session, so one tab's long turn holds no other tab's
-/// jobs.
-#[cfg(unix)]
+/// A schedule due while a tool call holds the editor's turn is checked when it is due, and its fire
+/// is read behind the call's results, in that turn: the editor is shown it as a user chunk after
+/// the call completes and before the reply.
 #[test]
-fn an_acp_job_on_a_session_mid_turn_is_held_over_while_another_session_s_fires() {
+fn acp_a_fire_due_while_a_tool_call_holds_the_turn_is_read_behind_its_results() {
     let script = serde_json::json!([
-        // The busy session's turn, until the test cancels it.
         [
-            { "type": "text", "text": "LONG_TURN_RUNNING" },
-            { "type": "sleep", "ms": 120_000 },
-            { "type": "message_end", "stop_reason": "end_turn" }
+            { "type": "tool_use_start", "id": "call_sched", "name": "schedule_create" },
+            { "type": "tool_use_end", "input": { "prompt": "ACP_FIRE_MARKER", "at": "2s" }},
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
-        // The free session's fire, while the other turn runs.
         [
-            { "type": "text", "text": "the free session's fire" },
-            { "type": "message_end", "stop_reason": "end_turn" }
+            { "type": "tool_use_start", "id": "call_wait", "name": "shell_execute" },
+            { "type": "tool_use_end", "input": {
+                "command": support::wait_for_file_command("released")
+            }},
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
-        // The busy session's fire, once its turn is over.
         [
-            { "type": "text", "text": "the held fire" },
+            { "type": "text", "text": "ACP_REPLY_MARKER" },
             { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let config = format!("{ACP_UNRESTRICTED_CONFIG}\n[schedule]\npoll_interval = \"200ms\"\n");
-    let mut harness = AcpTestHarness::spawn(&config, Some(script));
-    let busy = harness.new_session();
-    let free = harness.new_session();
-    let gate_ran = harness.work_dir().join("gate-ran");
-    let prompt = harness.prompt(&busy, "a long turn");
-    let started = read_until(&mut harness.reader, window(20), |line| {
-        line.contains("LONG_TURN_RUNNING")
-    });
-    assert!(
-        started
-            .iter()
-            .any(|line| line.contains("LONG_TURN_RUNNING")),
-        "the long turn never started"
-    );
-
-    // Seeded once the turn runs, in one transaction, the busy session's the more overdue: a
-    // sweep takes the most overdue first, so one that fires the free session's job has been
-    // offered the busy session's ahead of it.
-    {
-        let mut connection =
-            rusqlite::Connection::open(harness.database()).expect("open the store");
-        let now = chrono::Utc::now();
-        let seeded = connection.transaction().expect("begin");
-        for (session, prompt, overdue, gated) in [
-            (&busy, "the busy session's job", 120, true),
-            (&free, "the free session's job", 60, false),
-        ] {
-            let due = (now - chrono::Duration::seconds(overdue)).to_rfc3339();
-            let gate = gated.then(|| {
-                serde_json::json!({
-                    "shell": { "command": format!("touch '{}'", gate_ran.display()) },
-                    "when": "succeeded",
-                })
-                .to_string()
-            });
-            seeded
-                .execute(
-                    "INSERT INTO scheduled_jobs \
-                     (id, session_id, kind, spec, prompt, gate_kind, gate_spec_json, \
-                      gate_last_output, gate_permission, created_at, last_fired_at, next_fire_at) \
-                     VALUES (?1, ?2, 'at', ?3, ?4, ?5, ?6, NULL, ?7, ?8, NULL, ?3)",
-                    rusqlite::params![
-                        uuid::Uuid::new_v4().to_string(),
-                        session,
-                        due,
-                        prompt,
-                        gated.then_some("shell"),
-                        gate,
-                        gated.then_some("unrestricted"),
-                        now.to_rfc3339(),
-                    ],
-                )
-                .expect("seed the due job");
-        }
-        seeded.commit().expect("commit");
-    }
-
+    let mut harness = AcpTestHarness::builder()
+        .config(&config)
+        .script(script)
+        .window(Duration::from_secs(45))
+        .build();
+    let session_id = harness.new_session();
     let database = harness.database();
-    let fired = |session: &str| -> bool {
-        rusqlite::Connection::open(&database)
-            .expect("open the store")
+    let id = harness.prompt(&session_id, "remind me, then wait");
+    // The fire is queued while the tool call holds the turn: the check does not wait for it.
+    let queued_by = Instant::now() + Duration::from_secs(30);
+    loop {
+        let connection = rusqlite::Connection::open(&database).expect("open the store");
+        let queued: i64 = connection
             .query_row(
-                "SELECT count(*) FROM turns WHERE session_id = ?1 AND source = 'schedule'",
-                rusqlite::params![session],
-                |row| row.get::<_, i64>(0),
+                "SELECT count(*) FROM inbox_items WHERE session_id = ?1 \
+                 AND schedule_id IS NOT NULL AND appended_at IS NULL",
+                rusqlite::params![&session_id],
+                |row| row.get(0),
             )
-            .expect("count the fires' turns")
-            > 0
-    };
-    let wait_for_a_fire = |session: &str| {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !fired(session) {
-            assert!(
-                Instant::now() < deadline,
-                "no scheduled turn started on session {session} within 30s"
-            );
-            std::thread::sleep(Duration::from_millis(100));
+            .unwrap_or(0);
+        if queued > 0 {
+            break;
         }
-    };
-    wait_for_a_fire(&free);
-    assert!(
-        !gate_ran.exists() && !fired(&busy),
-        "the busy session's job is held over, its gate unrun"
-    );
+        assert!(
+            Instant::now() < queued_by,
+            "the fire was not queued while the turn held its session"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::fs::write(harness.work_dir().join("released"), "").expect("release the tool call");
+    let (updates, response) = harness.collect_updates(&session_id, id);
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
 
-    harness.cancel(&busy);
-    let (_updates, response) = harness.collect_updates(&busy, prompt);
-    assert_eq!(response["result"]["stopReason"], "cancelled", "{response}");
-    wait_for_a_fire(&busy);
-    assert!(gate_ran.exists(), "the held job fired through its gate");
+    let updates: Vec<&serde_json::Value> = updates
+        .iter()
+        .map(|update| &update["params"]["update"])
+        .collect();
+    let completed = updates
+        .iter()
+        .rposition(|update| {
+            update["sessionUpdate"] == "tool_call_update" && update["status"] == "completed"
+        })
+        .unwrap_or_else(|| panic!("the tool call completes; updates were:\n{updates:#?}"));
+    let carrying = |kind: &str, needle: &str| {
+        updates
+            .iter()
+            .position(|update| {
+                update["sessionUpdate"] == kind
+                    && update["content"]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(needle))
+            })
+            .unwrap_or_else(|| panic!("no {kind} carries {needle}; updates were:\n{updates:#?}"))
+    };
+    let fire = carrying("user_message_chunk", "ACP_FIRE_MARKER");
+    let reply = carrying("agent_message_chunk", "ACP_REPLY_MARKER");
+    assert!(
+        completed < fire && fire < reply,
+        "the fire is shown after the call's results and above the reply; updates were:\n\
+         {updates:#?}"
+    );
+    let fires: i64 = rusqlite::Connection::open(&database)
+        .expect("open the store")
+        .query_row(
+            "SELECT count(*) FROM turns WHERE session_id = ?1 AND source = 'schedule'",
+            rusqlite::params![&session_id],
+            |row| row.get(0),
+        )
+        .expect("count the fires' turns");
+    assert_eq!(fires, 0, "no turn of the fire's own");
 }
 
-/// `session/cancel` stops a turn a scheduled job started, not only one the editor prompted.
+/// `session/cancel` stops a turn a schedule started, not only one the editor prompted.
 ///
 /// A scheduled turn publishes its token the same way, so the editor's stop button reaches it. That
 /// was asserted only by a comment: the whole path is driven by the poller, so no prompt response
@@ -8369,7 +8562,7 @@ fn an_acp_job_on_a_session_mid_turn_is_held_over_while_another_session_s_fires()
 #[test]
 fn an_acp_scheduled_turn_stops_when_the_editor_cancels() {
     let script = serde_json::json!([[
-        { "type": "text", "text": "job turn running" },
+        { "type": "text", "text": "schedule turn running" },
         { "type": "sleep", "ms": 5000 },
         { "type": "text", "text": "PAST_THE_CANCEL" },
         { "type": "message_end", "stop_reason": "end_turn" }
@@ -8393,7 +8586,7 @@ poll_interval = "200ms"
         // Due a minute ago, so the very next sweep fires it.
         connection
             .execute(
-                "INSERT INTO scheduled_jobs \
+                "INSERT INTO schedules \
                  (id, session_id, kind, spec, prompt, gate_kind, gate_spec_json, gate_last_output, \
                   gate_permission, created_at, last_fired_at, next_fire_at) \
                  VALUES (?1, ?2, 'every', '3600s', 'PROBE_CANCEL_FIRE', NULL, NULL, NULL, NULL, \
@@ -8405,18 +8598,20 @@ poll_interval = "200ms"
                     (now - chrono::Duration::seconds(60)).to_rfc3339(),
                 ],
             )
-            .expect("seed the due job");
+            .expect("seed the due schedule");
     }
 
-    // Cancel only once the job's turn is provably streaming, or the cancel lands between turns and
-    // the latch would carry it instead, which is a different path.
+    // Cancel only once the schedule's turn is provably streaming, or the cancel lands between turns
+    // and the latch would carry it instead, which is a different path.
     let barrier = Instant::now() + Duration::from_secs(20);
     let started = read_until(&mut harness.reader, barrier, |line| {
-        line.contains("job turn running")
+        line.contains("schedule turn running")
     });
     assert!(
-        started.iter().any(|line| line.contains("job turn running")),
-        "the scheduled job never started a turn",
+        started
+            .iter()
+            .any(|line| line.contains("schedule turn running")),
+        "the schedule never started a turn",
     );
     harness.cancel(&session_id);
 
@@ -8437,7 +8632,7 @@ poll_interval = "200ms"
     );
 }
 
-/// The configuration the two one-shot fire tests below share: a sweep every 200 ms.
+/// The configuration the one-shot fire test below runs on: a sweep every 200 ms.
 const ACP_FAST_SCHEDULE_CONFIG: &str = r#"
 [accounts.mock]
 backend = "anthropic-messages"
@@ -8450,147 +8645,73 @@ model = "claude-sonnet-4-5"
 poll_interval = "200ms"
 "#;
 
-/// A fire's turn that says it has started and then waits for longer than either test runs.
+/// A fire's turn that waits, before the provider has said anything, for longer than the test runs.
 fn a_fire_that_waits() -> serde_json::Value {
     serde_json::json!([[
-        { "type": "text", "text": "job turn running" },
         { "type": "sleep", "ms": 60000 },
         { "type": "text", "text": "PAST_THE_STOP" },
         { "type": "message_end", "stop_reason": "end_turn" }
     ]])
 }
 
-/// Seed a one-shot job on `session_id`, due a minute ago so the next sweep fires it, and wait
-/// until its turn is streaming. Returns the job's id.
-fn fire_a_one_shot_job(harness: &mut AcpTestHarness, session_id: &str) -> String {
-    let job_id = uuid::Uuid::new_v4().to_string();
+/// Seed a one-shot schedule on `session_id`, due a minute ago so the next sweep fires it, and wait
+/// until the turn opened on its fire has begun. Returns the schedule's id.
+fn fire_a_one_shot_schedule(harness: &mut AcpTestHarness, session_id: &str) -> String {
+    let schedule_id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now();
     let due = (now - chrono::Duration::seconds(60)).to_rfc3339();
-    rusqlite::Connection::open(harness.database())
+    let database = harness.database();
+    rusqlite::Connection::open(&database)
         .expect("open the store")
         .execute(
-            "INSERT INTO scheduled_jobs \
+            "INSERT INTO schedules \
              (id, session_id, kind, spec, prompt, gate_kind, gate_spec_json, gate_last_output, \
               gate_permission, created_at, last_fired_at, next_fire_at) \
              VALUES (?1, ?2, 'at', ?3, 'PROBE_ONE_SHOT', NULL, NULL, NULL, NULL, ?4, NULL, ?3)",
-            rusqlite::params![&job_id, session_id, &due, now.to_rfc3339()],
+            rusqlite::params![&schedule_id, session_id, &due, now.to_rfc3339()],
         )
-        .expect("seed the due job");
-    let started = read_until(&mut harness.reader, window(20), |line| {
-        line.contains("job turn running")
+        .expect("seed the due schedule");
+    support::wait_until("the fire's turn to begin", Duration::from_secs(20), || {
+        rusqlite::Connection::open(&database)
+            .expect("open the store")
+            .query_row(
+                "SELECT count(*) FROM turns WHERE session_id = ?1 AND source = 'schedule'",
+                rusqlite::params![session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .is_ok_and(|count| count > 0)
     });
-    assert!(
-        started.iter().any(|line| line.contains("job turn running")),
-        "the scheduled job never started a turn",
-    );
-    job_id
+    schedule_id
 }
 
-/// How many rows the store holds for job `job_id`.
-fn job_rows(harness: &AcpTestHarness, job_id: &str) -> i64 {
-    rusqlite::Connection::open(harness.database())
-        .expect("open the store")
-        .query_row(
-            "SELECT count(*) FROM scheduled_jobs WHERE id = ?1",
-            rusqlite::params![job_id],
-            |row| row.get(0),
-        )
-        .expect("count the job's rows")
-}
-
-/// A one-shot fire the host leaving cuts short is handed back rather than spent: the job is still
-/// there for the next start to fire, and its turn says the host stopped it.
-#[cfg(unix)]
+/// A fire whose turn the editor stops is withdrawn, as any item a stopped turn opened on is: a stop
+/// that ran the same fire again would not be one.
 #[test]
-fn a_one_shot_fire_cut_short_by_the_host_leaving_is_not_spent() {
+fn a_fire_whose_turn_the_editor_stops_is_withdrawn() {
     let mut harness = AcpTestHarness::spawn(ACP_FAST_SCHEDULE_CONFIG, Some(a_fire_that_waits()));
     let session_id = harness.new_session();
-    let job_id = fire_a_one_shot_job(&mut harness, &session_id);
-
-    // SAFETY: `child.id()` is a live process this test spawned and still owns.
-    unsafe {
-        libc::kill(harness.child.id() as libc::pid_t, libc::SIGTERM);
-    }
-    assert!(
-        wait_for_exit(&mut harness.child, Duration::from_secs(30)).is_some(),
-        "meka acp did not leave on SIGTERM"
-    );
-    assert_eq!(job_rows(&harness, &job_id), 1, "the occurrence was spent");
-    let reason: Option<String> = rusqlite::Connection::open(harness.database())
-        .expect("open the store")
-        .query_row(
-            "SELECT cancel_reason FROM turns WHERE session_id = ?1 AND source = 'schedule'",
-            rusqlite::params![&session_id],
-            |row| row.get(0),
-        )
-        .expect("the fire's turn row");
-    assert_eq!(reason.as_deref(), Some("server_shutdown"));
-}
-
-/// A fire the leaving host hands back stays handed back: the host that is on its way out does not
-/// claim the occurrence again and run it as a new turn nobody stopped. The signal lands once the
-/// fire has run past a poll interval, which is when the next sweep is already due.
-#[cfg(unix)]
-#[test]
-fn a_fire_handed_back_by_a_leaving_host_is_not_fired_again_before_it_exits() {
-    // The fire says so itself once it has outlasted three of the 200 ms sweeps.
-    let script = serde_json::json!([
-        [
-            { "type": "text", "text": "job turn running" },
-            { "type": "sleep", "ms": 600 },
-            { "type": "text", "text": "PAST_A_SWEEP" },
-            { "type": "sleep", "ms": 60000 },
-            { "type": "text", "text": "PAST_THE_STOP" },
-            { "type": "message_end", "stop_reason": "end_turn" }
-        ],
-        [
-            { "type": "text", "text": "fired again" },
-            { "type": "message_end", "stop_reason": "end_turn" }
-        ]
-    ]);
-    let mut harness = AcpTestHarness::spawn(ACP_FAST_SCHEDULE_CONFIG, Some(script));
-    let session_id = harness.new_session();
-    let job_id = fire_a_one_shot_job(&mut harness, &session_id);
-    let past = read_until(&mut harness.reader, window(20), |line| {
-        line.contains("PAST_A_SWEEP")
-    });
-    assert!(
-        past.iter().any(|line| line.contains("PAST_A_SWEEP")),
-        "the fire never outlasted a sweep",
-    );
-
-    // SAFETY: `child.id()` is a live process this test spawned and still owns.
-    unsafe {
-        libc::kill(harness.child.id() as libc::pid_t, libc::SIGTERM);
-    }
-    assert!(
-        wait_for_exit(&mut harness.child, Duration::from_secs(30)).is_some(),
-        "meka acp did not leave on SIGTERM"
-    );
-    assert_eq!(job_rows(&harness, &job_id), 1, "the occurrence was spent");
-    let fires: i64 = rusqlite::Connection::open(harness.database())
-        .expect("open the store")
-        .query_row(
-            "SELECT count(*) FROM turns WHERE session_id = ?1 AND source = 'schedule'",
-            rusqlite::params![&session_id],
-            |row| row.get(0),
-        )
-        .expect("count the fires' turns");
-    assert_eq!(fires, 1, "the leaving host fired the occurrence again");
-}
-
-/// A one-shot fire the editor stops is spent, since stopping it was asked for: the job is gone
-/// once its turn has ended, and it never fires again.
-#[test]
-fn a_one_shot_fire_the_editor_stops_is_spent() {
-    let mut harness = AcpTestHarness::spawn(ACP_FAST_SCHEDULE_CONFIG, Some(a_fire_that_waits()));
-    let session_id = harness.new_session();
-    let job_id = fire_a_one_shot_job(&mut harness, &session_id);
+    let schedule_id = fire_a_one_shot_schedule(&mut harness, &session_id);
 
     harness.cancel(&session_id);
-    support::wait_until("the job's row to go", Duration::from_secs(20), || {
-        job_rows(&harness, &job_id) == 0
+    let database = harness.database();
+    let withdrawn = || -> Option<String> {
+        rusqlite::Connection::open(&database)
+            .expect("open the store")
+            .query_row(
+                "SELECT failure FROM inbox_items WHERE schedule_id = ?1 \
+                 AND withdrawn_at IS NOT NULL",
+                rusqlite::params![&schedule_id],
+                |row| row.get(0),
+            )
+            .ok()
+    };
+    support::wait_until("the fire to be withdrawn", Duration::from_secs(20), || {
+        withdrawn().is_some()
     });
+    assert_eq!(
+        withdrawn().as_deref(),
+        Some("the turn opened on it was canceled")
+    );
     let reasons: Vec<Option<String>> = {
         let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
         let mut statement = connection
@@ -8607,7 +8728,64 @@ fn a_one_shot_fire_the_editor_stops_is_spent() {
     assert_eq!(
         reasons,
         [Some("client".to_string())],
-        "one fire, stopped by the editor"
+        "one fire's turn, stopped by the editor"
+    );
+}
+
+/// A fire whose turn the host leaving cuts short is not withdrawn, as one the editor stops is: it
+/// waits in the inbox for the next start to deliver, its turn says the host stopped it, and the
+/// host on its way out opens no second turn on it.
+#[cfg(unix)]
+#[test]
+fn a_fire_whose_turn_the_host_leaving_cuts_short_waits_for_the_next_start() {
+    let script = serde_json::json!([
+        [
+            { "type": "sleep", "ms": 60000 },
+            { "type": "text", "text": "PAST_THE_STOP" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "text", "text": "opened again" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let mut harness = AcpTestHarness::spawn(ACP_FAST_SCHEDULE_CONFIG, Some(script));
+    let session_id = harness.new_session();
+    let schedule_id = fire_a_one_shot_schedule(&mut harness, &session_id);
+
+    // SAFETY: `child.id()` is a live process this test spawned and still owns.
+    unsafe {
+        libc::kill(harness.child.id() as libc::pid_t, libc::SIGTERM);
+    }
+    assert!(
+        wait_for_exit(&mut harness.child, Duration::from_secs(30)).is_some(),
+        "meka acp did not leave on SIGTERM"
+    );
+    let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
+    let stamps: (bool, bool, bool) = connection
+        .query_row(
+            "SELECT appended_at IS NOT NULL, delivered_at IS NOT NULL, withdrawn_at IS NOT NULL \
+             FROM inbox_items WHERE schedule_id = ?1",
+            rusqlite::params![&schedule_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("the fire's item");
+    assert_eq!(
+        stamps,
+        (false, false, false),
+        "the fire waits: not in the conversation, not read, not withdrawn"
+    );
+    let reasons: Vec<Option<String>> = connection
+        .prepare("SELECT cancel_reason FROM turns WHERE session_id = ?1 AND source = 'schedule'")
+        .expect("prepare")
+        .query_map(rusqlite::params![&session_id], |row| row.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("read the fires' turns");
+    assert_eq!(
+        reasons,
+        [Some("server_shutdown".to_string())],
+        "one turn on the fire, stopped by the host leaving"
     );
 }
 

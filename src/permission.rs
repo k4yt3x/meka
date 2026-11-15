@@ -126,7 +126,7 @@ impl Permission {
     }
 
     /// Whether this level may author a shell command that runs **unattended and unconfined**: a
-    /// scheduled job's gate, which outlives the turn that created it and fires on a timer with
+    /// schedule's gate, which outlives the turn that created it and fires on a timer with
     /// nobody watching.
     ///
     /// `Unrestricted` alone. A scheduled gate is spawned by `run_shell_probe` as a bare `sh -c`
@@ -150,14 +150,15 @@ impl Permission {
     /// Whether waking the agent unattended at this level could accomplish anything.
     ///
     /// Only `none` fails, and it fails completely: nothing is executable there, so a scheduled turn
-    /// reads nothing, acts on nothing, and cannot even cancel the job that woke it. Registration is
-    /// permission-independent, so the model does see the job in `[Scheduled]` and is offered
-    /// `schedule_cancel`; the refusal happens at dispatch, which leaves it able to describe its
-    /// predicament and unable to do anything about it. An `every = "5s"` job on such a session is
-    /// a turn's worth of tokens every five seconds, forever, stoppable only by an operator.
+    /// reads nothing, acts on nothing, and cannot even cancel the schedule that woke it.
+    /// Registration is permission-independent, so the model does see the schedule in `[Scheduled]`
+    /// and is offered `schedule_cancel`; the refusal happens at dispatch, which leaves it able to
+    /// describe its predicament and unable to do anything about it. An `every = "5s"` schedule on
+    /// such a session is a turn's worth of tokens every five seconds, forever, stoppable only by an
+    /// operator.
     ///
     /// Distinct from [`Self::allows_unattended_shell`], which asks what a *gate* may run. This asks
-    /// whether the job is worth running at all, so it applies to ungated jobs too.
+    /// whether the schedule is worth running at all, so it applies to ungated schedules too.
     pub(crate) fn allows_unattended_work(self) -> bool {
         !matches!(self, Permission::None)
     }
@@ -221,10 +222,10 @@ impl From<Permission> for String {
 /// "this session recorded a level Meka cannot read" and resumes at the process default either way,
 /// silently.
 ///
-/// Repeats. The scheduler reads a job's session level every time that job comes due, so a row it
-/// cannot read behind an `every = "1m"` watcher warns once a minute until the row is fixed. That is
-/// deliberate rather than overlooked: the condition silently changes what a session runs at, and
-/// the message names the session so it can be corrected.
+/// Repeats. The scheduler reads a schedule's session level every time that schedule comes due, so a
+/// row it cannot read behind an `every = "1m"` watcher warns once a minute until the row is fixed.
+/// That is deliberate rather than overlooked: the condition silently changes what a session runs
+/// at, and the message names the session so it can be corrected.
 pub(crate) fn parse_recorded_permission(
     recorded: Option<&str>,
     subject: &dyn fmt::Display,

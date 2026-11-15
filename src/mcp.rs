@@ -1923,8 +1923,8 @@ impl McpClientManager {
     /// Find a registered MCP tool by the name the model uses (`mcp__server__tool`).
     ///
     /// Reads [`Self::tools_snapshot`], which `update_server_tools` keeps current, so this is a map
-    /// lookup rather than a round trip. That matters because the caller is a scheduled job's gate,
-    /// asked once per poll interval per job: resolving through
+    /// lookup rather than a round trip. That matters because the caller is a schedule's gate,
+    /// asked once per poll interval per schedule: resolving through
     /// [`Self::list_advertised_tools`] would put a `tools/list` on the wire every tick.
     ///
     /// `None` covers both "no such tool" and "its server is not connected", which are the same

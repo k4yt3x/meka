@@ -15,7 +15,6 @@ pub(crate) mod gc;
 pub(crate) mod handlers;
 pub(crate) mod http_frontend;
 pub(crate) mod idempotency;
-pub(crate) mod inbox;
 pub(crate) mod openapi;
 pub(crate) mod reattach;
 pub(crate) mod schedule;
@@ -133,7 +132,7 @@ pub(crate) async fn run_serve(
     );
     let scheduler_handle = schedule::spawn(state.clone());
     let background_handle = schedule::spawn_background_poller(state.clone());
-    let inbox_handle = inbox::spawn_inbox_driver(state.clone());
+    let inbox_handle = schedule::spawn_inbox_driver(state.clone());
     let announcer_handle = tokio::spawn(handlers::sessions::announce_subagent_runs(state.clone()));
     let pruner_handle = idempotency_cache.spawn_pruner();
 
@@ -312,13 +311,19 @@ fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -
             "/v1/sessions/{id}/turns/{turn_id}",
             get(handlers::conversation::turn),
         )
-        .route("/v1/tasks", get(handlers::jobs::list_all_tasks))
-        .route("/v1/tasks/{task_id}", delete(handlers::jobs::cancel_task))
+        .route("/v1/tasks", get(handlers::schedules::list_all_tasks))
         .route(
-            "/v1/jobs",
-            get(handlers::jobs::list_all).post(handlers::jobs::create),
+            "/v1/tasks/{task_id}",
+            delete(handlers::schedules::cancel_task),
         )
-        .route("/v1/jobs/{job_id}", delete(handlers::jobs::cancel))
+        .route(
+            "/v1/schedules",
+            get(handlers::schedules::list_all).post(handlers::schedules::create),
+        )
+        .route(
+            "/v1/schedules/{schedule_id}",
+            delete(handlers::schedules::cancel),
+        )
         .route("/v1/sessions/{id}/tools", get(handlers::stores::list_tools))
         .route("/v1/info", get(handlers::info::info))
         .route("/v1/skills", get(handlers::info::skills))

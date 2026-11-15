@@ -1,12 +1,12 @@
-//! Scheduled jobs and background tasks: the two kinds of work that outlive the request that
+//! Schedules and background tasks: the two kinds of work that outlive the request that
 //! started them.
 //!
-//! `meka serve` is the durable host for both. It runs the scheduler over *every* job in the
+//! `meka serve` is the durable host for both. It runs the scheduler over *every* schedule in the
 //! database rather than only those belonging to an open conversation, because it can revive any
 //! session on demand (`crate::host::http::schedule`), and it polls background-task outcomes on its
 //! own timer.
 //!
-//! Scheduled jobs are keyed by `schedule:r` / `schedule:w` rather than `sessions:*`: a job survives
+//! Schedules are keyed by `schedule:r` / `schedule:w` rather than `sessions:*`: a schedule survives
 //! the conversation that created it and fires unattended, so the ability to plant one is a
 //! materially different grant from the ability to run a turn. Background tasks stay on `sessions:*`
 //! because they live and die inside one session's runtime.
@@ -29,20 +29,20 @@ use crate::{
         state::ServerState,
     },
     permission::Permission,
-    schedule::{Gate, GatePredicate, GateProbe, Schedule, ScheduledJob},
+    schedule::{Gate, GatePredicate, GateProbe, Schedule, Timing},
     store::background::TaskStatus,
-    view::{BackgroundTaskView, ScheduledJobView},
+    view::{BackgroundTaskView, ScheduleView},
 };
 
 #[derive(Debug, Serialize, ToSchema)]
-pub(crate) struct ScheduledJobsResponse {
-    pub(crate) jobs: Vec<ScheduledJobView>,
+pub(crate) struct SchedulesResponse {
+    pub(crate) schedules: Vec<ScheduleView>,
 }
 
-/// `GET /v1/jobs`: every scheduled job in the database, across all sessions.
+/// `GET /v1/schedules`: every schedule in the database, across all sessions.
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
-pub(crate) struct ListJobsQuery {
-    /// Only the jobs planted on this session. A session with none, or an id no session has,
+pub(crate) struct ListSchedulesQuery {
+    /// Only the schedules planted on this session. A session with none, or an id no session has,
     /// answers an empty list, as every listing filter does.
     #[serde(default)]
     pub(crate) session: Option<Uuid>,
@@ -50,11 +50,11 @@ pub(crate) struct ListJobsQuery {
 
 #[utoipa::path(
     get,
-    path = "/v1/jobs",
+    path = "/v1/schedules",
     tag = "schedule",
-    params(ListJobsQuery),
+    params(ListSchedulesQuery),
     responses(
-        (status = 200, description = "Scheduled jobs: every session's, or one session's with `session`", body = ScheduledJobsResponse),
+        (status = 200, description = "Schedules: every session's, or one session's with `session`", body = SchedulesResponse),
         (status = 400, description = "`session` is not a UUID (`/errors/invalid-body`)", body = ProblemDetail),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
@@ -65,26 +65,26 @@ pub(crate) struct ListJobsQuery {
 pub(crate) async fn list_all(
     State(state): State<ServerState>,
     scope::Scoped { principal, .. }: scope::Scoped<scope::ScheduleRead>,
-    Query(query): Query<ListJobsQuery>,
-) -> Result<Json<ScheduledJobsResponse>, ProblemDetail> {
+    Query(query): Query<ListSchedulesQuery>,
+) -> Result<Json<SchedulesResponse>, ProblemDetail> {
     let reveal_command = principal.has_scope("sessions:r");
     let schedule = state.shared.store.schedule_store();
-    let jobs = match query.session {
-        Some(id) => schedule.list_scheduled_jobs(id).await,
-        None => schedule.list_all_scheduled_jobs().await,
+    let schedules = match query.session {
+        Some(id) => schedule.list_schedules(id).await,
+        None => schedule.list_all_schedules().await,
     }
-    .map_err(|error| ProblemDetail::internal_sanitized("failed to list scheduled jobs", error))?;
-    Ok(Json(ScheduledJobsResponse {
-        jobs: render_batch(&state, jobs, reveal_command).await,
+    .map_err(|error| ProblemDetail::internal_sanitized("failed to list schedules", error))?;
+    Ok(Json(SchedulesResponse {
+        schedules: render_batch(&state, schedules, reveal_command).await,
     }))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct CreateJobRequest {
-    /// The session the job fires in.
+pub(crate) struct CreateScheduleRequest {
+    /// The session the schedule fires in.
     pub(crate) session_id: Uuid,
-    /// What the agent is asked to do when the job fires.
+    /// What the agent is asked to do when the schedule fires.
     pub(crate) prompt: String,
     /// One-shot time: an RFC 3339 instant, or a duration from now (`"20m"`, `"1h 30m"`).
     #[serde(default)]
@@ -99,7 +99,7 @@ pub(crate) struct CreateJobRequest {
     /// `at` or `every`, which read none.
     #[serde(default)]
     pub(crate) timezone: Option<String>,
-    /// Guard the job on a probe: a shell command, or a call to a read-only tool.
+    /// Guard the schedule on a probe: a shell command, or a call to a read-only tool.
     ///
     /// The level required depends on which. A shell command runs unattended and with no sandbox,
     /// so it needs `unrestricted` and no level that promises a boundary can honestly authorize it.
@@ -125,19 +125,19 @@ pub(crate) struct CreateGate {
     pub(crate) when: Option<serde_json::Value>,
 }
 
-/// `POST /v1/jobs`: plant a job on a session.
+/// `POST /v1/schedules`: plant a schedule on a session.
 #[utoipa::path(
     post,
-    path = "/v1/jobs",
+    path = "/v1/schedules",
     tag = "schedule",
-    request_body = CreateJobRequest,
+    request_body = CreateScheduleRequest,
     responses(
-        (status = 201, description = "Job created", body = ScheduledJobView),
+        (status = 201, description = "Schedule created", body = ScheduleView),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope, or a session that cannot do unattended work", body = ProblemDetail),
-        (status = 404, description = "Session not found, or scheduling is disabled on this server (`[schedule] enabled = false`), so there is nowhere for a job to go", body = ProblemDetail),
+        (status = 404, description = "Session not found, or scheduling is disabled on this server (`[schedule] enabled = false`), so there is nowhere for a schedule to go", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
-        (status = 422, description = "Invalid schedule, or the session's job limit is reached, or the id names a sub-agent's conversation, which nothing outside its parent can fire a job on (`/errors/session-not-drivable`)", body = ProblemDetail),
+        (status = 422, description = "Invalid timing, or the session's schedule limit is reached, or the id names a sub-agent's conversation, which nothing outside its parent can fire a schedule on (`/errors/session-not-drivable`)", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["schedule:w"]))
@@ -146,16 +146,16 @@ pub(crate) async fn create(
     State(state): State<ServerState>,
     scope::Scoped { principal, .. }: scope::Scoped<scope::ScheduleWrite>,
     raw_body: Bytes,
-) -> Result<(StatusCode, Json<ScheduledJobView>), ProblemDetail> {
+) -> Result<(StatusCode, Json<ScheduleView>), ProblemDetail> {
     // Refused rather than accepted-and-ignored. With `[schedule] enabled = false` the scheduler
     // task is a no-op and the `schedule_*` tools are not registered at all, so this endpoint is the
-    // only way a job can still be created -- and it would be created into a server that will never
-    // run it, persisted, and listed forever with a `next_fire_at` receding into the past. Listing
-    // and canceling stay open, because clearing out jobs left over from before the flag was
-    // flipped is exactly what an operator wants then.
+    // only way a schedule can still be created -- and it would be created into a server that will
+    // never run it, persisted, and listed forever with a `next_fire_at` receding into the past.
+    // Listing and canceling stay open, because clearing out schedules left over from before the
+    // flag was flipped is exactly what an operator wants then.
     //
     // `not-found`, as the disabled skill and memory stores answer: nothing is wrong with the
-    // request, there is nowhere for the job to go, and a client reading `invalid-body` would
+    // request, there is nowhere for the schedule to go, and a client reading `invalid-body` would
     // rewrite its payload forever.
     if !state.shared.config.schedule.enabled {
         return Err(ProblemDetail::new(
@@ -165,7 +165,7 @@ pub(crate) async fn create(
         ));
     }
 
-    let body: CreateJobRequest = serde_json::from_slice(&raw_body)
+    let body: CreateScheduleRequest = serde_json::from_slice(&raw_body)
         .map_err(|error| ProblemDetail::invalid_body("schedule", error))?;
     let id = body.session_id;
     if body.prompt.trim().is_empty() {
@@ -181,11 +181,11 @@ pub(crate) async fn create(
     // just denied on `GET /context`.
     //
     // Two reads, not one: this answers whether the session exists and what level a gate would be
-    // authorized against, and `spawn_terms` below answers whether a job may belong to it at all.
-    // `SessionSummary` carries `parent_id` but not `subagent_spec_json`, and the parent link alone
-    // is the wrong question -- an imported sub-agent has spawn terms and no parent. Widening the
-    // summary to fold these back into one read would put the column on every listing that returns
-    // one, for a check two handlers make.
+    // authorized against, and `spawn_terms` below answers whether a schedule may belong to it at
+    // all. `SessionSummary` carries `parent_id` but not `subagent_spec_json`, and the parent link
+    // alone is the wrong question -- an imported sub-agent has spawn terms and no parent. Widening
+    // the summary to fold these back into one read would put the column on every listing that
+    // returns one, for a check two handlers make.
     let summary = state
         .shared
         .store
@@ -207,7 +207,7 @@ pub(crate) async fn create(
     let resident = state.sessions.read().await.get(&id).cloned();
 
     let now = Utc::now();
-    let schedule = parse_schedule(&body, now)?;
+    let timing = parse_timing(&body, now)?;
 
     // The session's level, for both checks below rather than only the gate's.
     //
@@ -217,14 +217,14 @@ pub(crate) async fn create(
         None => permission_from_summary(&state, id, Some(&summary)),
     };
 
-    // Refused for an *ungated* job too, which is the case a gate-shaped check misses.
+    // Refused for an *ungated* schedule too, which is the case a gate-shaped check misses.
     //
-    // The fire door declines every job on a session at `none`, so accepting one here creates a row
-    // that can never run. This endpoint is the only door that could: `schedule_create` requires
+    // The fire door declines every schedule on a session at `none`, so accepting one here creates a
+    // row that can never run. This endpoint is the only door that could: `schedule_create` requires
     // `read` to dispatch at all, so the agent cannot reach it, and a token's scopes say nothing
     // about the session's level. A client that means to raise the session later can do so and then
-    // create the job; one that does not now finds out at the point it can act on it, rather than by
-    // noticing months later that nothing ever fired.
+    // create the schedule; one that does not now finds out at the point it can act on it, rather
+    // than by noticing months later that nothing ever fired.
     if !permission.allows_unattended_work() {
         return Err(ProblemDetail::new(
             ErrorKind::SessionPermission,
@@ -242,14 +242,14 @@ pub(crate) async fn create(
         Some(requested) => {
             // `sessions:w` on top of `schedule:w`, because a gate is not really a scheduling
             // feature: the command runs on a timer, before the turn, as the server's user, and it
-            // runs whether or not the turn works at all -- so a job whose gate is the payload
+            // runs whether or not the turn works at all -- so a schedule whose gate is the payload
             // needs no provider, no credit and no model. `schedule:w` alone is meant to say "may
-            // plant work on a session", and `GET /v1/jobs` already hands out every session id
+            // plant work on a session", and `GET /v1/schedules` already hands out every session id
             // in the database, so without this an operator who scoped a calendar bridge to
             // `schedule:*` and nothing else has in fact granted it unattended arbitrary shell.
             //
             // Requiring `sessions:w` puts gates in the tier that can already drive the agent, and
-            // leaves the ordinary prompt-only job reachable by a schedule-only token.
+            // leaves the ordinary prompt-only schedule reachable by a schedule-only token.
             scope::require(&principal, "sessions:w").map_err(|_| {
                 ProblemDetail::new(
                     ErrorKind::AuthScope,
@@ -271,7 +271,7 @@ pub(crate) async fn create(
                 GatePredicate::parse_request(requested.when.as_ref()).map_err(invalid)?;
 
             // Authority is re-checked at fire time as well; this is the early, specific refusal so
-            // a client learns at `POST` rather than from a job that silently never fires.
+            // a client learns at `POST` rather than from a schedule that silently never fires.
             if let Err(refusal) = crate::schedule::gate_probe_is_authorized(
                 &probe,
                 permission,
@@ -334,18 +334,18 @@ pub(crate) async fn create(
         }
     };
 
-    let next_fire_at = schedule.next_after(now).ok_or_else(|| {
+    let next_fire_at = timing.next_after(now).ok_or_else(|| {
         ProblemDetail::new(
             ErrorKind::InvalidBody,
             StatusCode::UNPROCESSABLE_ENTITY,
-            "that schedule has no next occurrence; a one-shot time must be in the future",
+            "that time has no next occurrence; a one-shot time must be in the future",
         )
     })?;
 
-    let job = ScheduledJob {
+    let schedule = Schedule {
         id: Uuid::new_v4().to_string(),
         session_id: id,
-        schedule,
+        timing,
         prompt: body.prompt,
         gate,
         created_at: now,
@@ -359,18 +359,18 @@ pub(crate) async fn create(
         .shared
         .store
         .schedule_store()
-        .create_scheduled_job(&job, state.shared.config.schedule.max_jobs)
+        .create_schedule(&schedule, state.shared.config.schedule.max_schedules)
         .await
         .map_err(|error| {
-            ProblemDetail::internal_sanitized("failed to create scheduled job", error)
+            ProblemDetail::internal_sanitized("failed to create schedule", error)
                 .with("session_id", id.to_string())
         })?;
-    if let crate::store::schedule::JobCreation::AtCapacity { existing } = created {
+    if let crate::store::schedule::ScheduleCreation::AtCapacity { existing } = created {
         return Err(ProblemDetail::new(
             ErrorKind::InvalidBody,
             StatusCode::UNPROCESSABLE_ENTITY,
             format!(
-                "session already has {existing} scheduled jobs, the configured limit; cancel one \
+                "session already has {existing} schedules, the configured limit; cancel one \
                  first"
             ),
         )
@@ -378,35 +378,35 @@ pub(crate) async fn create(
     }
 
     tracing::info!(
-        "created scheduled job {job_id} on session {id} via HTTP, next fire {next_fire}",
-        job_id = job.id,
-        next_fire = job.next_fire_at.to_rfc3339()
+        "created schedule {schedule_id} on session {id} via HTTP, next fire {next_fire}",
+        schedule_id = schedule.id,
+        next_fire = schedule.next_fire_at.to_rfc3339()
     );
     // The caller just supplied this command, so echoing it back discloses nothing new. `withheld`
     // is `None` by construction: both refusals above have already run against this same level, so a
-    // job that reached here can fire.
+    // schedule that reached here can fire.
     Ok((
         StatusCode::CREATED,
-        Json(ScheduledJobView::new(&job, true, None)),
+        Json(ScheduleView::new(&schedule, true, None)),
     ))
 }
 
-/// Render a batch of jobs, each paired with why it cannot fire.
+/// Render a batch of schedules, each paired with why it cannot fire.
 ///
-/// One permission lookup per distinct *session* rather than per job: a listing of fifty jobs on one
-/// session is the ordinary case, and the level is a property of the session. The resident copy wins
-/// where there is one, matching the creation door two functions up.
+/// One permission lookup per distinct *session* rather than per schedule: a listing of fifty
+/// schedules on one session is the ordinary case, and the level is a property of the session. The
+/// resident copy wins where there is one, matching the creation door two functions up.
 ///
-/// A session whose level cannot be read does not silence the answer. `job_withheld` asks the
-/// questions that need no level -- parking, above all -- before it asks for one, so a job that is
-/// provably dead is still reported as such. Passing the level as an `Option` is what lets that
-/// happen; resolving it to a default first, or skipping the call, reports a parked job as healthy
-/// on the one surface a client would ask.
+/// A session whose level cannot be read does not silence the answer. `schedule_withheld` asks the
+/// questions that need no level -- parking, above all -- before it asks for one, so a schedule that
+/// is provably dead is still reported as such. Passing the level as an `Option` is what lets that
+/// happen; resolving it to a default first, or skipping the call, reports a parked schedule as
+/// healthy on the one surface a client would ask.
 async fn render_batch(
     state: &ServerState,
-    jobs: Vec<ScheduledJob>,
+    schedules: Vec<Schedule>,
     reveal_command: bool,
-) -> Vec<ScheduledJobView> {
+) -> Vec<ScheduleView> {
     // Snapshotted rather than held: the loop below awaits a database read, and keeping the sessions
     // lock across that would put a listing in the way of every attach and detach.
     let resident: std::collections::HashMap<Uuid, Permission> = {
@@ -419,32 +419,32 @@ async fn render_batch(
     let tools = state.shared.gate_tools.as_deref();
     let mut levels: std::collections::HashMap<Uuid, Option<Permission>> =
         std::collections::HashMap::new();
-    let mut out = Vec::with_capacity(jobs.len());
-    for job in jobs {
-        let level = match levels.get(&job.session_id) {
+    let mut out = Vec::with_capacity(schedules.len());
+    for schedule in schedules {
+        let level = match levels.get(&schedule.session_id) {
             Some(level) => *level,
             None => {
-                let level = match resident.get(&job.session_id) {
+                let level = match resident.get(&schedule.session_id) {
                     Some(level) => Some(*level),
-                    None => session_permission_from_row(state, job.session_id)
+                    None => session_permission_from_row(state, schedule.session_id)
                         .await
                         .ok(),
                 };
-                levels.insert(job.session_id, level);
+                levels.insert(schedule.session_id, level);
                 level
             }
         };
-        let withheld = match crate::schedule::job_withheld(
+        let withheld = match crate::schedule::schedule_withheld(
             state.shared.store.scheduler_memory(),
-            &job,
+            &schedule,
             level,
             tools,
         ) {
             crate::schedule::Withheld::Yes(reason) => Some(reason),
             crate::schedule::Withheld::No | crate::schedule::Withheld::Undetermined => None,
         };
-        out.push(ScheduledJobView::new(
-            &job,
+        out.push(ScheduleView::new(
+            &schedule,
             reveal_command,
             withheld_for_scope(withheld, reveal_command),
         ));
@@ -466,23 +466,25 @@ async fn render_batch(
 fn withheld_for_scope(reason: Option<String>, reveal_command: bool) -> Option<String> {
     match reveal_command {
         true => reason,
-        false => reason
-            .map(|_| "this job cannot currently fire; the reason needs `sessions:r`".to_string()),
+        false => reason.map(|_| {
+            "this schedule cannot currently fire; the reason needs `sessions:r`".to_string()
+        }),
     }
 }
 
-/// Refuse a job on a session that is somebody's sub-agent, returning the problem when it is one.
+/// Refuse a schedule on a session that is somebody's sub-agent, returning the problem when it is
+/// one.
 ///
-/// A job belongs to a root session, and this endpoint is the only door that could plant one
+/// A schedule belongs to a root session, and this endpoint is the only door that could plant one
 /// elsewhere: a sub-agent has no `schedule_*` tools by construction
 /// ([`crate::tools::ToolRegistry::build_for_subagent`] passes no schedule config).
 ///
 /// **The authority escalation is closed a level down**, by
 /// [`crate::host::refuse_a_spawned_session`]: both agent builders refuse a session that records a
-/// parent, so a job keyed to a sub-agent cannot wake it unrestricted because nothing can wake it at
-/// all. What this refusal is worth is therefore narrow: a job on a sub-agent is refused *when it
-/// is created*, naming the session to use instead, rather than being accepted and then failing on
-/// every fire until someone reads a log. A diagnosis, not a boundary.
+/// parent, so a schedule keyed to a sub-agent cannot wake it unrestricted because nothing can wake
+/// it at all. What this refusal is worth is therefore narrow: a schedule on a sub-agent is refused
+/// *when it is created*, naming the session to use instead, rather than being accepted and then
+/// failing on every fire until someone reads a log. A diagnosis, not a boundary.
 ///
 /// `SessionNotDrivable` rather than `AuthScope` or `SessionPermission`: no token and no permission
 /// level changes the answer, so routing it at either would send a client off to re-provision a
@@ -491,8 +493,8 @@ fn withheld_for_scope(reason: Option<String>, reveal_command: bool) -> Option<St
 /// same `type`. [`create`] routes its gate refusals by the same rule.
 ///
 /// Takes [`crate::store::SpawnTerms`] rather than a parent, so it asks the question
-/// [`crate::host::refuse_a_spawned_session`] asks; keyed on the parent alone it admits a job on an
-/// imported sub-agent, which then fails on every fire at the poll cadence.
+/// [`crate::host::refuse_a_spawned_session`] asks; keyed on the parent alone it admits a schedule
+/// on an imported sub-agent, which then fails on every fire at the poll cadence.
 fn refuse_subagent_session(
     id: Uuid,
     spawned: Option<crate::store::SpawnTerms>,
@@ -500,9 +502,9 @@ fn refuse_subagent_session(
     let terms = spawned?;
     let remedy = match terms.parent {
         Some(parent) => {
-            format!(", which runs it only while waiting on it; schedule the job on '{parent}'")
+            format!(", which runs it only while waiting on it; create the schedule on '{parent}'")
         }
-        None => ", so nothing here can fire a job on it".to_string(),
+        None => ", so nothing here can fire a schedule on it".to_string(),
     };
     let detail = format!("{}{remedy}", terms.describe(id));
     Some(
@@ -543,12 +545,12 @@ async fn session_permission_from_row(
     Ok(permission_from_summary(state, id, summary.as_ref()))
 }
 
-/// The schedule the body names, read by the one rule every door that creates a job uses.
-fn parse_schedule(
-    body: &CreateJobRequest,
+/// The timing the body names, read by the one rule every door that creates a schedule uses.
+fn parse_timing(
+    body: &CreateScheduleRequest,
     now: chrono::DateTime<Utc>,
-) -> Result<Schedule, ProblemDetail> {
-    Schedule::parse_request(
+) -> Result<Timing, ProblemDetail> {
+    Timing::parse_request(
         body.at.as_deref(),
         body.every.as_deref(),
         body.cron.as_deref(),
@@ -564,23 +566,23 @@ fn parse_schedule(
     })
 }
 
-/// `DELETE /v1/jobs/{job_id}`: cancel a job.
+/// `DELETE /v1/schedules/{schedule_id}`: cancel a schedule.
 ///
-/// Keyed on the job id alone, as the collection names every job.
+/// Keyed on the schedule id alone, as the collection names every schedule.
 ///
 /// Takes the full id and 404s when nothing matches: a client holds the id whole from the listing,
-/// and answering 204 to an id that matched nothing would report a still-firing job as canceled. A
-/// gated job kept alive that way goes on running a shell command unattended.
+/// and answering 204 to an id that matched nothing would report a still-firing schedule as
+/// canceled. A gated schedule kept alive that way goes on running a shell command unattended.
 #[utoipa::path(
     delete,
-    path = "/v1/jobs/{job_id}",
+    path = "/v1/schedules/{schedule_id}",
     tag = "schedule",
-    params(("job_id" = String, Path, description = "Scheduled job id")),
+    params(("schedule_id" = String, Path, description = "Schedule id")),
     responses(
-        (status = 204, description = "Job canceled"),
+        (status = 204, description = "Schedule canceled"),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
-        (status = 404, description = "No job has that id", body = ProblemDetail),
+        (status = 404, description = "No schedule has that id", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["schedule:w"]))
@@ -588,30 +590,43 @@ fn parse_schedule(
 pub(crate) async fn cancel(
     State(state): State<ServerState>,
     _scoped: scope::Scoped<scope::ScheduleWrite>,
-    Path(job_id): Path<String>,
+    Path(schedule_id): Path<String>,
 ) -> Result<StatusCode, ProblemDetail> {
     let removed = state
         .shared
         .store
         .schedule_store()
-        .delete_scheduled_job(&job_id)
+        .delete_schedule(&schedule_id)
         .await
         .map_err(|error| {
-            ProblemDetail::internal_sanitized("failed to cancel scheduled job", error)
-                .with("job_id", job_id.clone())
+            ProblemDetail::internal_sanitized("failed to cancel schedule", error)
+                .with("schedule_id", schedule_id.clone())
         })?;
-    // `204` means this request canceled the job, which is what a client polls this endpoint to
-    // establish. A job a scheduler sweep retired a moment earlier is a `404`, the same answer the
-    // request would have got then, and true.
-    if !removed {
+    // `204` means this request canceled the schedule, which is what a client polls this endpoint to
+    // establish. A schedule a scheduler sweep retired a moment earlier is a `404`, the same answer
+    // the request would have got then, and true.
+    let Some(canceled) = removed else {
         return Err(ProblemDetail::new(
             ErrorKind::NotFound,
             StatusCode::NOT_FOUND,
-            format!("no scheduled job has id '{job_id}'"),
+            format!("no schedule has id '{schedule_id}'"),
         )
-        .with("job_id", job_id));
+        .with("schedule_id", schedule_id));
+    };
+    // `schedule.fired` named the waiting fire to whoever follows the session, so its withdrawal
+    // is said there too, as an item's own `DELETE` says it.
+    if !canceled.withdrawn.is_empty()
+        && let Some(session_id) = canceled.session_id
+        && let Some(entry) = state.sessions.read().await.get(&session_id).cloned()
+    {
+        for item_id in &canceled.withdrawn {
+            entry.frontend.push_sse(
+                crate::host::http::sse::SseEventType::InboxWithdrawn,
+                serde_json::json!({ "item_id": item_id.to_string() }),
+            );
+        }
     }
-    tracing::info!("canceled scheduled job {job_id} via HTTP");
+    tracing::info!("canceled schedule {schedule_id} via HTTP");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -774,18 +789,18 @@ pub(crate) async fn cancel_task(
 mod tests {
     use super::*;
 
-    /// A job may be planted on a root session and on nothing else.
+    /// A schedule may be planted on a root session and on nothing else.
     ///
     /// The refusal is a diagnosis rather than a boundary: `crate::host::refuse_a_spawned_session`
     /// is what stops a sub-agent being driven unrestricted, in the builders every door shares.
     /// This keeps the failure at creation time, where it can name the session to schedule on
-    /// instead, rather than letting a job be accepted and fail on every fire.
+    /// instead, rather than letting a schedule be accepted and fail on every fire.
     ///
     /// All three arms are asserted. A guard that refused everything would pass a refusal-only test
-    /// while breaking every ordinary job, and one that read only the parent admits an imported
+    /// while breaking every ordinary schedule, and one that read only the parent admits an imported
     /// sub-agent.
     #[test]
-    fn a_job_is_refused_on_a_sub_agent_session_and_admitted_on_a_top_level_one() {
+    fn a_schedule_is_refused_on_a_sub_agent_session_and_admitted_on_a_top_level_one() {
         let sub_agent = Uuid::new_v4();
         let parent = Uuid::new_v4();
 
@@ -800,7 +815,7 @@ mod tests {
                 parent: Some(parent),
             }),
         )
-        .expect("a session with a parent cannot own a job");
+        .expect("a session with a parent cannot own a schedule");
         assert_eq!(refusal.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(refusal.type_uri, ErrorKind::SessionNotDrivable.type_uri());
         // Both ids, because the remedy is to re-issue the request against the parent and a client
@@ -817,19 +832,20 @@ mod tests {
         assert_eq!(orphaned.type_uri, ErrorKind::SessionNotDrivable.type_uri());
         let detail = orphaned.detail.as_deref().unwrap_or_default();
         assert!(
-            detail.contains(&sub_agent.to_string()) && !detail.contains("schedule the job on"),
+            detail.contains(&sub_agent.to_string()) && !detail.contains("create the schedule on"),
             "with no parent in the store there is no session to redirect to: {detail}"
         );
     }
 
-    /// Nothing about *why* a job is held escapes to a token that may not see what the gate runs.
+    /// Nothing about *why* a schedule is held escapes to a token that may not see what the gate
+    /// runs.
     ///
     /// Every refusal sentence carries something the scope withholds elsewhere: a tool name, a
     /// session's permission level, or a line of the check's own output. Asserting on the exact
     /// wording would be brittle, so this asserts the property -- none of the reason survives --
     /// against the three shapes the reasons actually take.
     #[test]
-    fn a_low_scope_reader_learns_that_a_job_is_held_and_nothing_else() {
+    fn a_low_scope_reader_learns_that_a_schedule_is_held_and_nothing_else() {
         let reasons = [
             "no gate tool named 'mcp__internal_bridge__unseen'. A gate can call a read-only tool",
             "a gate command runs unattended with no sandbox, so it needs `unrestricted` \
@@ -860,7 +876,7 @@ mod tests {
         assert_eq!(
             withheld_for_scope(None, false),
             None,
-            "a job that can fire is not reported as held to anyone"
+            "a schedule that can fire is not reported as held to anyone"
         );
     }
 }

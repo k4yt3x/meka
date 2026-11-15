@@ -123,6 +123,37 @@ impl Default for Install {
     }
 }
 
+/// Write a pending inbox item of `class` for `session_id` straight into the store at `database`, as
+/// a process that holds the session writes one, and answer its id.
+pub(crate) fn plant_inbox_item(
+    database: &Path,
+    session_id: &str,
+    class: &str,
+    body: &str,
+) -> String {
+    let id = uuid::Uuid::new_v4().to_string();
+    rusqlite::Connection::open(database)
+        .expect("open the store")
+        .execute(
+            "INSERT INTO inbox_items (id, session_id, class, source, body, created_at) \
+             VALUES (?1, ?2, ?3, 'test', ?4, ?5)",
+            rusqlite::params![id, session_id, class, body, chrono::Utc::now().to_rfc3339()],
+        )
+        .expect("plant an inbox item");
+    id
+}
+
+/// A `shell_execute` command that returns once `file` exists in the command's working directory,
+/// spelled for the shell the tool runs on each platform: `powershell.exe -Command` on Windows, a
+/// POSIX shell elsewhere. How a test holds a turn in a tool call until it has acted.
+pub(crate) fn wait_for_file_command(file: &str) -> String {
+    if cfg!(windows) {
+        format!("while (-not (Test-Path -LiteralPath '{file}')) {{ Start-Sleep -Milliseconds 50 }}")
+    } else {
+        format!("while [ ! -e '{file}' ]; do sleep 0.05; done")
+    }
+}
+
 /// Wait until `check` holds, or give up. Polling rather than sleeping a fixed span: these tests
 /// wait on another process reaching a state, and the only constant that is reliably long enough on
 /// a loaded machine is one that makes the suite slow for everybody.

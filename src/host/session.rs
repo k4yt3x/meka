@@ -271,7 +271,7 @@ mod tests {
     }
 
     /// A session is busy while a turn is admitted on it, and while one holds its conversation
-    /// before it is counted, as a scheduled fire does; with neither, it is free.
+    /// before it is counted, as the inbox driver's does; with neither, it is free.
     #[tokio::test]
     async fn a_session_is_busy_while_a_turn_is_admitted_or_holds_its_conversation() {
         let store = Store::for_test().await;
@@ -763,6 +763,12 @@ impl CancelCell {
         }
     }
 
+    /// Whether a cancel has been asked since `admission` was sampled, whether or not it found a
+    /// turn to stop.
+    pub(crate) fn canceled_since(&self, admission: Admission) -> bool {
+        self.epoch.load(std::sync::atomic::Ordering::SeqCst) != admission.epoch
+    }
+
     /// Publish a turn's token. A cancel that arrived since `admission` fires it at once, because
     /// the caller of that cancel was told the turn was canceled, so it is.
     pub(crate) fn publish(
@@ -782,7 +788,7 @@ impl CancelCell {
         turn_id: uuid::Uuid,
     ) -> Published {
         self.store(Some((turn_id, cancellation.clone())));
-        if self.epoch.load(std::sync::atomic::Ordering::SeqCst) != admission.epoch {
+        if self.canceled_since(admission) {
             tracing::debug!(
                 "a cancel arrived while this turn was being admitted; honoring it before the turn runs"
             );

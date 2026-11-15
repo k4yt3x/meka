@@ -1,16 +1,16 @@
-//! Scheduled-job execution for `meka acp`.
+//! Schedule execution for `meka acp`.
 //!
 //! An editor is a live client, so unlike `meka serve` this host has a human on the far side. Two
 //! things follow. Approval requests genuinely round-trip (`session/request_permission` reaches
-//! the editor), rather than resolving to deny the way an unattended turn must. And the job's prompt
-//! is pushed as a `UserMessageChunk` before the turn runs, so the transcript shows what triggered
-//! the reply instead of an answer to a question nobody asked.
+//! the editor), rather than resolving to deny the way an unattended turn must. And the schedule's
+//! prompt is pushed as a `UserMessageChunk` before the turn runs, so the transcript shows what
+//! triggered the reply instead of an answer to a question nobody asked.
 //!
-//! ACP fires only jobs whose session the editor currently has open. It cannot revive an arbitrary
-//! session the way the server can: a session's cwd, permission and capabilities come from the
-//! client's `session/new`, and inventing them here would run a job against a workspace the editor
-//! never opened. Jobs for other sessions are simply not this host's to run, and the scope predicate
-//! filters them out before their gates are ever evaluated.
+//! ACP fires only schedules whose session the editor currently has open. It cannot revive an
+//! arbitrary session the way the server can: a session's cwd, permission and capabilities come from
+//! the client's `session/new`, and inventing them here would run a schedule against a workspace the
+//! editor never opened. Schedules for other sessions are simply not this host's to run, and the
+//! scope predicate filters them out before their gates are ever evaluated.
 
 use std::sync::Arc;
 
@@ -31,22 +31,14 @@ pub(super) fn spawn(state: Arc<super::ServerState>) -> tokio::task::JoinHandle<(
     // without the scheduler holding a stale snapshot. The map is keyed by the session's uuid in
     // string form (every insertion site derives the key from `session_uuid.to_string()`), so
     // finding the session needs no lock on any session's runtime.
-    //
-    // A session mid-turn is held over until a sweep finds it free, as `meka serve` holds one:
-    // offered now, the job's gate would run and its fire then defer behind the turn, on every
-    // sweep for as long as the turn lasts.
     let sessions = state.sessions.clone();
-    let scope = SchedulerScope::Jobs(Arc::new(move |job: &crate::schedule::ScheduledJob| {
+    let scope = SchedulerScope::Schedules(Arc::new(move |schedule: &crate::schedule::Schedule| {
         // `try_read` rather than `read`: the map is briefly write-locked on every `session/new` and
         // `session/close`, and blocking the sweep behind session setup would be worse than skipping
-        // a tick. The job stays due either way.
+        // a tick. The schedule stays due either way.
         sessions
             .try_read()
-            .map(|open| {
-                open.get(&job.session_id.to_string())
-                    .is_some_and(|entry| !entry.is_busy())
-            })
-            .unwrap_or(false)
+            .is_ok_and(|open| open.contains_key(&schedule.session_id.to_string()))
     }));
 
     tracing::info!(
@@ -54,18 +46,20 @@ pub(super) fn spawn(state: Arc<super::ServerState>) -> tokio::task::JoinHandle<(
         poll_interval = config.poll_interval
     );
     let store = Arc::new(state.shared.store.clone());
-    let hooks = Arc::new(AcpHooks {
-        state: Arc::clone(&state),
-    });
+    let inbox_wake = Arc::clone(&state.inbox_wake);
     crate::scheduler::spawn(
         store,
         config,
         state.shared.gate_tools.clone(),
-        Arc::clone(&hooks) as Arc<dyn crate::scheduler::ResidentPermissions>,
+        Arc::new(AcpHooks {
+            state: Arc::clone(&state),
+        }) as Arc<dyn crate::scheduler::ResidentPermissions>,
         scope,
-        move |wakeup| {
-            let hooks = Arc::clone(&hooks);
-            async move { crate::host::scheduler::run_wakeup(&*hooks, wakeup).await }
+        // The inbox driver opens the fire's turn when the session is idle; a running turn reads it
+        // at its next pause.
+        move |_schedule, _queued| {
+            inbox_wake.notify_one();
+            std::future::ready(())
         },
     )
 }
@@ -94,7 +88,32 @@ pub(super) fn spawn_background_poller(
     )
 }
 
-/// Build the `session/update` that shows a job's prompt as the user turn that triggered the reply.
+/// Start the inbox driver for a running ACP process, over the sessions the editor has open, for the
+/// reason the scheduler above keeps to them: a session it closed is not this host's to revive, and
+/// its items wait for whichever host opens it next.
+pub(super) fn spawn_inbox_driver(state: Arc<super::ServerState>) -> tokio::task::JoinHandle<()> {
+    let sessions = state.sessions.clone();
+    crate::host::scheduler::spawn_inbox_driver(
+        Arc::new(AcpHooks {
+            state: Arc::clone(&state),
+        }),
+        Arc::clone(&state.inbox_wake),
+        state.shared.config.schedule.poll_interval,
+        // A token nothing fires: the handle is aborted with the connection, which is what ends
+        // this driver.
+        tokio_util::sync::CancellationToken::new(),
+        // `try_read`, as the scheduler's scope reads the map: a pass that finds it write-locked by
+        // a `session/new` or a `session/close` leaves the session to the next.
+        move |session_id| {
+            sessions
+                .try_read()
+                .is_ok_and(|open| open.contains_key(&session_id.to_string()))
+        },
+    )
+}
+
+/// Build the `session/update` that shows a schedule's prompt as the user turn that triggered the
+/// reply.
 ///
 /// Zed skips an echoed `UserMessageChunk` only when it matches a message it optimistically added
 /// itself before calling `session/prompt`. A scheduled turn has no such message, so this renders --
@@ -158,6 +177,38 @@ impl crate::host::scheduler::HostHooks for AcpHooks {
         self.state.leaving.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    async fn inbox_deferred(
+        &self,
+        entry: &Self::Entry,
+        items: &[crate::store::inbox::InboxItem],
+        not_before: chrono::DateTime<chrono::Utc>,
+        _error: &crate::error::MekaError,
+    ) {
+        let notice = crate::host::scheduler::deferral_notice(items, not_before);
+        entry
+            .frontend
+            .emit(crate::frontend::FrontendEvent::Notice(
+                crate::frontend::Notice::info(notice),
+            ))
+            .await;
+    }
+
+    async fn inbox_given_up(
+        &self,
+        entry: &Self::Entry,
+        item: &crate::store::inbox::InboxItem,
+        reason: &str,
+        _error: Option<&crate::error::MekaError>,
+    ) {
+        let notice = crate::host::scheduler::give_up_notice(item, reason);
+        entry
+            .frontend
+            .emit(crate::frontend::FrontendEvent::Notice(
+                crate::frontend::Notice::warn(notice),
+            ))
+            .await;
+    }
+
     /// An out-of-band turn has no `session/prompt` response to carry its outcome, so a failure
     /// would otherwise leave the editor with a prompt and nothing under it. Said as the notice the
     /// screen prints and the webhook `meka serve` posts; a clean finish needs no announcement,
@@ -165,12 +216,22 @@ impl crate::host::scheduler::HostHooks for AcpHooks {
     async fn finished(
         &self,
         entry: &Self::Entry,
-        job: Option<&crate::schedule::ScheduledJob>,
+        origin: &crate::host::scheduler::TurnStarter,
         outcome: &Result<(), crate::error::MekaError>,
     ) {
-        let what = match job {
-            Some(job) => format!("Scheduled job '{}'", job.short_id()),
-            None => "The background outcome report".to_string(),
+        use crate::host::scheduler::TurnStarter;
+        let what = match origin {
+            TurnStarter::Schedule { schedule_ids, .. } => match schedule_ids.as_slice() {
+                [schedule_id] => format!(
+                    "Schedule '{}'",
+                    schedule_id
+                        .get(..crate::text::ID_PREFIX)
+                        .unwrap_or(schedule_id)
+                ),
+                _ => "The scheduled turn".to_string(),
+            },
+            TurnStarter::Inbox { .. } => "The inbox turn".to_string(),
+            _ => "The background outcome report".to_string(),
         };
         let notice = match outcome {
             Ok(()) => return,

@@ -659,10 +659,11 @@ pub(crate) enum ContentBlockView {
         body: String,
         text: String,
     },
-    /// A scheduled job's fire the model read: `text` as it read it, `prompt` the job's words,
-    /// `job_id` the job. Typed so a client shows it as a fire rather than as words a person typed.
+    /// A schedule's fire the model read: `text` as it read it, `prompt` the schedule's words,
+    /// `schedule_id` the schedule. Typed so a client shows it as a fire rather than as words a
+    /// person typed.
     Scheduled {
-        job_id: String,
+        schedule_id: String,
         prompt: String,
         text: String,
     },
@@ -824,11 +825,11 @@ fn view_for_block(block: &ContentBlock) -> ContentBlockView {
             text: text.clone(),
         },
         ContentBlock::Scheduled {
-            job_id,
+            schedule_id,
             prompt,
             text,
         } => ContentBlockView::Scheduled {
-            job_id: job_id.clone(),
+            schedule_id: schedule_id.clone(),
             prompt: prompt.clone(),
             text: text.clone(),
         },
@@ -1223,8 +1224,8 @@ mod tests {
     }
 
     /// What Meka wrote on another's behalf keeps its kind on the wire, with the facts a client
-    /// labels it by: an inbox item's words beside its class and source, a fire's job and words, a
-    /// report's tasks; and `text` on each is what the model read.
+    /// labels it by: an inbox item's words beside its class and source, a fire's schedule and
+    /// words, a report's tasks; and `text` on each is what the model read.
     #[test]
     fn the_view_types_what_meka_relayed() {
         let views: Vec<serde_json::Value> = [
@@ -1236,9 +1237,9 @@ mod tests {
                 text: "[Message from telegram, arrived now]\nthe words".to_string(),
             },
             ContentBlock::Scheduled {
-                job_id: "job".to_string(),
+                schedule_id: "schedule".to_string(),
                 prompt: "stretch".to_string(),
-                text: "[Scheduled job job fired now]\n\nstretch".to_string(),
+                text: "[Schedule schedule fired now]\n\nstretch".to_string(),
             },
             ContentBlock::BackgroundReport {
                 task_ids: vec!["task".to_string()],
@@ -1259,7 +1260,7 @@ mod tests {
             })
         );
         assert_eq!(views[1]["type"], "scheduled");
-        assert_eq!(views[1]["job_id"], "job");
+        assert_eq!(views[1]["schedule_id"], "schedule");
         assert_eq!(views[1]["prompt"], "stretch");
         assert_eq!(views[2]["type"], "background_report");
         assert_eq!(views[2]["task_ids"], serde_json::json!(["task"]));

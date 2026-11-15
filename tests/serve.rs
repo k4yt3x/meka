@@ -188,7 +188,7 @@ default = "unrestricted"
 # `workspace` included so it is reachable from a test at all. Leaving it out was a large part of
 # why this whole surface went unexercised: `POST /v1/sessions` refuses a level the server has not
 # enabled, so no test could create a `workspace` session even deliberately. `none` is here for the
-# same reason and it was found the same way: the scheduler refuses every job on a session at
+# same reason and it was found the same way: the scheduler refuses every schedule on a session at
 # `none`, and no test could reach that state to check what the endpoints then say.
 enabled = ["none", "read", "workspace", "unrestricted"]
 
@@ -2608,12 +2608,12 @@ fn cancel_during_in_flight_turn_emits_canceled_event() {
     );
 }
 
-/// `[schedule] max_jobs` is held where the row is written, in one transaction with the count, so
-/// creates racing for the last slot cannot all be told yes.
+/// `[schedule] max_schedules` is held where the row is written, in one transaction with the count,
+/// so creates racing for the last slot cannot all be told yes.
 #[test]
-fn parallel_job_creates_respect_max_jobs() {
+fn parallel_schedule_creates_respect_max_schedules() {
     let harness = ServeTestHarness::spawn_with(
-        "\n[schedule]\nmax_jobs = 1\npoll_interval = \"60s\"\n",
+        "\n[schedule]\nmax_schedules = 1\npoll_interval = \"60s\"\n",
         "",
         mock_simple_turn(),
         "sk_test_token",
@@ -2634,9 +2634,9 @@ fn parallel_job_creates_respect_max_jobs() {
                     .expect("client");
                 barrier.wait();
                 client
-                    .post(format!("{base_url}/v1/jobs"))
+                    .post(format!("{base_url}/v1/schedules"))
                     .header("Authorization", format!("Bearer {token}"))
-                    .json(&serde_json::json!({"session_id": id,  "prompt": format!("job {index}"), "every": "1h" }))
+                    .json(&serde_json::json!({"session_id": id,  "prompt": format!("schedule {index}"), "every": "1h" }))
                     .send()
                     .expect("send")
                     .status()
@@ -2658,13 +2658,17 @@ fn parallel_job_creates_respect_max_jobs() {
         11,
         "{statuses:?}"
     );
-    let jobs: serde_json::Value = harness
-        .request(reqwest::Method::GET, &format!("/v1/jobs?session={id}"))
+    let schedules: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/schedules?session={id}"))
         .send()
         .expect("send")
         .json()
         .expect("parse");
-    assert_eq!(jobs["jobs"].as_array().map_or(0, Vec::len), 1, "{jobs}");
+    assert_eq!(
+        schedules["schedules"].as_array().map_or(0, Vec::len),
+        1,
+        "{schedules}"
+    );
 }
 
 /// `max_concurrent_turns` counts every turn: an inbox turn takes the same process slot a client's
@@ -2753,8 +2757,8 @@ fn autonomous_turns_share_the_process_cap() {
     }
 }
 
-/// The scheduled door counts on the process too: a job due while a client's turn on another
-/// session holds the only slot is deferred, occurrence intact, and fires once the slot frees.
+/// A fire's turn counts on the process too: a schedule due while a client's turn on another session
+/// holds the only slot is queued, and its turn runs once the slot frees.
 #[test]
 fn a_scheduled_fire_waits_for_a_free_slot() {
     let script = serde_json::json!([
@@ -2821,8 +2825,8 @@ fn a_scheduled_fire_waits_for_a_free_slot() {
     );
     harness.wait_until_in_flight(&holding);
 
-    // Due after a second and swept every second, so by three seconds the fire has been found due
-    // at least once; without a slot it is deferred, not run.
+    // Due after a second and swept every second, so by three seconds the fire has been queued;
+    // without a slot its turn waits, and does not run.
     std::thread::sleep(Duration::from_millis(3000));
     let while_held = messages_of(&scheduling);
     assert!(
@@ -2847,122 +2851,145 @@ fn a_scheduled_fire_waits_for_a_free_slot() {
     );
 }
 
-/// One session's long turn holds no other session's jobs. A job whose session is mid-turn is held
-/// over before its gate runs while another session's job fires, and once the turn is over the
-/// held job's gate runs and it fires.
-#[cfg(unix)]
+/// The busy-session defect as a test: a schedule due while its session's turn is held in a tool
+/// call is checked when it is due, and its fire is read behind that round's results, in that turn,
+/// rather than waiting for the turn to end to run as a turn of its own.
 #[test]
-fn a_job_on_a_session_mid_turn_is_held_over_without_holding_another_session_s() {
+fn a_fire_due_while_a_tool_call_holds_the_turn_is_read_behind_its_results() {
     let script = serde_json::json!([
-        // The busy session's turn, until the test cancels it.
         [
-            { "type": "sleep", "ms": 120_000 },
-            { "type": "message_end", "stop_reason": "end_turn" }
+            { "type": "tool_use_start", "id": "tu_1", "name": "schedule_create" },
+            { "type": "tool_use_end", "input": { "prompt": "FIRE_PROMPT_MARKER", "at": "2s" }},
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
-        // The free session's fire, while the other turn runs.
         [
-            { "type": "text", "text": "the free session's fire" },
-            { "type": "message_end", "stop_reason": "end_turn" }
+            { "type": "tool_use_start", "id": "tu_2", "name": "shell_execute" },
+            { "type": "tool_use_end", "input": {
+                "command": support::wait_for_file_command("released")
+            }},
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
-        // The busy session's fire, once its turn is over.
         [
-            { "type": "text", "text": "the held fire" },
+            { "type": "text", "text": "saw the fire" },
             { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
-    let harness = ServeTestHarness::spawn_with(
-        "",
-        "\n[schedule]\npoll_interval = \"1s\"\n",
-        script,
-        "sk_test_token",
-        &["sessions:r", "sessions:w", "schedule:r", "schedule:w"],
-    );
-    let busy = create_session_id(&harness);
-    let free = create_session_id(&harness);
-    let gate_ran = harness.root().join("gate-ran");
-    let scheduled_turn_started = |id: &str| -> bool {
-        let turns: serde_json::Value = harness
-            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/turns"))
+    let harness = ServeTestHarness::spawn("\n[schedule]\npoll_interval = \"200ms\"\n", script);
+    let work = harness.root().join("work");
+    std::fs::create_dir_all(&work).expect("the session's directory");
+    let id = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"working_directory": work, "permission": "unrestricted"}))
+        .send()
+        .expect("create")
+        .json::<serde_json::Value>()
+        .expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    let base_url = harness.base_url.clone();
+    let token = harness.token.clone();
+    let session = id.clone();
+    let turn = std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("client");
+        client
+            .post(format!("{base_url}/v1/sessions/{session}/turns"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&serde_json::json!({"message": "remind me, then wait", "stream": true}))
             .send()
-            .expect("turns")
+            .expect("send")
+            .text()
+            .expect("body")
+    });
+
+    // The fire is queued while the tool call holds the turn: the check does not wait for it.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let fire_id = loop {
+        let open: serde_json::Value = harness
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/inbox"))
+            .send()
+            .expect("send")
             .json()
             .expect("parse");
-        turns["turns"]
+        if let Some(fire) = open["items"]
             .as_array()
             .into_iter()
             .flatten()
-            .any(|turn| turn["source"] == "schedule")
-    };
-    let wait_for_a_scheduled_turn = |id: &str| {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !scheduled_turn_started(id) {
-            assert!(
-                Instant::now() < deadline,
-                "no scheduled turn started on session {id} within 30s"
-            );
-            std::thread::sleep(Duration::from_millis(100));
+            .find(|item| item["schedule_id"].is_string() && item["state"] == "pending")
+        {
+            break fire["id"].as_str().expect("item id").to_string();
         }
-    };
-
-    let long_turn = request_on_a_thread(
-        &harness,
-        reqwest::Method::POST,
-        &format!("/v1/sessions/{busy}/turns"),
-        serde_json::json!({ "message": "a long turn" }),
-    );
-    harness.wait_until_in_flight(&busy);
-    for job in [
-        serde_json::json!({
-            "session_id": busy,
-            "prompt": "the busy session's job",
-            "at": "1s",
-            "gate": {
-                "check": { "command": format!("touch '{}'", gate_ran.display()) },
-                "when": "succeeded",
-            },
-        }),
-        serde_json::json!({ "session_id": free, "prompt": "the free session's job", "at": "2s" }),
-    ] {
-        let created = harness
-            .request(reqwest::Method::POST, "/v1/jobs")
-            .json(&job)
-            .send()
-            .expect("send");
-        assert_eq!(
-            created.status(),
-            201,
-            "{}",
-            created.text().unwrap_or_default()
+        assert!(
+            Instant::now() < deadline,
+            "the fire was not queued while the turn held its session: {open}"
         );
-    }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    std::fs::write(work.join("released"), "").expect("release the tool call");
 
-    wait_for_a_scheduled_turn(&free);
-    let record: serde_json::Value = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{busy}"))
+    let body = turn.join().expect("turn thread");
+    let events = sse_events(&body);
+    let completed = events
+        .iter()
+        .rposition(|(event, _)| event == "tool_call.completed")
+        .unwrap_or_else(|| panic!("the tool ran: {body}"));
+    let delivered = events
+        .iter()
+        .position(|(event, data)| event == "inbox.delivered" && data["item_ids"][0] == fire_id)
+        .unwrap_or_else(|| panic!("the fire is delivered inside the running turn: {body}"));
+    let finished = sse_position(&events, "turn.finished", &body);
+    assert!(
+        completed < delivered && delivered < finished,
+        "read after the round's results and before the turn ends: {body}"
+    );
+
+    let transcript: serde_json::Value = harness
+        .request(
+            reqwest::Method::GET,
+            &format!("/v1/sessions/{id}/context/messages"),
+        )
         .send()
         .expect("send")
         .json()
         .expect("parse");
-    assert_eq!(
-        record["turn_in_flight"], true,
-        "the long turn is still running"
-    );
+    let behind_results = transcript["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter_map(|message| message["content"].as_array())
+        .find(|blocks| {
+            blocks
+                .iter()
+                .any(|block| block["type"] == "tool_result" && block["tool_use_id"] == "tu_2")
+        })
+        .expect("the held round is in the transcript");
     assert!(
-        !gate_ran.exists() && !scheduled_turn_started(&busy),
-        "the busy session's job is held over, its gate unrun"
+        behind_results
+            .iter()
+            .any(|block| block["type"] == "scheduled"
+                && block["prompt"] == "FIRE_PROMPT_MARKER"
+                && block["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("while you were working]"))),
+        "the fire is read with the round, after its results: {behind_results:?}"
     );
-
-    let canceled = harness
-        .request(
-            reqwest::Method::POST,
-            &format!("/v1/sessions/{busy}/cancel"),
-        )
+    let turns: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/turns"))
         .send()
-        .expect("send");
-    assert_eq!(canceled.status(), 204);
-    long_turn.join().expect("the long turn's request");
-    wait_for_a_scheduled_turn(&busy);
-    assert!(gate_ran.exists(), "the held job fired through its gate");
+        .expect("turns")
+        .json()
+        .expect("parse");
+    let sources: Vec<&str> = turns["turns"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|turn| turn["source"].as_str())
+        .collect();
+    assert_eq!(sources, ["client"], "no turn of the fire's own: {turns}");
 }
 
 /// Process-wide `max_concurrent_turns = 1` rejects the second concurrent turn (across distinct
@@ -7022,7 +7049,7 @@ fn a_scheduled_turn_marks_the_session_in_flight() {
     );
 }
 
-/// End-to-end proof that a scheduled job actually fires: the agent creates a one-shot job through
+/// End-to-end proof that a schedule actually fires: the agent creates a one-shot schedule through
 /// `schedule_create`, and the scheduler running inside `meka serve` delivers its prompt as a turn
 /// with no HTTP request driving it.
 ///
@@ -7030,7 +7057,7 @@ fn a_scheduled_turn_marks_the_session_in_flight() {
 /// nothing else proves the scheduler is wired into the server, that an agent-initiated turn reaches
 /// the model, or that its output is persisted where a client can read it back.
 #[test]
-fn scheduled_job_fires_without_a_client_request() {
+fn schedule_fires_without_a_client_request() {
     let script = serde_json::json!([
         // Turn 1: the agent schedules a one-shot two seconds out.
         [
@@ -7070,7 +7097,7 @@ fn scheduled_job_fires_without_a_client_request() {
         .expect("send");
     assert_eq!(scheduled.status(), 200);
 
-    // Poll for the fired turn rather than sleeping a fixed span: the job is due in 2s and the
+    // Poll for the fired turn rather than sleeping a fixed span: the schedule is due in 2s and the
     // scheduler ticks every 1s, so the turn lands somewhere in a window rather than at an instant.
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut body = String::new();
@@ -7091,14 +7118,14 @@ fn scheduled_job_fires_without_a_client_request() {
 
     // Deliberately counted, not merely contained: the marker appears once in turn 1's
     // `schedule_create` tool-call input, which is echoed back by `GET /history` whether or not the
-    // job ever fires. Only a real delivery produces a second occurrence.
+    // schedule ever fires. Only a real delivery produces a second occurrence.
     assert!(
         body.matches("DELIVERED_PROMPT_MARKER").count() >= 2,
-        "the job's prompt must be delivered as a turn nobody requested, not just appear in the \
+        "the schedule's prompt must be delivered as a turn nobody requested, not just appear in the \
          tool call that created it; messages were:\n{body}",
     );
     assert!(
-        body.contains("Scheduled job"),
+        body.contains("Schedule"),
         "the delivered prompt must be marked as scheduled so the model knows no human is \
          waiting; messages were:\n{body}",
     );
@@ -7112,9 +7139,9 @@ fn scheduled_job_fires_without_a_client_request() {
 /// `isolated` is gone from the request body, and a client still sending it is told so.
 ///
 /// The field named a mode that ran the turn in a fresh session instead of the conversation that
-/// created the job. `CreateJobRequest` denies unknown fields, so this is a 422 naming `isolated`
-/// rather than a silently ignored key -- which matters because the two failures look identical
-/// from the client's side until the fire lands somewhere it did not expect.
+/// created the schedule. `CreateScheduleRequest` denies unknown fields, so this is a 422 naming
+/// `isolated` rather than a silently ignored key -- which matters because the two failures look
+/// identical from the client's side until the fire lands somewhere it did not expect.
 #[test]
 fn a_request_still_asking_for_isolation_is_refused_by_name() {
     let harness = ServeTestHarness::spawn_with(
@@ -7135,7 +7162,7 @@ fn a_request_still_asking_for_isolation_is_refused_by_name() {
     let id = body["id"].as_str().expect("id").to_string();
 
     let refused = harness
-        .request(reqwest::Method::POST, "/v1/jobs")
+        .request(reqwest::Method::POST, "/v1/schedules")
         .json(&serde_json::json!({"session_id": id,
             "prompt": "check the feed",
             "every": "1h",
@@ -7151,9 +7178,9 @@ fn a_request_still_asking_for_isolation_is_refused_by_name() {
         "the refusal must name the retired field so the fix is obvious: {text}"
     );
 
-    // And the same job without it is still perfectly ordinary.
+    // And the same schedule without it is still perfectly ordinary.
     let accepted = harness
-        .request(reqwest::Method::POST, "/v1/jobs")
+        .request(reqwest::Method::POST, "/v1/schedules")
         .json(&serde_json::json!({"session_id": id, "prompt": "check the feed", "every": "1h"}))
         .send()
         .expect("send");
@@ -7162,7 +7189,7 @@ fn a_request_still_asking_for_isolation_is_refused_by_name() {
     assert_eq!(status, 201, "{text}");
     assert!(
         !text.contains("isolated"),
-        "and the job it returns no longer carries the field either: {text}"
+        "and the schedule it returns no longer carries the field either: {text}"
     );
 }
 
@@ -8405,11 +8432,11 @@ fn an_import_refusal_names_this_api_s_remedy() {
     }
 }
 
-/// A job is canceled by its full id, which is what a client of this API holds. An id matching
-/// nothing must say so rather than answering 204 over a job that is still firing, and the short
-/// form a terminal prints is no id here: that ergonomic is the CLI's.
+/// A schedule is canceled by its full id, which is what a client of this API holds. An id matching
+/// nothing must say so rather than answering 204 over a schedule that is still firing, and the
+/// short form a terminal prints is no id here: that ergonomic is the CLI's.
 #[test]
-fn canceling_a_scheduled_job_takes_its_full_id_and_reports_a_miss() {
+fn canceling_a_schedule_takes_its_full_id_and_reports_a_miss() {
     let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
         "sessions:r",
         "sessions:w",
@@ -8426,35 +8453,35 @@ fn canceling_a_scheduled_job_takes_its_full_id_and_reports_a_miss() {
         .as_str()
         .expect("id")
         .to_string();
-    let job_id = harness
-        .request(reqwest::Method::POST, "/v1/jobs")
+    let schedule_id = harness
+        .request(reqwest::Method::POST, "/v1/schedules")
         .json(&serde_json::json!({"session_id": id, "prompt": "check the build", "every": "30m"}))
         .send()
         .expect("send")
         .json::<serde_json::Value>()
         .expect("parse")["id"]
         .as_str()
-        .expect("job id")
+        .expect("schedule id")
         .to_string();
 
     let missing = harness
         .request(
             reqwest::Method::DELETE,
-            "/v1/jobs/deadbeef-0000-0000-0000-000000000000",
+            "/v1/schedules/deadbeef-0000-0000-0000-000000000000",
         )
         .send()
         .expect("send");
     assert_eq!(
         missing.status(),
         404,
-        "an id that matches no job must not report a cancellation"
+        "an id that matches no schedule must not report a cancellation"
     );
     let body: serde_json::Value = missing.json().expect("parse");
     assert_eq!(body["type"], "https://meka.bot/errors/not-found");
 
-    let short = &job_id[..8];
+    let short = &schedule_id[..8];
     let prefix = harness
-        .request(reqwest::Method::DELETE, &format!("/v1/jobs/{short}"))
+        .request(reqwest::Method::DELETE, &format!("/v1/schedules/{short}"))
         .send()
         .expect("send");
     assert_eq!(
@@ -8463,28 +8490,31 @@ fn canceling_a_scheduled_job_takes_its_full_id_and_reports_a_miss() {
         "a prefix is not an id on this API, so it matches nothing"
     );
     let cancel = harness
-        .request(reqwest::Method::DELETE, &format!("/v1/jobs/{job_id}"))
+        .request(
+            reqwest::Method::DELETE,
+            &format!("/v1/schedules/{schedule_id}"),
+        )
         .send()
         .expect("send");
     assert_eq!(cancel.status(), 204);
 
     let after: serde_json::Value = harness
-        .request(reqwest::Method::GET, "/v1/jobs")
+        .request(reqwest::Method::GET, "/v1/schedules")
         .send()
         .expect("send")
         .json()
         .expect("parse");
     assert!(
-        after["jobs"].as_array().expect("jobs").is_empty(),
-        "the job must actually be gone: {after}"
+        after["schedules"].as_array().expect("schedules").is_empty(),
+        "the schedule must actually be gone: {after}"
     );
 }
 
-/// With the scheduler off, this endpoint is the only way a job can still be created: the
+/// With the scheduler off, this endpoint is the only way a schedule can still be created: the
 /// `schedule_*` tools are not registered and there is no CLI for it. Accepting one would persist a
-/// job that never fires, listed forever with a `next_fire_at` receding into the past.
+/// schedule that never fires, listed forever with a `next_fire_at` receding into the past.
 #[test]
-fn creating_a_job_is_refused_when_scheduling_is_disabled() {
+fn creating_a_schedule_is_refused_when_scheduling_is_disabled() {
     let harness = ServeTestHarness::spawn_with(
         "",
         "\n[schedule]\nenabled = false\n",
@@ -8504,31 +8534,31 @@ fn creating_a_job_is_refused_when_scheduling_is_disabled() {
         .to_string();
 
     let created = harness
-        .request(reqwest::Method::POST, "/v1/jobs")
+        .request(reqwest::Method::POST, "/v1/schedules")
         .json(&serde_json::json!({"session_id": id, "prompt": "never runs", "every": "10s"}))
         .send()
         .expect("send");
     // `not-found`, the answer a disabled skill or memory store already gives: nothing is wrong
-    // with the request, there is nowhere for the job to go. As a 422 `invalid-body` it told a
+    // with the request, there is nowhere for the schedule to go. As a 422 `invalid-body` it told a
     // client to correct a payload that was never the problem, and two subsystems answered the same
     // condition two different ways.
     assert_eq!(created.status(), 404);
     let problem: serde_json::Value = created.json().expect("parse");
     assert_eq!(problem["type"], "https://meka.bot/errors/not-found");
 
-    // Listing and canceling stay open: clearing out jobs left from before the flag was flipped is
-    // exactly what an operator does next.
+    // Listing and canceling stay open: clearing out schedules left from before the flag was flipped
+    // is exactly what an operator does next.
     let listed = harness
-        .request(reqwest::Method::GET, "/v1/jobs")
+        .request(reqwest::Method::GET, "/v1/schedules")
         .send()
         .expect("send");
     assert_eq!(listed.status(), 200);
     assert!(
-        listed.json::<serde_json::Value>().expect("parse")["jobs"]
+        listed.json::<serde_json::Value>().expect("parse")["schedules"]
             .as_array()
-            .expect("jobs")
+            .expect("schedules")
             .is_empty(),
-        "the refused job must not have been persisted"
+        "the refused schedule must not have been persisted"
     );
 }
 
@@ -8768,15 +8798,15 @@ fn omitting_priority_keeps_it_rather_than_resetting_to_the_default() {
     }
 }
 
-/// A job that cannot fire is refused at the door, and one already there says so when listed.
+/// A schedule that cannot fire is refused at the door, and one already there says so when listed.
 ///
-/// This is the only door that could plant such a job: `schedule_create` needs `read` to dispatch at
-/// all, so the agent cannot reach it from a session at `none`, and a token's scopes say nothing
-/// about the session's level. It was also the only reader with no way to find out -- the agent gets
-/// a `NOT FIRING` line and `meka schedule list` a `Held` column, while `GET` returned a row that
-/// looked exactly like a working one.
+/// This is the only door that could plant such a schedule: `schedule_create` needs `read` to
+/// dispatch at all, so the agent cannot reach it from a session at `none`, and a token's scopes say
+/// nothing about the session's level. It was also the only reader with no way to find out -- the
+/// agent gets a `NOT FIRING` line and `meka schedule list` a `Held` column, while `GET` returned a
+/// row that looked exactly like a working one.
 #[test]
-fn a_job_that_could_never_fire_is_refused_and_an_existing_one_is_reported() {
+fn a_schedule_that_could_never_fire_is_refused_and_an_existing_one_is_reported() {
     let config = "\n[[serve.tokens]]\ntoken = \"sk_test_full\"\n\
                   scopes = [\"sessions:r\", \"sessions:w\", \"schedule:r\", \"schedule:w\"]\n";
     let harness = ServeTestHarness::spawn_with("", config, mock_simple_turn(), "sk_test_token", &[
@@ -8802,7 +8832,7 @@ fn a_job_that_could_never_fire_is_refused_and_an_existing_one_is_reported() {
     let plant = || {
         harness
             .client
-            .post(format!("{}/v1/jobs", harness.base_url))
+            .post(format!("{}/v1/schedules", harness.base_url))
             .header("Authorization", "Bearer sk_test_full")
             .json(&serde_json::json!({"session_id": session, "prompt": "remind me", "every": "1h"}))
             .send()
@@ -8810,7 +8840,7 @@ fn a_job_that_could_never_fire_is_refused_and_an_existing_one_is_reported() {
     };
 
     // Planted while the session can still run it, so the listing below is about the level changing
-    // underneath an existing job rather than about the refusal.
+    // underneath an existing schedule rather than about the refusal.
     assert_eq!(plant().status().as_u16(), 201, "ungated at `read` is fine");
 
     let lowered = harness
@@ -8826,7 +8856,7 @@ fn a_job_that_could_never_fire_is_refused_and_an_existing_one_is_reported() {
     assert_eq!(
         refused.status().as_u16(),
         403,
-        "a second job would never fire either, and the fire door already knows it"
+        "a second schedule would never fire either, and the fire door already knows it"
     );
     let body = refused.json::<serde_json::Value>().expect("parse");
     assert!(
@@ -8839,16 +8869,21 @@ fn a_job_that_could_never_fire_is_refused_and_an_existing_one_is_reported() {
 
     let listed = harness
         .client
-        .get(format!("{}/v1/jobs?session={}", harness.base_url, session))
+        .get(format!(
+            "{}/v1/schedules?session={}",
+            harness.base_url, session
+        ))
         .header("Authorization", "Bearer sk_test_full")
         .send()
         .expect("send")
         .json::<serde_json::Value>()
         .expect("parse");
-    let withheld = listed["jobs"][0]["withheld"].as_str().unwrap_or_default();
+    let withheld = listed["schedules"][0]["withheld"]
+        .as_str()
+        .unwrap_or_default();
     assert!(
         withheld.contains("nothing is executable"),
-        "the job planted before the drop is inert now, and a client has no other way to tell: \
+        "the schedule planted before the drop is inert now, and a client has no other way to tell: \
          {listed}"
     );
 }
@@ -8888,7 +8923,7 @@ fn a_gate_refusal_is_a_422_when_no_permission_would_help() {
     let refuse = |id: &str, check: serde_json::Value| -> (u16, String) {
         let response = harness
             .client
-            .post(format!("{}/v1/jobs", harness.base_url))
+            .post(format!("{}/v1/schedules", harness.base_url))
             .header("Authorization", "Bearer sk_test_full")
             .json(&serde_json::json!({"session_id": id,
                 "prompt": "check the thing",
@@ -8955,7 +8990,7 @@ fn a_read_only_built_in_tool_gate_is_accepted_at_read() {
 
     let response = harness
         .client
-        .post(format!("{}/v1/jobs", harness.base_url))
+        .post(format!("{}/v1/schedules", harness.base_url))
         .header("Authorization", "Bearer sk_test_full")
         .json(&serde_json::json!({"session_id": session,
             "prompt": "tell me when it changes",
@@ -8986,16 +9021,16 @@ fn a_read_only_built_in_tool_gate_is_accepted_at_read() {
     );
 }
 
-/// A `schedule:r` token sees that a job is gated, but not what the gate runs.
+/// A `schedule:r` token sees that a schedule is gated, but not what the gate runs.
 ///
 /// A gate command is a `shell_execute` line that runs unattended as the server's user. The
 /// webhook path already withholds the same field, on the stated grounds that a command line is the
 /// highest-entropy field in the system and the one most likely to carry a credential someone pasted
-/// into a `curl`. `GET /v1/jobs` is server-wide, so leaving the command at `schedule:r` handed
+/// into a `curl`. `GET /v1/schedules` is server-wide, so leaving the command at `schedule:r` handed
 /// every gate on the box to a bridge scoped to the read half of a scope that was invented so
 /// schedule access would *not* imply session access.
 ///
-/// The fire condition stays visible either way, so a client can still tell a gated job from an
+/// The fire condition stays visible either way, so a client can still tell a gated schedule from an
 /// ungated one.
 #[test]
 fn a_schedule_scoped_token_sees_a_gate_without_its_command() {
@@ -9024,7 +9059,7 @@ fn a_schedule_scoped_token_sees_a_gate_without_its_command() {
     let secret = "curl -H 'Authorization: Bearer sk-live-DO-NOT-DISCLOSE' https://example.test";
     let created = harness
         .client
-        .post(format!("{}/v1/jobs", harness.base_url))
+        .post(format!("{}/v1/schedules", harness.base_url))
         .header("Authorization", "Bearer sk_test_full")
         .json(&serde_json::json!({"session_id": id,
             "prompt": "check the thing",
@@ -9038,21 +9073,21 @@ fn a_schedule_scoped_token_sees_a_gate_without_its_command() {
     // The full-scope token gets the command back.
     let full: serde_json::Value = harness
         .client
-        .get(format!("{}/v1/jobs", harness.base_url))
+        .get(format!("{}/v1/schedules", harness.base_url))
         .header("Authorization", "Bearer sk_test_full")
         .send()
         .expect("send")
         .json()
         .expect("parse");
     assert_eq!(
-        full["jobs"][0]["gate"]["check"].as_str(),
+        full["schedules"][0]["gate"]["check"].as_str(),
         Some(secret),
         "a token holding sessions:r may see the command: {full}"
     );
 
     // The schedule:r-only token does not.
     let limited: serde_json::Value = harness
-        .request(reqwest::Method::GET, "/v1/jobs")
+        .request(reqwest::Method::GET, "/v1/schedules")
         .send()
         .expect("send")
         .json()
@@ -9063,19 +9098,19 @@ fn a_schedule_scoped_token_sees_a_gate_without_its_command() {
         "the gate command must not reach a schedule:r-only token: {body}"
     );
     assert_eq!(
-        limited["jobs"][0]["gate"]["when"].as_str(),
+        limited["schedules"][0]["gate"]["when"].as_str(),
         Some("succeeded"),
         "the gate itself must still be visible: {limited}"
     );
     assert_eq!(
-        limited["jobs"][0]["gate"]["kind"].as_str(),
+        limited["schedules"][0]["gate"]["kind"].as_str(),
         Some("shell"),
         "and so must its kind, so a shell gate reads differently from a tool one: {limited}"
     );
 }
 
 /// A gate runs a shell command on a timer, before the turn, as the server's user, and needs no
-/// working provider to do it. `GET /v1/jobs` hands a `schedule:r` token every session id in
+/// working provider to do it. `GET /v1/schedules` hands a `schedule:r` token every session id in
 /// the database, so if `schedule:w` alone could plant a gate, scoping a bridge to `schedule:*`
 /// would quietly be granting it unattended arbitrary shell.
 #[test]
@@ -9105,7 +9140,7 @@ fn planting_a_gate_needs_more_than_the_schedule_scope() {
         .to_string();
 
     let gated = harness
-        .request(reqwest::Method::POST, "/v1/jobs")
+        .request(reqwest::Method::POST, "/v1/schedules")
         .json(&serde_json::json!({"session_id": id,
             "prompt": "report",
             "every": "30m",
@@ -9119,17 +9154,17 @@ fn planting_a_gate_needs_more_than_the_schedule_scope() {
         "a schedule-only token must not reach a shell"
     );
 
-    // The ordinary prompt-only job stays reachable: this is a narrowing of gates, not of
+    // The ordinary prompt-only schedule stays reachable: this is a narrowing of gates, not of
     // scheduling.
     let plain = harness
-        .request(reqwest::Method::POST, "/v1/jobs")
+        .request(reqwest::Method::POST, "/v1/schedules")
         .json(&serde_json::json!({"session_id": id, "prompt": "report", "every": "30m"}))
         .send()
         .expect("send");
     assert_eq!(
         plain.status(),
         201,
-        "a gateless job needs only `schedule:w`"
+        "a gateless schedule needs only `schedule:w`"
     );
 }
 
@@ -9158,7 +9193,7 @@ fn a_gate_below_write_permission_is_not_reported_as_a_scope_failure() {
         .to_string();
 
     let response = harness
-        .request(reqwest::Method::POST, "/v1/jobs")
+        .request(reqwest::Method::POST, "/v1/schedules")
         .json(&serde_json::json!({"session_id": id,
             "prompt": "report",
             "every": "30m",
@@ -9175,7 +9210,7 @@ fn a_gate_below_write_permission_is_not_reported_as_a_scope_failure() {
 }
 
 #[test]
-fn scheduled_job_create_list_and_cancel_round_trip() {
+fn schedule_create_list_and_cancel_round_trip() {
     let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
         "sessions:r",
         "sessions:w",
@@ -9191,7 +9226,7 @@ fn scheduled_job_create_list_and_cancel_round_trip() {
     let id = created["id"].as_str().expect("id").to_string();
 
     let response = harness
-        .request(reqwest::Method::POST, "/v1/jobs")
+        .request(reqwest::Method::POST, "/v1/schedules")
         // Far enough out that the scheduler cannot fire it mid-test.
         .json(&serde_json::json!({"session_id": id, "prompt": "check the build", "every": "6h"}))
         .send()
@@ -9202,57 +9237,63 @@ fn scheduled_job_create_list_and_cancel_round_trip() {
         "schedule create failed: {}",
         response.text().unwrap_or_default()
     );
-    let job: serde_json::Value = response.json().expect("parse");
-    let job_id = job["id"].as_str().expect("job id").to_string();
-    assert_eq!(job["session_id"], id);
+    let schedule: serde_json::Value = response.json().expect("parse");
+    let schedule_id = schedule["id"].as_str().expect("schedule id").to_string();
+    assert_eq!(schedule["session_id"], id);
     assert!(
-        job["schedule"].as_str().unwrap_or_default().contains("6h"),
-        "the rendered schedule should describe the interval: {job}"
+        schedule["timing"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("6h"),
+        "the rendered timing should describe the interval: {schedule}"
     );
 
     // Visible both server-wide and scoped to the session.
     let all: serde_json::Value = harness
-        .request(reqwest::Method::GET, "/v1/jobs")
+        .request(reqwest::Method::GET, "/v1/schedules")
         .send()
         .expect("send")
         .json()
         .expect("parse");
     assert!(
-        all["jobs"]
+        all["schedules"]
             .as_array()
-            .expect("jobs")
+            .expect("schedules")
             .iter()
-            .any(|j| j["id"] == job_id.as_str()),
-        "the job must appear in the server-wide listing: {all}"
+            .any(|j| j["id"] == schedule_id.as_str()),
+        "the schedule must appear in the server-wide listing: {all}"
     );
 
     let scoped: serde_json::Value = harness
-        .request(reqwest::Method::GET, &format!("/v1/jobs?session={id}"))
+        .request(reqwest::Method::GET, &format!("/v1/schedules?session={id}"))
         .send()
         .expect("send")
         .json()
         .expect("parse");
-    assert_eq!(scoped["jobs"].as_array().expect("jobs").len(), 1);
+    assert_eq!(scoped["schedules"].as_array().expect("schedules").len(), 1);
 
     let cancel = harness
-        .request(reqwest::Method::DELETE, &format!("/v1/jobs/{job_id}"))
+        .request(
+            reqwest::Method::DELETE,
+            &format!("/v1/schedules/{schedule_id}"),
+        )
         .send()
         .expect("send");
     assert_eq!(cancel.status(), 204);
 
     let after: serde_json::Value = harness
-        .request(reqwest::Method::GET, &format!("/v1/jobs?session={id}"))
+        .request(reqwest::Method::GET, &format!("/v1/schedules?session={id}"))
         .send()
         .expect("send")
         .json()
         .expect("parse");
-    assert!(after["jobs"].as_array().expect("jobs").is_empty());
+    assert!(after["schedules"].as_array().expect("schedules").is_empty());
 }
 
-/// Giving two schedules is refused rather than resolved by precedence: silently honoring one
-/// would produce a job firing on a schedule nobody asked for.
+/// Giving two timings is refused rather than resolved by precedence: silently honoring one
+/// would produce a schedule firing on a timing nobody asked for.
 #[test]
-fn scheduled_job_rejects_two_schedules() {
+fn schedule_rejects_two_timings() {
     let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
         "sessions:r",
         "sessions:w",
@@ -9270,7 +9311,7 @@ fn scheduled_job_rejects_two_schedules() {
     let response = harness
         .request(
             reqwest::Method::POST,
-            "/v1/jobs",
+            "/v1/schedules",
         )
         .json(&serde_json::json!({"session_id": id, "prompt": "x", "every": "6h", "cron": "0 9 * * *"}))
         .send()
@@ -9304,13 +9345,13 @@ fn schedule_endpoints_require_the_schedule_scopes() {
     let id = created["id"].as_str().expect("id");
 
     let listing = harness
-        .request(reqwest::Method::GET, "/v1/jobs")
+        .request(reqwest::Method::GET, "/v1/schedules")
         .send()
         .expect("send");
     assert_eq!(listing.status(), 403);
 
     let creating = harness
-        .request(reqwest::Method::POST, "/v1/jobs")
+        .request(reqwest::Method::POST, "/v1/schedules")
         .json(&serde_json::json!({"session_id": id, "prompt": "x", "every": "6h"}))
         .send()
         .expect("send");
@@ -11509,6 +11550,170 @@ fn an_inbox_turn_refused_for_quota_waits_and_says_so() {
     assert_eq!((retry_until - created_at).num_seconds(), 3600, "{open}");
 }
 
+/// A fire whose turn fails in a way waiting can change waits and is tried again, as any item in
+/// the inbox is: the feed names the fire's item as it is put off, and the next attempt delivers it.
+#[test]
+fn a_fire_whose_turn_fails_for_quota_waits_and_is_tried_again() {
+    let script = serde_json::json!([
+        [{ "type": "fail_exhausted", "message": "insufficient_quota", "resets_after_secs": 3600 }],
+        [
+            { "type": "text", "text": "FIRE_ANSWERED" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn_with(
+        "",
+        "\n[schedule]\npoll_interval = \"200ms\"\n",
+        script,
+        "sk_test_token",
+        &["sessions:r", "sessions:w", "schedule:r", "schedule:w"],
+    );
+    let id = start_streaming_session(&harness);
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+    let created = harness
+        .request(reqwest::Method::POST, "/v1/schedules")
+        .json(&serde_json::json!({"session_id": id, "prompt": "RETRIED_FIRE", "at": "1s"}))
+        .send()
+        .expect("send");
+    assert_eq!(created.status(), 201);
+
+    let (body, feed) = read_feed_until_open(feed, |text| {
+        text.contains("event: inbox.deferred") || text.contains("event: inbox.failed")
+    });
+    let queued = sse_event_data(&body, "schedule.fired").expect("schedule.fired on the feed");
+    let deferred = sse_event_data(&body, "inbox.deferred").expect("inbox.deferred on the feed");
+    assert_eq!(
+        deferred["item_ids"],
+        serde_json::json!([queued["item_id"]]),
+        "{body}"
+    );
+    assert!(
+        sse_event_data(&body, "inbox.failed").is_none(),
+        "nothing was given up: {body}"
+    );
+    // Brought forward rather than waited out: the backoff is the inbox's, and what is under test
+    // is that the attempt after it runs.
+    let item_id = queued["item_id"].as_str().expect("item id").to_string();
+    rusqlite::Connection::open(harness.install.database())
+        .expect("open the store")
+        .execute(
+            "UPDATE inbox_items SET not_before = ?2 WHERE id = ?1",
+            rusqlite::params![item_id, chrono::Utc::now().to_rfc3339()],
+        )
+        .expect("bring the attempt forward");
+    let body = read_feed_until(feed, |text| {
+        text.contains("event: inbox.delivered") || text.contains("event: inbox.failed")
+    });
+    assert_eq!(
+        sse_event_data(&body, "inbox.delivered")
+            .unwrap_or_else(|| panic!("the next attempt delivers it: {body}"))["item_ids"],
+        serde_json::json!([item_id]),
+        "{body}"
+    );
+    assert!(body.contains("FIRE_ANSWERED"), "{body}");
+}
+
+/// A schedule canceled while the turn its fire opened waits on the provider takes the fire with
+/// it: the fire's text is in the conversation and no provider has read it, so the cancel
+/// withdraws it and says so, and the turn failing in a way waiting can change leaves nothing to
+/// try again.
+#[test]
+fn a_fire_canceled_while_its_turn_waits_on_the_provider_is_not_tried_again() {
+    let script = serde_json::json!([[
+        // Long past the cancel, which follows the fire's opening at once.
+        { "type": "sleep", "ms": 5000 },
+        { "type": "fail_exhausted", "message": "insufficient_quota", "resets_after_secs": 3600 }
+    ]]);
+    let harness = ServeTestHarness::spawn_with(
+        "",
+        "\n[schedule]\npoll_interval = \"200ms\"\n",
+        script,
+        "sk_test_token",
+        &["sessions:r", "sessions:w", "schedule:r", "schedule:w"],
+    );
+    let id = start_streaming_session(&harness);
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+    let created: serde_json::Value = harness
+        .request(reqwest::Method::POST, "/v1/schedules")
+        .json(&serde_json::json!({"session_id": id, "prompt": "CANCELED_FIRE", "every": "1h"}))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let schedule_id = created["id"].as_str().expect("schedule id").to_string();
+    let database = harness.install.database();
+    // Due now rather than in an hour.
+    rusqlite::Connection::open(&database)
+        .expect("open the store")
+        .execute(
+            "UPDATE schedules SET next_fire_at = ?2 WHERE id = ?1",
+            rusqlite::params![schedule_id, chrono::Utc::now().to_rfc3339()],
+        )
+        .expect("make the schedule due");
+
+    let (mut body, feed) = read_feed_until_open(feed, |text| text.contains("event: turn.started"));
+    let item_id =
+        sse_event_data(&body, "schedule.fired").expect("schedule.fired on the feed")["item_id"]
+            .as_str()
+            .expect("item id")
+            .to_string();
+    let stamps = || -> (bool, bool, bool) {
+        rusqlite::Connection::open(&database)
+            .expect("open the store")
+            .query_row(
+                "SELECT appended_at IS NOT NULL, delivered_at IS NOT NULL, \
+                 withdrawn_at IS NOT NULL FROM inbox_items WHERE id = ?1",
+                [&item_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("the fire's row")
+    };
+    support::wait_until(
+        "the fire's text in the conversation",
+        Duration::from_secs(20),
+        || stamps().0,
+    );
+    let canceled = harness
+        .request(
+            reqwest::Method::DELETE,
+            &format!("/v1/schedules/{schedule_id}"),
+        )
+        .send()
+        .expect("send");
+    assert_eq!(canceled.status(), 204);
+    assert_eq!(
+        stamps(),
+        (true, false, true),
+        "the fire the turn appended, and no provider read, went with its schedule"
+    );
+
+    body.push_str(&read_feed_until(feed, |text| {
+        text.contains("event: turn.failed")
+    }));
+    let events = sse_events(&body);
+    let withdrawn = sse_position(&events, "inbox.withdrawn", &body);
+    assert_eq!(events[withdrawn].1["item_id"], item_id, "{body}");
+    assert!(
+        withdrawn < sse_position(&events, "turn.failed", &body),
+        "{body}"
+    );
+    assert_eq!(
+        stamps(),
+        (false, false, true),
+        "the failed turn took its opening back, the fire with it, and did not offer it again"
+    );
+    let open: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/inbox"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert!(
+        open["items"].as_array().is_some_and(Vec::is_empty),
+        "nothing waits for another try: {open}"
+    );
+}
+
 /// `enqueue_inbox_item` under an `Idempotency-Key`, answering the whole response.
 fn enqueue_inbox_item_keyed(
     harness: &ServeTestHarness,
@@ -12067,10 +12272,11 @@ fn canceling_an_inbox_turn_withdraws_its_items_instead_of_rerunning_them() {
     );
 }
 
-/// A scheduled fire is announced by `schedule.fired` alone; the feed's terminal for it does not
-/// become a second delivery to an endpoint that asked for `turn.finished`.
+/// A fire is announced by `schedule.fired` as it is queued, naming the item that stands for it and
+/// saying nothing of a turn, and the turn opened on it posts its own `turn.finished`, as any turn
+/// the inbox opens does.
 #[test]
-fn a_scheduled_fire_posts_no_turn_webhook() {
+fn a_turn_opened_on_a_fire_posts_its_turn_webhook_beside_schedule_fired() {
     let (port, rx) = spawn_webhook_listener();
     let script = serde_json::json!([
         [
@@ -12092,7 +12298,8 @@ fn a_scheduled_fire_posts_no_turn_webhook() {
     ]);
     let config = format!(
         "\n[schedule]\npoll_interval = \"1s\"\n\n[[serve.webhooks]]\nurl = \
-         \"http://127.0.0.1:{port}/hook\"\nsecret = \"s\"\nevents = [\"turn.finished\"]\n"
+         \"http://127.0.0.1:{port}/hook\"\nsecret = \"s\"\nevents = [\"turn.finished\", \
+         \"schedule.fired\"]\n"
     );
     let harness = ServeTestHarness::spawn(&config, script);
     let id = start_streaming_session(&harness);
@@ -12112,12 +12319,35 @@ fn a_scheduled_fire_posts_no_turn_webhook() {
 
     let mut delivered = Vec::new();
     while let Ok(delivery) = rx.recv_timeout(Duration::from_secs(2)) {
-        delivered.push(delivery.event);
+        delivered.push(delivery);
     }
+    let mut events: Vec<&str> = delivered
+        .iter()
+        .map(|delivery| delivery.event.as_str())
+        .collect();
+    events.sort_unstable();
     assert_eq!(
-        delivered,
-        vec!["turn.finished".to_string()],
-        "the client's turn and nothing else"
+        events,
+        ["schedule.fired", "turn.finished", "turn.finished"],
+        "the client's turn, the fire, and the fire's turn"
+    );
+    let fired: serde_json::Value = serde_json::from_str(
+        &delivered
+            .iter()
+            .find(|delivery| delivery.event == "schedule.fired")
+            .expect("checked above")
+            .body,
+    )
+    .expect("json");
+    assert_eq!(fired["session_id"], id, "{fired}");
+    assert!(
+        fired["schedule_id"].is_string() && fired["item_id"].is_string(),
+        "{fired}"
+    );
+    assert_eq!(fired["occurrences"], 1, "{fired}");
+    assert!(
+        fired.get("replaces").is_none() && fired.get("status").is_none(),
+        "a new fire replaces nothing, and a fire is not a turn: {fired}"
     );
 }
 
@@ -12204,8 +12434,9 @@ fn a_followup_waits_for_the_running_turn_and_then_opens_one_of_its_own() {
     );
 }
 
-/// The feed carries the turns nobody asked for over HTTP. A scheduled fire opens with its source
-/// and ends with a terminal, like any other.
+/// The feed carries the turns nobody asked for over HTTP. A fire is said as it is queued, and the
+/// turn opened on it opens with its source, the item and its schedule, and ends with a terminal,
+/// like any other.
 #[test]
 fn a_scheduled_fire_appears_on_the_feed() {
     let script = serde_json::json!([
@@ -12245,7 +12476,19 @@ fn a_scheduled_fire_appears_on_the_feed() {
         .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
         .find(|data| data["source"] == "schedule")
         .unwrap_or_else(|| panic!("the fire opens on the feed with its source: {body}"));
-    assert!(fired["job_id"].is_string(), "{fired}");
+    let queued = sse_event_data(&body, "schedule.fired")
+        .unwrap_or_else(|| panic!("the fire is said on the feed as it is queued: {body}"));
+    assert!(queued["schedule_id"].is_string(), "{queued}");
+    assert_eq!(
+        fired["item_ids"],
+        serde_json::json!([queued["item_id"]]),
+        "{fired}"
+    );
+    assert_eq!(
+        fired["schedule_ids"],
+        serde_json::json!([queued["schedule_id"]]),
+        "{fired}"
+    );
     assert!(
         body.matches("event: turn.finished").count() >= 2,
         "the client's turn and the fire's both end on the feed: {body}"
@@ -12263,9 +12506,11 @@ fn a_scheduled_fire_appears_on_the_feed() {
     let started_at = of_the_fire("turn.started");
     let opening_at = of_the_fire("message.appended");
     let reply_at = of_the_fire("assistant_text.delta");
+    let queued_at = sse_position(&events, "schedule.fired", &body);
     assert!(
-        started_at < opening_at && opening_at < reply_at,
-        "started at {started_at}, opened at {opening_at}, replied at {reply_at}: {body}"
+        queued_at < started_at && started_at < opening_at && opening_at < reply_at,
+        "queued at {queued_at}, started at {started_at}, opened at {opening_at}, replied at \
+         {reply_at}: {body}"
     );
     let opening = &events[opening_at].1;
     assert_eq!(opening["role"], "user", "{opening}");
@@ -12275,13 +12520,13 @@ fn a_scheduled_fire_appears_on_the_feed() {
         .iter()
         .find(|block| block["type"] == "scheduled")
         .unwrap_or_else(|| panic!("typed as a fire: {opening}"));
-    assert_eq!(scheduled["job_id"], fired["job_id"], "{opening}");
+    assert_eq!(scheduled["schedule_id"], queued["schedule_id"], "{opening}");
     assert_eq!(scheduled["prompt"], "DELIVERED_PROMPT_MARKER", "{opening}");
     assert!(
         scheduled["text"]
             .as_str()
             .unwrap_or_default()
-            .starts_with("[Scheduled job "),
+            .starts_with("[Schedule "),
         "{opening}"
     );
     assert!(
@@ -12292,6 +12537,234 @@ fn a_scheduled_fire_appears_on_the_feed() {
                 .contains("DELIVERED_PROMPT_MARKER")),
         "the prompt rides no notice: {body}"
     );
+}
+
+/// The holder of the only turn slot, for a test that needs its fires to wait: a turn that sleeps
+/// until it is canceled.
+fn a_turn_that_holds_the_slot() -> serde_json::Value {
+    serde_json::json!([
+        { "type": "sleep", "ms": 120_000 },
+        { "type": "message_end", "stop_reason": "end_turn" }
+    ])
+}
+
+/// `schedule.fired` is said as each fire is queued, to the webhooks and on the session's feed,
+/// naming the item that stands for it now; an occurrence that joins a fire still waiting names the
+/// item it replaces. Canceling the schedule withdraws the fire it has waiting, and the feed that
+/// named the item says so.
+#[test]
+fn schedule_fired_names_the_waiting_fire_an_occurrence_replaces() {
+    let (port, rx) = spawn_webhook_listener();
+    let config = format!(
+        "max_concurrent_turns = 1\n\n[schedule]\npoll_interval = \"200ms\"\n\n\
+         [[serve.webhooks]]\nurl = \"http://127.0.0.1:{port}/hook\"\nsecret = \"s\"\n\
+         events = [\"schedule.fired\"]\n"
+    );
+    let harness = ServeTestHarness::spawn_with(
+        "",
+        &config,
+        serde_json::json!([a_turn_that_holds_the_slot()]),
+        "sk_test_token",
+        &["sessions:r", "sessions:w", "schedule:r", "schedule:w"],
+    );
+    let holder = create_session_id(&harness);
+    let id = start_streaming_session(&harness);
+    // Shorter than the feed's keep-alive, so a feed that never says the fire ends the read.
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(10));
+    let held = request_on_a_thread(
+        &harness,
+        reqwest::Method::POST,
+        &format!("/v1/sessions/{holder}/turns"),
+        serde_json::json!({ "message": "hold the slot", "stream": false }),
+    );
+    harness.wait_until_in_flight(&holder);
+    let created: serde_json::Value = harness
+        .request(reqwest::Method::POST, "/v1/schedules")
+        .json(&serde_json::json!({"session_id": id, "prompt": "WAITING_FIRE", "every": "1s"}))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let schedule_id = created["id"].as_str().expect("schedule id").to_string();
+
+    let delivery = |which: &str| -> serde_json::Value {
+        let delivery = rx
+            .recv_timeout(Duration::from_secs(20))
+            .unwrap_or_else(|_| panic!("the {which} fire is announced"));
+        assert_eq!(delivery.event, "schedule.fired");
+        serde_json::from_str(&delivery.body).expect("json")
+    };
+    let first = delivery("first");
+    let second = delivery("second");
+    assert_eq!(
+        (&first["schedule_id"], &first["session_id"]),
+        (&serde_json::json!(schedule_id), &serde_json::json!(id)),
+        "{first}"
+    );
+    assert_eq!(first["occurrences"], 1, "{first}");
+    assert!(
+        first.get("replaces").is_none(),
+        "a new fire replaces nothing: {first}"
+    );
+    assert_ne!(second["item_id"], first["item_id"], "{second}");
+    assert_eq!(
+        second["replaces"], first["item_id"],
+        "the occurrence joined the fire that waits, which takes a new id: {second}"
+    );
+    assert!(
+        second["occurrences"]
+            .as_u64()
+            .is_some_and(|count| count >= 2),
+        "{second}"
+    );
+
+    let (mut body, feed) = read_feed_until_open(feed, |text| {
+        text.matches("event: schedule.fired").count() >= 2
+    });
+    let on_the_feed: Vec<serde_json::Value> = sse_events(&body)
+        .into_iter()
+        .filter(|(event, _)| event == "schedule.fired")
+        .map(|(_, data)| data)
+        .take(2)
+        .collect();
+    assert_eq!(
+        on_the_feed
+            .iter()
+            .map(|data| (data["item_id"].clone(), data.get("replaces").cloned()))
+            .collect::<Vec<_>>(),
+        [
+            (first["item_id"].clone(), None),
+            (second["item_id"].clone(), Some(first["item_id"].clone())),
+        ],
+        "the feed says what the webhook does: {body}"
+    );
+
+    let canceled = harness
+        .request(
+            reqwest::Method::DELETE,
+            &format!("/v1/schedules/{schedule_id}"),
+        )
+        .send()
+        .expect("send");
+    assert_eq!(canceled.status(), 204);
+    let open: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/inbox"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert!(
+        open["items"].as_array().is_some_and(Vec::is_empty),
+        "the canceled schedule's waiting fire is withdrawn: {open}"
+    );
+    body.push_str(&read_feed_until(feed, |text| {
+        text.contains("event: inbox.withdrawn")
+    }));
+    let events = sse_events(&body);
+    let withdrawn_at = sse_position(&events, "inbox.withdrawn", &body);
+    let waiting = events[..withdrawn_at]
+        .iter()
+        .rev()
+        .find(|(event, _)| event == "schedule.fired")
+        .map(|(_, data)| data["item_id"].clone())
+        .expect("a fire was announced");
+    assert_eq!(
+        events[withdrawn_at].1["item_id"], waiting,
+        "the feed says the fire it last named was withdrawn: {body}"
+    );
+    harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{holder}/cancel"),
+        )
+        .send()
+        .expect("send");
+    held.join().expect("the held turn");
+}
+
+/// A fire and a message waiting together open one turn, and it is the inbox's: what it answers is
+/// not the schedule's alone.
+#[test]
+fn a_fire_and_a_message_waiting_together_open_one_inbox_turn() {
+    let harness = ServeTestHarness::spawn_with(
+        "",
+        "max_concurrent_turns = 1\n\n[schedule]\npoll_interval = \"200ms\"\n",
+        serde_json::json!([
+            a_turn_that_holds_the_slot(),
+            [
+                { "type": "text", "text": "BOTH_ANSWERED" },
+                { "type": "message_end", "stop_reason": "end_turn" }
+            ]
+        ]),
+        "sk_test_token",
+        &["sessions:r", "sessions:w", "schedule:r", "schedule:w"],
+    );
+    let holder = create_session_id(&harness);
+    let id = start_streaming_session(&harness);
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+    let held = request_on_a_thread(
+        &harness,
+        reqwest::Method::POST,
+        &format!("/v1/sessions/{holder}/turns"),
+        serde_json::json!({ "message": "hold the slot", "stream": false }),
+    );
+    harness.wait_until_in_flight(&holder);
+    let created = harness
+        .request(reqwest::Method::POST, "/v1/schedules")
+        .json(&serde_json::json!({"session_id": id, "prompt": "WAITING_FIRE", "at": "1s"}))
+        .send()
+        .expect("send");
+    assert_eq!(created.status(), 201);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let fire_id = loop {
+        let open: serde_json::Value = harness
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/inbox"))
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+        if let Some(fire) = open["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|item| item["schedule_id"].is_string())
+        {
+            break fire["id"].as_str().expect("item id").to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the fire was never queued: {open}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let message_id = enqueue_inbox_item(&harness, &id, "and this too");
+    harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{holder}/cancel"),
+        )
+        .send()
+        .expect("send");
+    held.join().expect("the held turn");
+
+    let body = read_feed_until(feed, |text| {
+        text.contains("BOTH_ANSWERED") && text.contains("event: turn.finished")
+    });
+    let started: Vec<serde_json::Value> = sse_events(&body)
+        .into_iter()
+        .filter(|(event, _)| event == "turn.started")
+        .map(|(_, data)| data)
+        .collect();
+    let [started] = started.as_slice() else {
+        panic!("one turn opens on both: {body}");
+    };
+    assert_eq!(started["source"], "inbox", "{started}");
+    assert_eq!(
+        started["item_ids"],
+        serde_json::json!([fire_id, message_id]),
+        "{started}"
+    );
+    assert!(started.get("schedule_ids").is_none(), "{started}");
 }
 
 /// A report that rides a client's turn is announced as a fire's is: the opening carries a
@@ -13271,7 +13744,7 @@ fn turn_finished_webhook_is_delivered_and_signed() {
     assert!(payload["turn_id"].is_string());
 }
 
-/// 429 says "not now", not "not ever". Several jobs sharing a cron minute deliver as a burst,
+/// 429 says "not now", not "not ever". Several schedules sharing a cron minute deliver as a burst,
 /// which is exactly when a receiver rate-limits; dropping those would lose the 9am report to the
 /// one rejection the receiver was explicitly asking Meka to wait out.
 #[test]
@@ -13840,11 +14313,11 @@ fn a_session_with_a_running_background_task_is_not_evicted() {
 
 /// A fire that fails keeps the outcome that was riding on it.
 ///
-/// A recurring job asks for `Withdraw`, because its next occurrence regenerates the
-/// prompt. That stops being true the moment an outcome joins it: the row is stamped delivered
-/// before the turn starts and is never handed out again, so withdrawing the message destroys the
-/// only copy. `retention_carrying` is what notices, and its three call sites were reachable only
-/// by a turn that actually fails -- which every other test of this path avoids.
+/// A turn the inbox opens asks for `Withdraw`, because a failed one offers its items again. That
+/// stops being true the moment an outcome joins it: the row is stamped delivered before the turn
+/// starts and is never handed out again, so withdrawing the message destroys the only copy.
+/// `retention_carrying` is what notices, and its three call sites were reachable only by a turn
+/// that actually fails -- which every other test of this path avoids.
 #[test]
 fn a_fire_that_fails_keeps_the_outcome_riding_on_it() {
     let script = serde_json::json!([
@@ -13896,12 +14369,12 @@ fn a_fire_that_fails_keeps_the_outcome_riding_on_it() {
     }
     assert!(!task_id.is_empty(), "no background task started");
 
-    let job = harness
-        .request(reqwest::Method::POST, "/v1/jobs")
+    let schedule = harness
+        .request(reqwest::Method::POST, "/v1/schedules")
         .json(&serde_json::json!({"session_id": id, "prompt": "PROBE_FAILING_FIRE", "every": "1s"}))
         .send()
         .expect("send");
-    assert_eq!(job.status(), 201, "the job must be created");
+    assert_eq!(schedule.status(), 201, "the schedule must be created");
 
     let cancel = harness
         .request(reqwest::Method::DELETE, &format!("/v1/tasks/{task_id}"))
@@ -13945,7 +14418,7 @@ fn a_fire_that_fails_keeps_the_outcome_riding_on_it() {
 /// Three doors claim from the undelivered pool and all three must announce, because the stamp is
 /// one-way: `list_unannounced_background_tasks` also requires `delivered_at IS NULL`, so a row a
 /// fire delivered can never be announced afterwards. Reachable without any race on a restart, where
-/// the load sweep retires a task the dead host left running and a due job claims it before the
+/// the load sweep retires a task the dead host left running and a due schedule claims it before the
 /// poller has ticked.
 #[test]
 fn a_scheduled_fire_announces_what_it_claims() {
@@ -13954,7 +14427,7 @@ fn a_scheduled_fire_announces_what_it_claims() {
     // scheduled fire revives it through `ensure_session_loaded`, and is then the only thing that
     // can announce. A short idle timeout plus a poll interval long enough that the first tick
     // arrives after the eviction is what arranges that -- the same shape as a restart, where the
-    // load sweep retires the task and a due job claims it before the poller has ever ticked.
+    // load sweep retires the task and a due schedule claims it before the poller has ever ticked.
     let config = format!(
         "idle_timeout = \"1s\"\ngc_scan_interval = \"200ms\"\n\
          \n[background]\nenabled = true\n\n[schedule]\npoll_interval = \"10s\"\n\n\
@@ -13972,7 +14445,7 @@ fn a_scheduled_fire_announces_what_it_claims() {
             { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "type": "text", "text": "ran the job" },
+            { "type": "text", "text": "ran the schedule" },
             { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
@@ -14011,12 +14484,12 @@ fn a_scheduled_fire_announces_what_it_claims() {
 
     // Created before the cancellation, so nothing has to touch the session afterwards: an HTTP
     // request would make it resident again and hand the poller its chance.
-    let job = harness
-        .request(reqwest::Method::POST, "/v1/jobs")
+    let schedule = harness
+        .request(reqwest::Method::POST, "/v1/schedules")
         .json(&serde_json::json!({"session_id": id, "prompt": "PROBE_ANNOUNCE", "every": "1s"}))
         .send()
         .expect("send");
-    assert_eq!(job.status(), 201, "the job must be created");
+    assert_eq!(schedule.status(), 201, "the schedule must be created");
 
     let cancel = harness
         .request(reqwest::Method::DELETE, &format!("/v1/tasks/{task_id}"))
@@ -14034,7 +14507,7 @@ fn a_scheduled_fire_announces_what_it_claims() {
 
 /// A scheduled fire carries a cancellation that has been waiting for a turn.
 ///
-/// The third door. A user turn and the poller's own report were both folded; a scheduled job runs a
+/// The third door. A user turn and the poller's own report were both folded; a schedule runs a
 /// turn too, and a session whose only traffic is scheduled work would otherwise never learn its
 /// task was canceled -- which is the promise `TaskStatus::wakes_a_host` makes when it declines to
 /// wake one. `meka serve` and ACP both had the gap; this pins the serve half.
@@ -14051,7 +14524,7 @@ fn a_scheduled_fire_carries_a_cancellation_that_was_waiting() {
             { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "type": "text", "text": "ran the job" },
+            { "type": "text", "text": "ran the schedule" },
             { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
@@ -14095,16 +14568,16 @@ fn a_scheduled_fire_carries_a_cancellation_that_was_waiting() {
         .expect("send");
     assert_eq!(cancel.status(), 204, "the task must cancel");
 
-    // The only turn from here on is the job's, so anything the model is told rides its prompt.
-    let job = harness
+    // The only turn from here on is the schedule's, so anything the model is told rides its prompt.
+    let schedule = harness
         .request(
             reqwest::Method::POST,
-            "/v1/jobs",
+            "/v1/schedules",
         )
         .json(&serde_json::json!({"session_id": id, "prompt": "PROBE_SCHEDULED_PROMPT", "every": "1s"}))
         .send()
         .expect("send");
-    assert_eq!(job.status(), 201, "the job must be created");
+    assert_eq!(schedule.status(), 201, "the schedule must be created");
 
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -14130,13 +14603,13 @@ fn a_scheduled_fire_carries_a_cancellation_that_was_waiting() {
             let text = message_text(&fired);
             assert!(
                 text.contains("was canceled"),
-                "the job's prompt must carry the outcome that was waiting for a turn: {text}"
+                "the schedule's prompt must carry the outcome that was waiting for a turn: {text}"
             );
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "the scheduled job never fired: {body}"
+            "the schedule never fired: {body}"
         );
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -14293,60 +14766,6 @@ fn task_webhook_payload_omits_the_command_line() {
         }
         Err(_) => panic!("a task.finished delivery must arrive"),
     }
-}
-
-/// A scheduled fire whose session names a profile this process cannot resolve is reported as
-/// `not_run`, as a fire whose session could not be opened is: a subscriber sent looking for a
-/// fault in a turn would find no turn, and the fire is tried again when its lease expires.
-#[test]
-fn a_fire_on_a_session_whose_profile_does_not_resolve_is_reported_as_not_run() {
-    let (port, rx) = spawn_webhook_listener();
-    let config = format!(
-        "\n[schedule]\npoll_interval = \"1s\"\n\n[[serve.webhooks]]\nurl = \
-         \"http://127.0.0.1:{port}/hook\"\nsecret = \"s\"\nevents = [\"schedule.fired\"]\n"
-    );
-    let script = serde_json::json!([
-        [
-            { "type": "tool_use_start", "id": "tu_1", "name": "schedule_create" },
-            { "type": "tool_use_end", "input": {
-                "prompt": "NEVER_DELIVERED",
-                "at": "2s"
-            }},
-            { "type": "message_end", "stop_reason": "tool_use" }
-        ],
-        [
-            { "type": "text", "text": "scheduled it" },
-            { "type": "message_end", "stop_reason": "end_turn" }
-        ],
-        [
-            { "type": "text", "text": "a reply the fire must never reach" },
-            { "type": "message_end", "stop_reason": "end_turn" }
-        ]
-    ]);
-    let harness = ServeTestHarness::spawn(&config, script);
-    let id = create_session_id(&harness);
-    let scheduled = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turns"))
-        .json(&serde_json::json!({"message": "remind me in two seconds"}))
-        .send()
-        .expect("send");
-    assert_eq!(scheduled.status(), 200);
-
-    let store = rusqlite::Connection::open(harness.install.data_dir().join("meka.db"))
-        .expect("open the store");
-    let moved = store
-        .execute("UPDATE sessions SET profile = 'retired' WHERE id = ?1", [
-            &id,
-        ])
-        .expect("repin the session");
-    assert_eq!(moved, 1, "the repin matched no row");
-
-    let delivery = rx
-        .recv_timeout(Duration::from_secs(20))
-        .expect("the fire is reported");
-    assert_eq!(delivery.event, "schedule.fired");
-    let payload: serde_json::Value = serde_json::from_str(&delivery.body).expect("json body");
-    assert_eq!(payload["status"], "not_run", "{}", delivery.body);
 }
 
 /// An endpoint that subscribed to something else must not be called at all, or the `events` list
@@ -17400,69 +17819,6 @@ fn a_relayed_upstream_body_is_size_bounded() {
 /// copy taken mid-turn ends on a message nothing answered. The probe lives in the store's one fork
 /// door, so the HTTP door gets it without remembering to ask. A second descriptor from this test
 /// stands in for the other process: `flock` conflicts across descriptors either way.
-/// A due item on a session another process holds is put off, not asked about in a loop. The
-/// sweeper wakes itself whenever due items remain after a pass, so a driver that returned with
-/// them still due would be spawned again at once, probe the lock, and return, for as long as the
-/// holder kept the session: a screen open beside `serve`, after a restart left items pending.
-#[test]
-fn an_item_on_a_session_another_process_holds_waits_instead_of_spinning() {
-    let harness = ServeTestHarness::spawn_with(
-        "[schedule]\npoll_interval = \"1s\"\n",
-        "idle_timeout = \"1s\"\ngc_scan_interval = \"1s\"\n",
-        mock_simple_turn(),
-        "sk_test_token",
-        &["sessions:r", "sessions:w"],
-    );
-    let id = create_session_id(&harness);
-    harness.wait_until_evicted(&id);
-
-    let lock_path = harness
-        .install
-        .data_dir()
-        .join("locks")
-        .join(format!("{id}.lock"));
-    let held = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .unwrap_or_else(|error| panic!("open {}: {error}", lock_path.display()));
-    held.try_lock()
-        .expect("the evicted session's lock is free for this test to take");
-
-    // Written to the store directly: the door refuses a held session, and the case is an item
-    // that was already pending when the holder took the session.
-    let store = rusqlite::Connection::open(harness.install.database()).expect("open the store");
-    let item_id = uuid::Uuid::new_v4().to_string();
-    store
-        .execute(
-            "INSERT INTO inbox_items (id, session_id, class, source, body, created_at) \
-             VALUES (?1, ?2, 'followup', 'test', 'hello', ?3)",
-            rusqlite::params![item_id, id, chrono::Utc::now().to_rfc3339()],
-        )
-        .expect("insert the item");
-
-    std::thread::sleep(Duration::from_secs(3));
-    let (attempts, not_before): (i64, Option<String>) = store
-        .query_row(
-            "SELECT attempts, not_before FROM inbox_items WHERE id = ?1",
-            [&item_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("read the item");
-    assert_eq!(
-        attempts, 1,
-        "one pass found the session held and put the item off once; zero means the driver left \
-         it due for the sweeper to retry at once, more means it spun"
-    );
-    assert!(
-        not_before.is_some(),
-        "the item carries the time it will be asked about again"
-    );
-    drop(held);
-}
-
 #[test]
 fn fork_refuses_a_source_another_process_holds() {
     let harness = ServeTestHarness::spawn_with(

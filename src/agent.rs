@@ -551,7 +551,7 @@ impl Agent {
         let options = AgentOptions {
             sandboxed_shell: parent_options.sandboxed_shell,
             one_shot: parent_options.one_shot,
-            // A sub-agent has no `[Scheduled]` section: the jobs belong to the parent's
+            // A sub-agent has no `[Scheduled]` section: the schedules belong to the parent's
             // session, and `new_subagent` gives it a session of its own.
             gate_tools: None,
             // Deliberately not inherited. Instructions are installation-wide and describe the

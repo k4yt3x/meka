@@ -240,8 +240,8 @@ pub(crate) async fn run_acp(
         transport_dead,
     ));
 
-    // Fires jobs for whichever sessions the editor currently has open; see `acp::schedule`. Aborted
-    // on the way out so a scheduled turn cannot outlive the connection it would report to.
+    // Fires schedules for whichever sessions the editor currently has open; see `acp::schedule`.
+    // Aborted on the way out so a scheduled turn cannot outlive the connection it would report to.
     let scheduler_handle = schedule::spawn(Arc::clone(&state));
     let _scheduler_guard = AbortOnDrop(scheduler_handle);
 
@@ -249,6 +249,10 @@ pub(crate) async fn run_acp(
     // terms and with the same abort-on-drop lifetime.
     let background_handle = schedule::spawn_background_poller(Arc::clone(&state));
     let _background_guard = AbortOnDrop(background_handle);
+
+    // Opens a turn for whichever open session has an item waiting in its inbox, on the same terms.
+    let inbox_handle = schedule::spawn_inbox_driver(Arc::clone(&state));
+    let _inbox_guard = AbortOnDrop(inbox_handle);
 
     // Releases sessions the editor opened and never closed; see `spawn_idle_session_sweep`.
     let idle_handle = spawn_idle_session_sweep(Arc::clone(&state));
@@ -429,6 +433,7 @@ pub(crate) async fn run_acp(
                         crate::host::Opening::Fresh,
                         frontend::EditorThread::Empty,
                         session_lock,
+                        Arc::clone(&state.inbox_wake),
                     )
                     .await
                     {

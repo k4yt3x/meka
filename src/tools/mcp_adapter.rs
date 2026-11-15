@@ -184,7 +184,7 @@ pub(crate) async fn install_on_worker_registry(
     }
 }
 
-/// The registry form of the tool a scheduled job's gate names, or `None` when no connected server
+/// The registry form of the tool a schedule's gate names, or `None` when no connected server
 /// offers it.
 pub(crate) async fn tool_by_name(manager: &McpClientManager, name: &str) -> Option<Arc<dyn Tool>> {
     manager
@@ -309,7 +309,7 @@ mod tests {
 
     /// A server's structured output reaches callers as data, not only as rendered prose.
     ///
-    /// The fenced block is what the model reads and is presentational, so a scheduled job's gate
+    /// The fenced block is what the model reads and is presentational, so a schedule's gate
     /// predicate has to take the field: parsing the block back out would make a format string a
     /// wire format between two parts of Meka. Both halves are asserted so neither can quietly
     /// stop happening.

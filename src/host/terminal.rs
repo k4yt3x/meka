@@ -32,10 +32,11 @@ pub(crate) struct InterruptRelay {
     /// collection between them. Waiters listen to this instead, so the ladder stays the only
     /// reader of the signal.
     pub(crate) pressed: tokio::sync::Notify,
-    /// Set when a hangup or a termination arrives, ahead of the turn being stopped, and when a
-    /// SIGINT is the ladder's last press. The host leaves only once the stopped background tasks
-    /// have had their moment, and the screen's host lets no turn run in between: it refuses what
-    /// arrives after, and a turn admitted before is canceled as it opens.
+    /// Set when a hangup or a termination arrives, or the screen finds its terminal gone, ahead of
+    /// the turn being stopped, and when a SIGINT is the ladder's last press. The host leaves only
+    /// once the stopped background tasks have had their moment, and the screen's host lets no turn
+    /// run in between: it refuses what arrives after, and a turn admitted before is canceled as it
+    /// opens.
     told_to_leave: std::sync::atomic::AtomicBool,
 }
 pub(crate) static INTERRUPT_RELAY: std::sync::LazyLock<InterruptRelay> =
@@ -46,9 +47,17 @@ pub(crate) static INTERRUPT_RELAY: std::sync::LazyLock<InterruptRelay> =
         told_to_leave: std::sync::atomic::AtomicBool::new(false),
     });
 impl InterruptRelay {
-    /// Whether a hangup or a termination has arrived, or a SIGINT that is the ladder's last press.
+    /// Whether a hangup or a termination has arrived, the screen has found its terminal gone, or a
+    /// SIGINT has been the ladder's last press.
     pub(crate) fn is_told_to_leave(&self) -> bool {
         self.told_to_leave.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Mark the process as leaving, as a hangup does, for the screen that finds its terminal gone
+    /// with no signal to say so.
+    pub(crate) fn tell_to_leave(&self) {
+        self.told_to_leave
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Fire the live turn's token, if any, and count the press on the ladder.

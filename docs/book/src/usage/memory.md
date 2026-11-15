@@ -165,7 +165,7 @@ Results carry enough to act on without a follow-up read: name, priority, age, re
 | `unverified` | Memories not verified within this long: `90d`, `6months`. |
 | `expired` | Memories whose expiry has passed. |
 
-With `queries` a filter narrows the search. Without them it is a listing, in index order, most important first, and the result says which: "3 memories referencing 'deploy-host', most important first". A scheduled job can run one (`memory_search` with `unverified: "90d"`, then `memory_read` and `memory_write` with `verified: true` on what still holds) and keep the store honest without anyone remembering to.
+With `queries` a filter narrows the search. Without them it is a listing, in index order, most important first, and the result says which: "3 memories referencing 'deploy-host', most important first". A schedule can run one (`memory_search` with `unverified: "90d"`, then `memory_read` and `memory_write` with `verified: true` on what still holds) and keep the store honest without anyone remembering to.
 
 ## References and backlinks
 

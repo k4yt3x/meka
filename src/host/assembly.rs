@@ -497,7 +497,7 @@ pub(crate) fn warn_on_stale_tool_config(
 /// work retired, a row repinned -- and the builders are the backstop that catches a door nobody
 /// thought of. A rule placed only in the builders arrives too late to prevent a write; a rule
 /// placed only at the doors is one the next door forgets, which is how this came to be enforced
-/// for scheduled jobs alone.
+/// for schedules alone.
 ///
 /// Nothing about a previous release is encoded here: a sub-agent session must not be driven this
 /// way on a store Meka created a minute ago, and the check reads the same column either way.
@@ -697,8 +697,8 @@ pub(crate) async fn build_shared_deps(
     warn_on_stale_tool_config(&config, &builtin_filter);
 
     // One dispatcher for the whole process, for the same reason the MCP manager is process-wide: a
-    // gate's tool probe is answered by the process that picks the job up, not by the session that
-    // wrote it.
+    // gate's tool probe is answered by the process that picks the schedule up, not by the session
+    // that wrote it.
     let gate_tools: Option<Arc<dyn crate::schedule::GateTools>> =
         Some(Arc::new(crate::tools::GateToolset::new(
             mcp_manager.clone(),
@@ -1342,7 +1342,7 @@ pub(crate) async fn record_session_cwd(
 /// A session's directory is its own, so a resume reopens it rather than adopting whatever shell
 /// started the process. At `workspace` that directory is also the writable boundary, and taking the
 /// shell's instead would silently widen it: resume a project session from `$HOME` and the whole
-/// home directory becomes writable, with a scheduled job able to fire before the user can react.
+/// home directory becomes writable, with a schedule able to fire before the user can react.
 /// `meka serve` reads the column the same way (`crate::host::http::reattach`).
 ///
 /// The launch directory is the fallback for two cases, both of which have to keep the run going:

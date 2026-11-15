@@ -12,12 +12,92 @@ and `-shm` companions with the file.
 
 ## 0.94 to 0.95
 
-Nothing in `config.toml` changes shape. The store moves forward on its first open, behind the
-automatic backup, so that a turn or a compaction that fails because a login must be redone records
-the refusal itself, which each surface then says with its own remedy; nothing 0.94 wrote converts.
-0.94 refuses a store 0.95 has opened; downgrading means restoring the backup the upgrade took.
-Session archives are `format_version` 29; a 0.94 archive (28) is brought forward as it is read,
-and 0.94 refuses a 29.
+Two keys of `config.toml` change: `[schedule].max_jobs` is `max_schedules` and
+`[schedule].max_consecutive_fires` is gone, and Meka refuses a file that still sets either, naming
+the key's line. The store moves forward on its first open, behind the automatic backup: a turn or
+a compaction that fails because a login must be redone records the refusal itself, which each
+surface then says with its own remedy; a scheduled job becomes a schedule, in its own table and in
+the `scheduled` blocks of every history, which name it by `schedule_id`; and an inbox item can be
+a schedule's fire. 0.94 refuses a store 0.95 has opened; downgrading means restoring the backup
+the upgrade took. Session archives are `format_version` 30; a 0.94 archive (28) is brought forward
+as it is read, and 0.94 refuses a 30.
+
+**A scheduled job is a schedule.** Meka called what `schedule_create` makes a job in some places
+and a schedule in others. It is a schedule everywhere now, and the `at`, `every` or `cron` that
+says when it fires is its timing.
+
+- Over HTTP, `/v1/jobs` is `/v1/schedules` and `DELETE /v1/schedules/{schedule_id}` cancels one;
+  the old routes answer `404`. A listing is `{"schedules": [...]}`, and each schedule's `schedule`
+  member is `timing`. Creating one takes the body it took.
+- `job_id` is `schedule_id` wherever it appears: in the `schedule.fired` event, in the `scheduled`
+  block of a history and of `message.appended`, and among a Problem Detail's members.
+- `meka schedule list --format json` prints `schedules`, each with its `timing`; the table's
+  column is "Timing", and `meka schedule show` prints a `timing:` line.
+- In `config.toml`, rename `[schedule].max_jobs` to `max_schedules`.
+
+**A schedule's fire reaches its session through the inbox.** A due schedule used to wait until its
+session was free, then run its gate and a turn of its own. Now a schedule fires when it is due,
+whatever its session is doing: Meka runs its gate and writes the fire into the session's
+[inbox](../usage/http-api.md#the-inbox) as a `steer` item. A running turn reads it at its next
+pause, behind the tool results of the round that ends there, and an idle session gets a turn for
+it at once, under `meka serve`, in an editor and on the screen. A gate's command can therefore run
+while a turn's own commands do.
+
+- **`schedule.fired` says a fire was queued.** It is sent when the fire enters the inbox, to the
+  webhooks and now on the session's feed, no longer after a turn, and it has no `status`. Its
+  members are `schedule_id`, `session_id`, `item_id` (the inbox item that stands for the fire),
+  `occurrences`, and `replaces` when the occurrence joined a fire that was still waiting; the
+  feed's copy has `turn_id` too while a turn runs. What
+  becomes of a fire is said about its item, on the feed: `inbox.delivered` when the model has read
+  it, `inbox.deferred` or `inbox.failed` when a turn on it failed, `inbox.withdrawn` when it was
+  taken back; the first three are webhook events too. A turn opened on a fire posts
+  `turn.finished` or `turn.failed` to the webhooks, as a turn opened on any inbox item does. A
+  fire whose session cannot be brought up, which used to post `status: "not_run"`, posts nothing
+  of its own now: it waits as an item, put off five minutes at a time, and the server's log says
+  why.
+- **`turn.started` names what the turn opened on.** A turn opened on fires alone has
+  `source: "schedule"` and carries `item_ids` and `schedule_ids` where it carried one `job_id`. A
+  fire and a message that waited together open one turn, with `source: "inbox"`. The ids are the
+  whole opening: an item that arrives while a turn the inbox opened is starting no longer rides
+  that opening, and is read at the turn's next pause, or after its end for a `followup`. A fire
+  an occurrence joined while the turn was starting is opened on under its new id.
+- **A schedule has one waiting fire.** An occurrence that comes due while the last fire is still
+  unread joins it: the inbox item takes a new id, which `schedule.fired` gives as `item_id` beside
+  the old one as `replaces`, a `DELETE` of the old id answers `404`, and `occurrences` counts what
+  the fire stands for, which the model is told when it reads it.
+- **A fire whose turn fails is retried as an inbox item is.** When waiting can change the answer
+  (the upstream unavailable, a quota, a required MCP server not ready) the fire is tried again
+  after 10 seconds, then twice that per attempt, for an hour from when it was first queued, or for
+  [`[serve].inbox_retry_ceiling`](../configuration/config-file.md#serveinbox_retry_ceiling) under
+  `meka serve`; any other failure gives it up at once. The screen and an editor say when the next
+  attempt is, and when a fire is given up. A fire whose turn somebody stops before the model has
+  answered, with Esc or `/exit` on the screen, an editor's cancel or `POST /cancel`, is withdrawn,
+  and one whose turn is cut short by then because Meka was told to leave, by a signal, an editor
+  going away or the screen's terminal going away, waits in the inbox and is read at the next
+  start. Once the model has answered, the fire is read and is not run again, whatever ends its
+  turn: `meka serve` used to run a fire again after a restart however far its turn had got, and no
+  longer does.
+- **A host that is killed keeps a waiting fire, and not one whose turn had opened.** The claim on
+  an occurrence ends when its fire is queued, so `claim_lease` no longer covers the turn. A fire
+  still waiting when a host is killed (a crash, the kernel, a power cut) is read by the next host
+  to hold the session. One whose turn had already written its opening stays in the conversation
+  and opens no turn again: the model reads it at the session's next turn, whatever opens that.
+  Before, the occurrence fired again once its lease ran out, an hour later by default.
+- **Canceling a schedule withdraws its unread fire.** Every fire of it the model has not read
+  goes with the schedule and is not offered again, and one the model has read stays. The feed of
+  the server that canceled it, by `DELETE /v1/schedules/{schedule_id}` or the model's
+  `schedule_cancel`, says `inbox.withdrawn`; a cancel made by another process is not on that
+  feed. `inbox.withdrawn` is final for a fire that was still waiting. One whose text was already
+  in the conversation cannot be unsaid: the next request a provider accepts carries it, be it
+  the one already on its way or a later turn's, and `inbox.delivered` then names the fire after
+  its `inbox.withdrawn`. A one-shot schedule leaves the list as soon as its fire is queued, so
+  that fire is taken back as an item, with `DELETE /v1/sessions/{id}/inbox/{item_id}`.
+- **`[schedule].max_consecutive_fires` is gone.** It bounded how many of a session's fires one
+  sweep ran turns for, and a sweep runs no turn now. Delete the key. `claim_lease` stays: it is
+  how long a host that stopped while running a gate keeps the occurrence from the others.
+- **`meka serve` beside a screen or an editor.** A server leaves a session another process holds
+  to that process: it fires none of the session's schedules, since the holder does, and leaves its
+  inbox items for the holder's turns, counting no attempt against them.
 
 **An import takes its level and approvals switch from this installation.**
 `meka session import` and `POST /v1/sessions/import` used to write the permission level and the
@@ -34,7 +114,7 @@ with `/permission` on the screen, `meka -r <id> --permission <level>`, or
 **A gate on an MCP tool reads repeated structured content once.** An MCP tool that returns
 `structuredContent` usually returns the same JSON as text too, as the MCP specification asks.
 Meka used to append the structured content to that text as a second, pretty-printed copy under a
-`**Structured content:**` heading, and a scheduled job's tool gate judged the whole. Now such a
+`**Structured content:**` heading, and a schedule's tool gate judged the whole. Now such a
 result carries it once, as the server's own text. A `"changed"` gate on such a tool fires once at
 its first check after the upgrade, because the text it compares has changed; a gate judges the
 first 8 KiB of a result, so one whose own text fills that is unaffected. A `matches` gate

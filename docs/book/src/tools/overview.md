@@ -48,9 +48,9 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`conversation_read`](./overview.md#conversation_search--conversation_read) | Read | Read conversation turns by index |
 | [`session_list`](./overview.md#session_list--session_search) | Read | List the sessions the agent may read |
 | [`session_search`](./overview.md#session_list--session_search) | Read | Find a readable session by what was said in it |
-| [`schedule_create`](../usage/scheduling.md) | Read | Schedule a future turn for this session |
-| [`schedule_list`](../usage/scheduling.md) | Read | List this session's scheduled jobs |
-| [`schedule_cancel`](../usage/scheduling.md) | Read | Cancel a scheduled job |
+| [`schedule_create`](../usage/scheduling.md) | Read | Schedule a prompt for this session |
+| [`schedule_list`](../usage/scheduling.md) | Read | List this session's schedules |
+| [`schedule_cancel`](../usage/scheduling.md) | Read | Cancel a schedule |
 | [`task_list`](../usage/background.md) | Read | List this session's background tasks |
 | [`task_cancel`](../usage/background.md) | Read | Stop a running background task |
 | [`tool_load`](./overview.md#deferred-tools) | Read | Fetch the full schema of a deferred tool, one name or up to ten |

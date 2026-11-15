@@ -1,6 +1,6 @@
-//! The scheduler: the sweep that finds due jobs, claims each occurrence against every other
-//! process on the same store, evaluates its gate and hands a [`Wakeup`] to the host that fires it.
-//! What a job *is* lives in [`crate::schedule`]; this is what *runs* one, and it is the one place
+//! The scheduler: the sweep that finds due schedules, claims each occurrence against every other
+//! process on the same store, evaluates its gate and queues the fire in its session's inbox. What
+//! a schedule *is* lives in [`crate::schedule`]; this is what *runs* one, and it is the one place
 //! that knows the store's claim protocol.
 
 use std::time::Duration;
@@ -12,110 +12,18 @@ use humantime_serde::re::humantime;
 
 use crate::{
     schedule::*,
-    store::schedule::{ClaimClosed, ScheduleStore},
+    store::{
+        inbox::{Fire, QueuedFire},
+        schedule::{ClaimClosed, ScheduleStore},
+    },
 };
 
-/// A due job, with everything the turn needs to know about why it is running now.
-pub(crate) struct Wakeup {
-    pub(crate) job: ScheduledJob,
-    /// The gate's stdout, when the job has one. Carried so the model does not re-run the check the
-    /// gate just ran.
-    pub(crate) gate_output: Option<String>,
-    /// How far past its due time this fire is. Near zero in normal operation; large after
-    /// downtime.
-    pub(crate) late_by: chrono::Duration,
-    /// Occurrences this fire stands in for, beyond the one being delivered. Non-zero only after
-    /// downtime, since the scheduler collapses a backlog into a single turn.
-    pub(crate) coalesced: u32,
-}
-impl Wakeup {
-    /// Whether the fire is late enough to say so, to the model and on the screen alike. A tick's
-    /// worth of delay is normal, and saying so every time would train the model to ignore the line
-    /// that matters after an outage.
-    pub(crate) fn is_materially_late(&self) -> bool {
-        self.late_by > chrono::Duration::minutes(1)
-    }
-
-    /// The lateness the fire's announcement carries: `None` when a tick explains it.
-    pub(crate) fn lateness(&self) -> Option<crate::frontend::FireLateness> {
-        self.is_materially_late()
-            .then_some(crate::frontend::FireLateness {
-                late_by: self.late_by,
-                coalesced: self.coalesced,
-            })
-    }
-
-    /// Render the user-turn text delivered to the model.
-    ///
-    /// The header is not decoration: without it the model reads a bare instruction as if a human
-    /// had just typed it and answers conversationally, into an empty terminal at 03:00, to nobody.
-    pub(crate) fn render_prompt(&self) -> String {
-        let mut rendered = format!(
-            "[Scheduled job {} fired {}]",
-            self.job.short_id(),
-            crate::text::format_timestamp(Utc::now(), crate::text::Precision::Minutes)
-        );
-        if self.is_materially_late() {
-            rendered.push_str(&format!(
-                "\n[Late by {}; this fire replaces {} missed occurrence(s)]",
-                format_late(self.late_by),
-                self.coalesced + 1
-            ));
-        }
-        rendered.push_str("\n\n");
-        rendered.push_str(&self.job.prompt);
-        if let Some(output) = &self.gate_output {
-            // What the gate's command or tool printed, a fetched page as readily as a status
-            // word: sanitized as a background report's output is, and quoted, so no line of it
-            // can pass for this block's header or for a prompt after it.
-            rendered.push_str("\n\n[Gate output]\n");
-            rendered.push_str(&crate::text::quote_lines(&crate::text::sanitize_text(
-                output,
-            )));
-        }
-        rendered
-    }
-}
-/// Human-readable lateness, for the header above.
+/// Human-readable lateness, for a fire's header and its stage direction.
 pub(crate) fn format_late(late_by: chrono::Duration) -> String {
     late_by
         .to_std()
         .map(|std| humantime::format_duration(Duration::from_secs(std.as_secs())).to_string())
         .unwrap_or_else(|_| "an unknown interval".to_string())
-}
-/// What a host did with a job handed to it.
-///
-/// Exists because deciding to fire and being *able* to fire are separate questions, and the gap
-/// between them is where an occurrence can be lost. `prepare` leases the occurrence before handing
-/// the wakeup over, so the row is untouched while the host works; a host that turns out to be
-/// unable to run the job says so, and the lease is released rather than completed.
-///
-/// Crash protection is [`MAX_CLAIM_ATTEMPTS`]'s job, not this variant's, so this means only what it
-/// says.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum FireOutcome {
-    /// The turn ran, or failed in a way that re-running would not fix.
-    Ran,
-    /// This host could not take the job now and the occurrence is restored rather than burnt. The
-    /// concrete cases are `meka serve` finding the session's file lock held by a screen, which has
-    /// its own watcher and will run the job itself, and a process at its concurrent-turn cap,
-    /// which takes the job on a later sweep.
-    Deferred,
-    /// This host owns the job and could not run it, for the cause it carries, and trying again
-    /// immediately would not help.
-    ///
-    /// The claim is left to expire rather than released or completed, which is the treatment a
-    /// panicking turn already gets and for the same reason: releasing puts `next_fire_at` back in
-    /// the past, so the occurrence comes due on the very next sweep and a gated job re-runs its
-    /// probe every `poll_interval`; completing spends the occurrence, which for a one-shot deletes
-    /// the row and loses the job outright. Waiting out `claim_lease` retries at a cadence a blip
-    /// survives. A cause that is the installation's takes back the attempt the claim counted, so
-    /// it never parks the job, which would outlast the fix; see [`Unrunnable::standing_reason`].
-    ///
-    /// The concrete case is a session whose recorded profile no longer resolves: running
-    /// the turn would bill an account the row does not name, and the cause may be a configuration
-    /// error the user has yet to fix or a transient `SQLITE_BUSY` from another Meka process.
-    Unrunnable(Unrunnable),
 }
 /// What this process knows about a session's level that its row may not.
 ///
@@ -167,49 +75,42 @@ impl ResidentPermissions for ResidentAt {
     }
 }
 
-/// Which jobs a scheduler instance is responsible for.
+/// Which schedules a scheduler instance is responsible for.
 ///
 /// Every host answers a predicate rather than claiming a static set, because none of them can
-/// actually take every job: `meka serve` can revive any session but not one another process has
-/// locked, the screen owns exactly the conversation it has open, and ACP owns whatever the editor
-/// currently has open.
+/// actually take every schedule: `meka serve` can revive any session but not one another process
+/// has locked, the screen owns exactly the conversation it has open, and ACP owns whatever the
+/// editor currently has open.
 ///
-/// Asked here rather than letting a host decline afterwards: `prepare` evaluates a job's gate
-/// before the host is offered the wakeup, so a scope that admitted everything would run every gated
-/// job's probe (a shell command, or a call to someone else's server) on every tick for sessions it
-/// could never serve.
+/// Asked here rather than letting a host decline afterwards: `prepare` evaluates a schedule's gate
+/// before its fire is queued, so a scope that admitted everything would run every gated schedule's
+/// probe (a shell command, or a call to someone else's server) on every tick for sessions it could
+/// never serve.
 #[derive(Clone)]
 pub(crate) enum SchedulerScope {
-    /// Only jobs belonging to this session. The screen, which has exactly one conversation open.
-    OneSession(uuid::Uuid),
-    /// Jobs the predicate accepts, re-asked every sweep, so a host whose set of runnable jobs moves
-    /// under it (ACP's open editors, serve's session locks) is never working from a snapshot.
-    ///
-    /// Takes the whole job rather than its session id because the answer is not the only thing a
-    /// host produces: `meka serve` names the job it is declining when the lock cannot be probed at
-    /// all, and a predicate handed a bare uuid could not say which one.
-    Jobs(std::sync::Arc<dyn Fn(&ScheduledJob) -> bool + Send + Sync>),
+    /// Schedules the predicate accepts, re-asked every sweep, so a host whose set of sessions
+    /// moves under it (the screen's `/resume`, ACP's open editors, serve's session locks) is never
+    /// working from a snapshot.
+    Schedules(std::sync::Arc<dyn Fn(&Schedule) -> bool + Send + Sync>),
 }
 impl std::fmt::Debug for SchedulerScope {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::OneSession(id) => write!(formatter, "OneSession({id})"),
-            Self::Jobs(_) => formatter.write_str("Jobs(<predicate>)"),
+            Self::Schedules(_) => formatter.write_str("Schedules(<predicate>)"),
         }
     }
 }
 impl SchedulerScope {
-    /// Every job in the database, whoever it belongs to. Only the tests want this: a real host
-    /// always has some job it cannot take.
+    /// Every schedule in the database, whoever it belongs to. Only the tests want this: a real host
+    /// always has some schedule it cannot take.
     #[cfg(test)]
-    pub(crate) fn every_job() -> Self {
-        Self::Jobs(std::sync::Arc::new(|_| true))
+    pub(crate) fn every_schedule() -> Self {
+        Self::Schedules(std::sync::Arc::new(|_| true))
     }
 
-    pub(crate) fn covers(&self, job: &ScheduledJob) -> bool {
+    pub(crate) fn covers(&self, schedule: &Schedule) -> bool {
         match self {
-            Self::OneSession(id) => job.session_id == *id,
-            Self::Jobs(predicate) => predicate(job),
+            Self::Schedules(predicate) => predicate(schedule),
         }
     }
 }
@@ -217,52 +118,50 @@ impl SchedulerScope {
 /// runs until then.
 ///
 /// Modeled on [`crate::host::http::gc::spawn`]: a tokio interval that wakes, queries, and hands
-/// work to a host-supplied callback. Fires are awaited one at a time rather than spawned, so a
-/// process with several due jobs runs one turn at a time. That bounds concurrent model spend, which
-/// matters more here than latency: nobody is waiting on these.
-pub(crate) fn spawn<Callback, Fired>(
+/// work to a host-supplied callback. Schedules are prepared one at a time, so a process with
+/// several due runs one gate at a time; the turns the fires open are the inbox's.
+pub(crate) fn spawn<Callback, Told>(
     store: std::sync::Arc<crate::store::Store>,
     config: crate::config::ResolvedScheduleConfig,
     tools: Option<std::sync::Arc<dyn GateTools>>,
     residents: std::sync::Arc<dyn ResidentPermissions>,
     scope: SchedulerScope,
-    fire: Callback,
+    queued: Callback,
 ) -> tokio::task::JoinHandle<()>
 where
-    Callback: Fn(Wakeup) -> Fired + Send + Sync + 'static,
-    Fired: std::future::Future<Output = FireOutcome> + Send,
+    Callback: Fn(Schedule, QueuedFire) -> Told + Send + Sync + 'static,
+    Told: std::future::Future<Output = ()> + Send,
 {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(config.poll_interval);
-        // A sweep contains its turns, so it routinely overruns `poll_interval` by minutes. Tokio's
-        // default `Burst` then resolves *every* tick missed during it, so a sweep that ran twelve
-        // periods long is followed by twelve immediate sweeps, eleven of which find nothing due.
-        // `Delay` collapses that to one.
+        // A sweep contains its gates' probes, so it can overrun `poll_interval` by a
+        // `gate_timeout` for every gated schedule due. Tokio's default `Burst` then resolves
+        // *every* tick missed during it, so a sweep that ran twelve periods long is followed by
+        // twelve immediate sweeps, eleven of which find nothing due. `Delay` collapses that to one.
         //
         // It does not create a gap, and nothing here does: `Delay` schedules the next tick a period
         // after the miss is *recognized*, so the first `tick()` following a long sweep still
-        // returns at once. Batches are therefore adjacent, and `max_consecutive_fires`
-        // splits a backlog without spacing it out.
+        // returns at once.
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // The first tick resolves immediately; skip it so startup is not competing with provider
         // and MCP connection setup.
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            // A panic must not end the loop either: under `meka serve` the callback runs a whole
-            // agent turn, so the surface that can panic is the entire tool loop, and nothing joins
-            // this handle, so losing the task would stop every scheduled job silently.
+            // A panic must not end the loop either: a gate's probe calls into an MCP server's tool
+            // and the callback is host code, and nothing joins this handle, so losing the task
+            // would stop every schedule silently.
             let sweep = std::panic::AssertUnwindSafe(run_due(
                 &store,
                 &config,
                 tools.as_deref(),
                 &*residents,
                 &scope,
-                &fire,
+                &queued,
             ));
             match futures::FutureExt::catch_unwind(sweep).await {
                 // A failed sweep must not end the loop: a transient database error would otherwise
-                // silently disable every scheduled job for the life of the process.
+                // silently disable every schedule for the life of the process.
                 Ok(Err(error)) => tracing::warn!("scheduler tick failed: {error}"),
                 Err(panic) => {
                     let message = crate::error::panic_message(&*panic);
@@ -273,214 +172,68 @@ where
         }
     })
 }
-/// One sweep: evaluate every due job in scope and fire what survives, up to
-/// [`crate::config::ResolvedScheduleConfig::max_consecutive_fires`] turns per session.
+/// One sweep: evaluate every due schedule in scope and queue the fires that survive, telling
+/// `queued` of each once its write has committed: the schedule, and where its fire is now.
 ///
-/// Public because the screen drives it directly rather than from a timer. There, the host loop
-/// owns the conversation and must be the one to run the turn, so a watcher only hands the screen
-/// a wake and this runs on the host side. `meka serve` reaches it through [`spawn`] instead.
-///
-/// What the budget buys is a seam, not a ceiling. A sweep contains the turns it fires (they are
-/// awaited here), so forty due jobs still cost forty turns however small the budget is; what
-/// changes is that they arrive in groups, so another session's due job is reached after five of the
-/// first session's rather than after all forty. The groups are adjacent rather than spaced, since a
-/// sweep that overran `poll_interval` leaves its successor already due, so this splits a backlog
-/// without slowing it.
-pub(crate) async fn run_due<Callback, Fired>(
+/// The sweep awaits no turn. A fire waits in its session's inbox, where a running turn reads it at
+/// its next pause and an idle session gets a turn for it from its host's driver, so a check runs
+/// when it is due whatever its session is doing.
+pub(crate) async fn run_due<Callback, Told>(
     store: &crate::store::Store,
     config: &crate::config::ResolvedScheduleConfig,
     tools: Option<&dyn GateTools>,
     residents: &dyn ResidentPermissions,
     scope: &SchedulerScope,
-    fire: &Callback,
+    queued: &Callback,
 ) -> crate::error::Result<()>
 where
-    Callback: Fn(Wakeup) -> Fired,
-    Fired: std::future::Future<Output = FireOutcome>,
+    Callback: Fn(Schedule, QueuedFire) -> Told,
+    Told: std::future::Future<Output = ()>,
 {
-    let sweep_started = Utc::now();
-    let schedule_store = store.schedule_store();
-    let due = schedule_store
-        .list_due_scheduled_jobs(sweep_started)
+    let due = store
+        .schedule_store()
+        .list_due_schedules(Utc::now())
         .await?;
-    let mut fired: std::collections::HashMap<uuid::Uuid, usize> = std::collections::HashMap::new();
-    let mut held_over = 0usize;
-    for job in due {
-        if !scope.covers(&job) {
+    for schedule in due {
+        if !scope.covers(&schedule) {
             continue;
         }
-        // Checked *before* `prepare`, which is what makes holding a job over free: `prepare` is
-        // where a gate runs and where the schedule is advanced, so a job skipped here has done
-        // neither and is still due, unchanged, on the next sweep. Reaching `prepare` and then
-        // declining would pay a gate evaluation and a lease round trip to arrive at the same
-        // place.
-        //
-        // `list_due_scheduled_jobs` orders by `next_fire_at`, so a held-over job is still the most
-        // overdue one next time and goes first. Nothing starves.
-        if fired.get(&job.session_id).copied().unwrap_or(0) >= config.max_consecutive_fires {
-            held_over += 1;
-            continue;
-        }
-        // Cloned whole, before `prepare` claims it. Claiming a job rewrites its schedule, advances
-        // its gate baseline, and for a one-shot deletes the row outright, so nothing short of the
-        // original can put it back.
-        let original = job.clone();
-        let short_id = original.short_id();
-        // Per job, not per sweep: a sweep contains the turns it fires, so by the fifth job the
-        // sweep's own clock can be minutes old, which would advance a recurring job to a
-        // `next_fire_at` already in the past and stamp a lease to expire before it was taken.
+        let short_id = schedule.short_id().to_string();
+        // Per schedule, not per sweep: a sweep contains the gates it runs, so by the fifth
+        // schedule the sweep's own clock can be minutes old, which would advance a recurring
+        // schedule to a `next_fire_at` already in the past and stamp a lease to expire before it
+        // was taken.
         let now = Utc::now();
         // `warn!`, not `?`: propagating would abort the whole sweep, so one transient `SQLITE_BUSY`
-        // would skip every other job due in the same tick. A job that was never claimed comes back
-        // next tick.
-        let prepared = match prepare(store, config, tools, residents, job, now).await {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                // Deliberately not promising the occurrence is intact: the one error that can
-                // arrive after the claim is a one-shot's restore failing, and there the row is
-                // already gone.
-                tracing::warn!("failed to prepare job {short_id}: {error}");
-                continue;
-            }
-        };
-        if let Some((claim, wakeup)) = prepared {
-            // The callback is host code and can panic: a turn that blows up must not take the lease
-            // with it for a whole `claim_lease`, nor end the sweep before the jobs behind it.
-            // Caught here rather than only at the sweep boundary so the occurrence goes back
-            // immediately, and released *without* forgiving the attempt, so a prompt that does this
-            // every time climbs to `MAX_CLAIM_ATTEMPTS` and parks instead of looping.
-            let outcome =
-                futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(fire(wakeup))).await;
-            let outcome = match outcome {
-                Ok(outcome) => outcome,
-                // The lease is kept and left to expire, which is the retry. Releasing it would
-                // leave the row due on the next sweep, and since every claim raises `attempts` a
-                // prompt that panics on a transient condition would be parked after three of them,
-                // half a minute at the default `poll_interval`. Waiting out `claim_lease` gives the
-                // same three attempts an hour apart, which a blip survives and a broken prompt does
-                // not; the gate-probe path follows the same rule.
-                Err(_) => {
-                    tracing::warn!(
-                        "the turn for job {short_id} panicked; it is retried after \
-                         `[schedule].claim_lease`"
-                    );
-                    continue;
-                }
-            };
-            if let FireOutcome::Unrunnable(cause) = &outcome {
-                // Neither released nor completed; see the variant. Same handling as the panicking
-                // turn above, and for the same reason.
-                tracing::warn!(
-                    "this host failed to run job {short_id}; it is retried after \
-                     `[schedule].claim_lease`"
-                );
-                // Unlike a panic, a cause that is the installation's is forgiven, and said on
-                // every surface that reports the job until a turn is delivered or that occurrence
-                // closes. A failed write leaves the claim counted, which only brings a park
-                // closer.
-                if let Some(reason) = cause.standing_reason() {
-                    if let Err(error) = schedule_store
-                        .forgive_attempt(&original.id, &claim.owner)
-                        .await
-                    {
-                        tracing::warn!("failed to forgive job {short_id}'s attempt: {error}");
-                    }
-                    store
-                        .scheduler_memory()
-                        .record_unrunnable(&original, reason);
-                }
-                continue;
-            }
-            if outcome == FireOutcome::Deferred {
-                tracing::debug!("job {short_id} deferred; releasing the lease");
-                // Also `warn!`: propagating would take the rest of the sweep with it, and a lease
-                // that is not released expires on its own, so the cost of continuing is a delay
-                // rather than a loss.
-                if let Err(error) = schedule_store
-                    .release_claim(&original.id, &claim.owner)
-                    .await
-                {
-                    tracing::warn!(
-                        "job {short_id} was deferred but failed to release its lease: {error}"
-                    );
-                }
-                // A `false` here needs nothing said: the lease was already gone, and the
-                // occurrence this host declined to run is open for whoever holds it now, which is
-                // the outcome a deferral wants anyway.
-            } else {
-                // Delivered, so the occurrence is spent: advance a job that lives on, retire one
-                // whose moment has passed. Written after the turn rather than before it, which is
-                // what the attempt counter buys.
-                match schedule_store
-                    .complete_claim(
-                        &original.id,
-                        &claim.owner,
-                        claim.next_fire_at,
-                        Some(now),
-                        claim.gate_baseline.as_deref(),
-                    )
-                    .await
-                {
-                    Ok(ClaimClosed::Yes) => {}
-                    // Not a problem, and not silent either: a job that fires and then cancels
-                    // itself is an ordinary shape, and the turn that did it should not look like
-                    // a fault in the log.
-                    Ok(ClaimClosed::RowGone) => tracing::debug!(
-                        "job {short_id} ran and its row was removed during the turn"
-                    ),
-                    // Its own sentence because the remedy differs from the `Err` below: an error is
-                    // a database problem, this is a `claim_lease` shorter than a turn takes.
-                    Ok(ClaimClosed::LeaseLost) => tracing::warn!(
-                        "job {short_id} ran after its lease expired and may be delivered again; \
-                         raise `[schedule].claim_lease` past the turn's length"
-                    ),
-                    Err(error) => tracing::warn!(
-                        "job {short_id} ran but failed to close its occurrence: {error}; it may be \
-                         delivered again"
-                    ),
-                }
-                // Here rather than left to the witness: a one-shot just retired has no row left to
-                // compare against, and its entry would outlive it.
-                store.scheduler_memory().clear_unrunnable(&original.id);
-                // Counted only once a turn has actually been spent. A job `prepare` retired (a
-                // declining gate, a one-shot past its grace period) and a job the host handed back
-                // both cost the conversation nothing, so neither may consume a session's budget,
-                // or five quiet watchers would starve the sixth job that had something to say.
-                *fired.entry(original.session_id).or_default() += 1;
-            }
+        // would skip every other schedule due in the same tick. A schedule that was never claimed
+        // comes back next tick.
+        match prepare(store, config, tools, residents, schedule, now).await {
+            Ok(Some((schedule, fire))) => queued(schedule, fire).await,
+            Ok(None) => {}
+            Err(error) => tracing::warn!("failed to prepare schedule {short_id}: {error}"),
         }
-    }
-    // Said out loud: a cap that bounds coverage silently reads as "everything ran". `info!` rather
-    // than `warn!` because holding a job over is the budget working, not a fallback.
-    if held_over > 0 {
-        let ceiling = config.max_consecutive_fires;
-        tracing::info!(
-            "held over {held_over} due job(s) past `[schedule].max_consecutive_fires` ({ceiling}) \
-             until the next sweep"
-        );
     }
     Ok(())
 }
-/// The lease this host holds on one occurrence.
+/// The lease this host holds on one occurrence, and what closing it writes.
 ///
-/// Carried out of [`prepare`] so the host that turns out to be unable to run the job hands back
-/// exactly what it took, and so every write that follows is scoped to the claim *this process* won
-/// rather than to the job id alone. A stale writer whose lease has since expired and been taken by
-/// someone else changes nothing.
+/// Every write that follows the claim is scoped to the claim *this process* won rather than to the
+/// schedule id alone. A stale writer whose lease has since expired and been taken by someone else
+/// changes nothing.
 #[derive(Debug, Clone)]
 pub(crate) struct Claim {
-    /// Proof of ownership, matched against `scheduled_jobs.claimed_by`.
+    /// Proof of ownership, matched against `schedules.claimed_by`.
     pub(crate) owner: String,
-    /// Where the schedule goes once the turn is delivered: `Some` advances a job that lives on,
-    /// `None` retires one whose moment is spent.
+    /// Where the schedule goes once the occurrence is spent: `Some` advances a schedule that lives
+    /// on, `None` retires one whose moment is spent.
     pub(crate) next_fire_at: Option<DateTime<Utc>>,
     /// What the gate saw, to be recorded when the occurrence is disposed of.
     ///
     /// Carried rather than written as soon as the gate returns, because a baseline is only true
-    /// once the occurrence it belongs to is finished with. A host that evaluates, decides to fire
-    /// and then cannot run the turn hands the occurrence back, and if it had already advanced the
-    /// baseline the next host would compare the new value against itself, see no change, and never
-    /// fire: the change would be swallowed by the handback that was supposed to preserve it.
+    /// once the occurrence it belongs to is finished with: it is written with the fire it decided,
+    /// in one transaction. A host that stopped between the gate and that write leaves the
+    /// occurrence to the next claim with the baseline as it was, and the change it measured still
+    /// fires there rather than being compared against itself.
     pub(crate) gate_baseline: Option<String>,
 }
 /// What the store said when a session's row was asked for.
@@ -511,20 +264,16 @@ pub(crate) enum SessionLookup<'a> {
 /// creation door returns 403 for the same authority, so an unclamped read here would keep firing a
 /// gate the two doors had refused.
 ///
-/// A lookup that failed, or found no row, answers `none` here; the callers that can defer instead
-/// decline it before asking. See [`SessionLookup`].
-///
-/// Shared with [`wake_would_produce_work`] rather than duplicated: the watcher that decides whether
-/// to interrupt a prompt has to reach the same answer as the door that decides whether to fire, or
-/// it wakes the shell for work that will not happen.
+/// A lookup that failed, or found no row, answers `none` here; [`prepare`] leaves the occurrence
+/// for the next sweep instead, ahead of asking. See [`SessionLookup`].
 pub(crate) fn live_permission(
     lookup: SessionLookup<'_>,
     config: &crate::config::ResolvedScheduleConfig,
     session_id: uuid::Uuid,
 ) -> crate::permission::Permission {
     let session = match lookup {
-        // Nothing is executable at `none`, which is the level that lets a job neither act nor be
-        // woken until the row can be read again.
+        // Nothing is executable at `none`, which is the level that lets a schedule neither act nor
+        // be woken until the row can be read again.
         SessionLookup::Failed | SessionLookup::Read(None) => {
             return crate::permission::Permission::None;
         }
@@ -535,78 +284,25 @@ pub(crate) fn live_permission(
         .admit_recorded(session.permission, &format!("session {session_id}"))
         .unwrap_or(crate::permission::Permission::None)
 }
-/// Whether any of `due` belongs to this session and is not parked.
-///
-/// Separated from the two database reads around it so the rule can be asserted directly: a job at
-/// [`MAX_CLAIM_ATTEMPTS`] stays in the table on purpose (listed, cancelable, reported as held), so
-/// "there is a due row" and "something will run" are different questions and the watcher has to ask
-/// the second one.
-pub(crate) fn has_runnable_job(due: &[ScheduledJob], session_id: uuid::Uuid) -> bool {
-    due.iter()
-        .any(|job| job.session_id == session_id && job.attempts < MAX_CLAIM_ATTEMPTS)
-}
-/// Whether waking this session's prompt would actually produce work.
-///
-/// `list_due_scheduled_jobs` is a pure SQL predicate, while [`prepare`] declines for several
-/// further reasons. Waking on the SQL predicate alone interrupts the prompt every poll to run
-/// nothing, wherever the row deliberately does not move: a job parked at [`MAX_CLAIM_ATTEMPTS`], or
-/// a session whose live level cannot do unattended work.
-///
-/// This answers the subset of `prepare`'s question that costs a row read and nothing else. It is
-/// deliberately *conservative* rather than exact: a gated job still wakes the prompt, because the
-/// only way to know whether its gate passes is to run the probe, and running a side-effecting probe
-/// twice per poll to answer the same question would be worse than the interruption. The invariant
-/// is that anything this refuses, `prepare` would also have refused, never the reverse.
-pub(crate) async fn wake_would_produce_work(
-    store: &crate::store::Store,
-    config: &crate::config::ResolvedScheduleConfig,
-    residents: &dyn ResidentPermissions,
-    session_id: uuid::Uuid,
-    now: DateTime<Utc>,
-) -> crate::error::Result<bool> {
-    let due = store.schedule_store().list_due_scheduled_jobs(now).await?;
-    if !has_runnable_job(&due, session_id) {
-        return Ok(false);
-    }
-    // The same source `prepare` reads, or the two disagree about the one session this watcher
-    // exists for: a row a level change failed to write would have this decline a wake the fire
-    // door would take.
-    if let Some(level) = residents.live_permission_of(session_id).await {
-        return Ok(level.allows_unattended_work());
-    }
-    // Read once for the session, not once per job: every job here shares it.
-    let lookup = store.session_info(session_id).await;
-    let lookup = match &lookup {
-        Ok(info) => SessionLookup::Read(info.as_ref()),
-        // Fail closed on a lookup that could not confirm the level, the same way `prepare` does:
-        // a session whose row cannot be read is not one to wake a prompt for.
-        Err(error) => {
-            tracing::warn!(
-                "failed to read session {session_id} while checking for due work: {error}"
-            );
-            SessionLookup::Failed
-        }
-    };
-    Ok(live_permission(lookup, config, session_id).allows_unattended_work())
-}
-/// Decide what to do with one due job: retire it, reschedule it quietly, or produce the [`Wakeup`]
-/// that spends a turn.
+/// Decide what to do with one due schedule: retire it, reschedule it quietly, or queue its fire,
+/// answering the schedule and where its fire is now when it queued one.
 pub(crate) async fn prepare(
     store: &crate::store::Store,
     config: &crate::config::ResolvedScheduleConfig,
     tools: Option<&dyn GateTools>,
     residents: &dyn ResidentPermissions,
-    job: ScheduledJob,
+    schedule: Schedule,
     now: DateTime<Utc>,
-) -> crate::error::Result<Option<(Claim, Wakeup)>> {
+) -> crate::error::Result<Option<(Schedule, QueuedFire)>> {
     let schedule_store = store.schedule_store();
     let memory = store.scheduler_memory();
-    let late_by = now - job.next_fire_at;
-    let recurring = job.schedule.is_recurring();
-    let short_id = job.short_id();
+    let late_by = now - schedule.next_fire_at;
+    let recurring = schedule.timing.is_recurring();
+    let short_id = schedule.short_id();
     // A one-shot far past its moment is noise rather than a reminder: "join the standup" delivered
-    // five days late helps nobody. Recurring jobs need no equivalent rule, since their occurrences
-    // are one period apart and the most recent missed one is always less than a period old.
+    // five days late helps nobody. Recurring schedules need no equivalent rule, since their
+    // occurrences are one period apart and the most recent missed one is always less than a period
+    // old.
     if !recurring
         && chrono::Duration::from_std(config.missed_grace)
             .map(|grace| late_by > grace)
@@ -615,38 +311,38 @@ pub(crate) async fn prepare(
         // Claimed rather than deleted outright, so the announcement is made once by whichever host
         // actually removed the row rather than once per host that had it in its due list.
         if schedule_store
-            .retire_unclaimed(&job.id, job.next_fire_at, now)
+            .retire_unclaimed(&schedule.id, schedule.next_fire_at, now)
             .await?
         {
-            // One of the two doors out of the table that do not go through `delete_scheduled_job`;
-            // the other is `complete_claim` retiring a job whose moment is spent, which is reached
-            // only after the clears below have already run. Without these the ledgers keyed by job
-            // id outlive the job, which a held one-shot reaches routinely: it survives every sweep
-            // until its grace window closes, and this is where it ends.
-            memory.forget(&job.id);
+            // One of the two doors out of the table that do not go through `delete_schedule`;
+            // the other is a claim's close retiring a schedule whose moment is spent, which is
+            // reached only after the clears below have already run. Without these the ledgers keyed
+            // by schedule id outlive the schedule, which a held one-shot reaches routinely: it
+            // survives every sweep until its grace window closes, and this is where it ends.
+            memory.forget(&schedule.id);
             let late = format_late(late_by);
             tracing::warn!(
-                "dropping one-shot job {short_id}: due {late} ago, past `[schedule].missed_grace`"
+                "dropping one-shot schedule {short_id}: due {late} ago, past `[schedule].missed_grace`"
             );
         }
         return Ok(None);
     }
 
-    // One lookup, for every job rather than only gated ones, serving the working directory a gate
-    // runs in and the live level both the checks below need.
+    // One lookup, for every schedule rather than only gated ones, serving the working directory a
+    // gate runs in and the live level both the checks below need.
     //
-    // Not skipped for an ungated job: at `none` such a job would keep firing, waking a model that
-    // can read nothing and act on nothing. The query costs one row read per job actually due,
-    // against a model turn.
-    let looked_up = store.session_info(job.session_id).await;
+    // Not skipped for an ungated schedule: at `none` such a schedule would keep firing, waking a
+    // model that can read nothing and act on nothing. The query costs one row read per schedule
+    // actually due, against a model turn.
+    let looked_up = store.session_info(schedule.session_id).await;
     let (session, lookup) = match &looked_up {
         Ok(info) => (info.as_ref(), SessionLookup::Read(info.as_ref())),
         Err(error) => {
             // Not silently "no session". A failed lookup means the level cannot be confirmed, and
             // `live_permission` fails closed on it rather than falling back to the host's level.
-            let session_id = job.session_id;
+            let session_id = schedule.session_id;
             tracing::warn!(
-                "failed to read session {session_id} while preparing job {short_id}: {error}"
+                "failed to read session {session_id} while preparing schedule {short_id}: {error}"
             );
             (None, SessionLookup::Failed)
         }
@@ -654,7 +350,7 @@ pub(crate) async fn prepare(
     let gate_cwd = session.and_then(|info| info.cwd.clone());
     // A row that could not be read, or is gone, decides nothing, and the occurrence stays for the
     // next sweep, exactly as it does when a gate tool is not yet resolvable. Falling through to the
-    // permission branch would decline the job at `none` on the strength of one `SQLITE_BUSY`.
+    // permission branch would decline the schedule at `none` on the strength of one `SQLITE_BUSY`.
     if matches!(lookup, SessionLookup::Failed | SessionLookup::Read(None)) {
         return Ok(None);
     }
@@ -664,34 +360,34 @@ pub(crate) async fn prepare(
     // and what its own turns dispatch against; the row it writes back can lag on a failed write.
     // Every other session answers from its row, filtered by the enabled set; see `live_permission`
     // for why nothing else does.
-    let live_permission = match residents.live_permission_of(job.session_id).await {
+    let live_permission = match residents.live_permission_of(schedule.session_id).await {
         Some(level) => level,
-        None => live_permission(lookup, config, job.session_id),
+        None => live_permission(lookup, config, schedule.session_id),
     };
 
-    let coalesced = occurrences_between(&job.schedule, job.next_fire_at, now);
-    // `Some` only for a job that lives on. A one-shot's moment is spent, and a cron pattern with
-    // nothing left in range has no future to be scheduled for; both are retired by `complete_claim`
-    // once the turn is delivered, which is the only place the scheduler deletes a job.
+    let coalesced = occurrences_between(&schedule.timing, schedule.next_fire_at, now);
+    // `Some` only for a schedule that lives on. A one-shot's moment is spent, and a cron pattern
+    // with nothing left in range has no future to be scheduled for; both are retired when the
+    // claim is closed.
     //
-    // Derived before the claim because a refusal needs it too: it is what spends a recurring job's
-    // occurrence without evaluating anything.
-    let next_fire_at = job
-        .schedule
-        .next_after_delivering(job.next_fire_at, now)
+    // Derived before the claim because a refusal needs it too: it is what spends a recurring
+    // schedule's occurrence without evaluating anything.
+    let next_fire_at = schedule
+        .timing
+        .next_after_delivering(schedule.next_fire_at, now)
         .filter(|_| recurring);
 
-    // Spend the occurrence of a job refused before its claim was taken.
+    // Spend the occurrence of a schedule refused before its claim was taken.
     //
-    // A recurring job advances, which is the documented rule and the same thing a gate that ran and
-    // said no does: without it a held job sits permanently due and then reports a month-long
-    // backlog the moment it is authorized again.
+    // A recurring schedule advances, which is the documented rule and the same thing a gate that
+    // ran and said no does: without it a held schedule sits permanently due and then reports a
+    // month-long backlog the moment it is authorized again.
     //
     // A one-shot is left completely alone. Every refusal that needs nothing but a row read is made
     // here because there is no reason to pay for a lease to reach the same answer.
     async fn decline_before_claiming(
         store: &ScheduleStore,
-        job: &ScheduledJob,
+        schedule: &Schedule,
         now: DateTime<Utc>,
         next_fire_at: Option<DateTime<Utc>>,
     ) -> crate::error::Result<()> {
@@ -699,23 +395,25 @@ pub(crate) async fn prepare(
         // off the value every host read, and no host will deliver it.
         if let Some(next) = next_fire_at {
             store
-                .advance_unclaimed(&job.id, job.next_fire_at, now, next)
+                .advance_unclaimed(&schedule.id, schedule.next_fire_at, now, next)
                 .await?;
         }
         Ok(())
     }
 
-    // A job that has crashed its host repeatedly is parked rather than retried again.
+    // A schedule whose claims keep ending without being closed is parked rather than retried
+    // again.
     //
-    // Claiming is a lease now, so nothing else stops a prompt that reliably kills the process from
-    // being picked up on every expiry, forever. The row stays exactly where it is: listed,
-    // cancelable, and reported as held on every surface, because destroying a user's job over a
-    // failure Meka cannot diagnose would be worse than leaving it visible and inert.
-    if job.attempts >= MAX_CLAIM_ATTEMPTS {
-        if memory.declined_for_permission_first_time(&job.id, "crashed") {
-            let reason = job_withheld_reason(memory, &job, live_permission, tools)
+    // Claiming is a lease, so nothing else stops an occurrence that reliably takes its host down
+    // before the fire is written from being picked up on every expiry, forever. The row stays
+    // exactly where it is: listed, cancelable, and reported as held on every surface, because
+    // destroying a user's schedule over a failure Meka cannot diagnose would be worse than leaving
+    // it visible and inert.
+    if schedule.attempts >= MAX_CLAIM_ATTEMPTS {
+        if memory.declined_for_permission_first_time(&schedule.id, "crashed") {
+            let reason = schedule_withheld_reason(memory, &schedule, live_permission, tools)
                 .unwrap_or_else(|| "it has been parked".to_string());
-            tracing::warn!("job {short_id} not fired: {reason}");
+            tracing::warn!("schedule {short_id} not fired: {reason}");
         }
         return Ok(None);
     }
@@ -726,19 +424,19 @@ pub(crate) async fn prepare(
     // interval, until an operator notices.
     if !live_permission.allows_unattended_work() {
         if memory.declined_for_permission_first_time(
-            &job.id,
+            &schedule.id,
             &format!("unattended-work:{live_permission}"),
         ) {
             tracing::warn!(
-                "job {short_id} not fired: the session is at `{live_permission}`, where no tool is \
+                "schedule {short_id} not fired: the session is at `{live_permission}`, where no tool is \
                  executable; raise the session to restore it"
             );
         } else {
             tracing::debug!(
-                "job {short_id} still not fired: the session remains at {live_permission}"
+                "schedule {short_id} still not fired: the session remains at {live_permission}"
             );
         }
-        decline_before_claiming(&schedule_store, &job, now, next_fire_at).await?;
+        decline_before_claiming(&schedule_store, &schedule, now, next_fire_at).await?;
         return Ok(None);
     }
 
@@ -751,28 +449,30 @@ pub(crate) async fn prepare(
     // keeps the doors in agreement.
     //
     // The occurrence is declined, exactly as a gate that ran and said no is declined: a gate that
-    // could not be evaluated has not passed, and firing anyway would convert a conditional job into
-    // an unconditional one, a turn a minute for `every = "1m"` with a `changed` gate.
-    if let Some(gate) = &job.gate
+    // could not be evaluated has not passed, and firing anyway would convert a conditional schedule
+    // into an unconditional one, a turn a minute for `every = "1m"` with a `changed` gate.
+    if let Some(gate) = &schedule.gate
         && let Some((refusal, level)) = gate_withheld_reason(gate, live_permission, tools)
     {
         // Not decidable yet is not refused: a server mid-handshake, or a host with no dispatcher
         // for this tool at all, cannot say whether the gate passes, and declining would spend the
-        // occurrence (a `6h` job due at startup advanced six hours without its probe running). The
-        // same rule `job_withheld` applies before it reports.
+        // occurrence (a `6h` schedule due at startup advanced six hours without its probe running).
+        // The same rule `schedule_withheld` applies before it reports.
         if matches!(refusal, GateRefusal::ToolUnavailable)
             && let GateProbe::Tool { name, .. } = &gate.probe
             && tools.is_none_or(|tools| tools.is_still_connecting(name))
         {
-            tracing::debug!("job {short_id} not decided: gate tool '{name}' is not resolvable yet");
+            tracing::debug!(
+                "schedule {short_id} not decided: gate tool '{name}' is not resolvable yet"
+            );
             return Ok(None);
         }
         // Said once per decline, not once per evaluation: the condition is a standing state rather
-        // than an event, and an `every = "1m"` job would otherwise write this line every minute.
-        // The id is cleared the moment the gate is authorized again, so a later withdrawal is
-        // announced afresh.
+        // than an event, and an `every = "1m"` schedule would otherwise write this line every
+        // minute. The id is cleared the moment the gate is authorized again, so a later withdrawal
+        // is announced afresh.
         let explained = refusal.explain(&gate.probe, level);
-        if memory.declined_for_permission_first_time(&job.id, &explained) {
+        if memory.declined_for_permission_first_time(&schedule.id, &explained) {
             // `gate_withheld_reason` reports the live level first because it is the one an
             // operator can act on, so a refusal carrying the recorded level instead means the live
             // level was fine: a hand-edited or damaged row, which no amount of cycling the session
@@ -784,31 +484,31 @@ pub(crate) async fn prepare(
                     Ok(()) => {
                         let recorded = gate.permission;
                         tracing::warn!(
-                            "job {short_id} not fired: {explained}; raise the session back to \
+                            "schedule {short_id} not fired: {explained}; raise the session back to \
                              `{recorded}` to restore it"
                         );
                     }
                     Err(_) => {
-                        tracing::warn!("job {short_id} not fired: {explained}")
+                        tracing::warn!("schedule {short_id} not fired: {explained}")
                     }
                 }
             } else {
                 tracing::warn!(
-                    "job {short_id} not fired: {explained}, which is the level recorded when the gate was \
+                    "schedule {short_id} not fired: {explained}, which is the level recorded when the gate was \
                      authorized"
                 );
             }
         } else {
-            tracing::debug!("job {short_id} still not fired: its gate is still unauthorized");
+            tracing::debug!("schedule {short_id} still not fired: its gate is still unauthorized");
         }
-        decline_before_claiming(&schedule_store, &job, now, next_fire_at).await?;
+        decline_before_claiming(&schedule_store, &schedule, now, next_fire_at).await?;
         return Ok(None);
     }
-    // Nothing is holding this job back, so a later withdrawal is announced afresh rather than
-    // swallowed by the once-per-decline suppression above. An ungated job passes through here too:
-    // it is held by nothing, and the `none` floor above is the only thing that could have stopped
-    // it.
-    memory.clear_permission_decline(&job.id);
+    // Nothing is holding this schedule back, so a later withdrawal is announced afresh rather than
+    // swallowed by the once-per-decline suppression above. An ungated schedule passes through here
+    // too: it is held by nothing, and the `none` floor above is the only thing that could have
+    // stopped it.
+    memory.clear_permission_decline(&schedule.id);
 
     // Lease the occurrence before doing anything that can fail or hang.
     //
@@ -817,9 +517,9 @@ pub(crate) async fn prepare(
     // at once; whoever takes the lease owns it, and the rest return here having neither evaluated
     // the gate nor spent the occurrence.
     //
-    // The lease is taken *before* the gate runs and released or completed after, so the row is
-    // never absent while this host is working: a refusal has nothing to put back, and a crash
-    // between the claim and the turn expires rather than spending the occurrence.
+    // The lease is taken *before* the gate runs and closed after, so the row is never absent
+    // while this host is working: a refusal has nothing to put back, and a crash between the claim
+    // and the fire's write expires rather than spending the occurrence.
     let mut claim = Claim {
         owner: memory.owner().to_string(),
         next_fire_at,
@@ -827,8 +527,8 @@ pub(crate) async fn prepare(
     };
     if !schedule_store
         .claim_occurrence(
-            &job.id,
-            job.next_fire_at,
+            &schedule.id,
+            schedule.next_fire_at,
             &claim.owner,
             now,
             now + chrono::Duration::from_std(config.claim_lease).unwrap_or_else(|_| {
@@ -839,26 +539,31 @@ pub(crate) async fn prepare(
         )
         .await?
     {
-        tracing::debug!("job {short_id} was claimed for this occurrence by another host");
+        tracing::debug!("schedule {short_id} was claimed for this occurrence by another host");
         return Ok(None);
     }
 
-    let gate_output = match &job.gate {
+    let gate_output = match &schedule.gate {
         None => None,
         Some(gate) => {
-            match evaluate_gate(
+            // A sweep stopped while the gate runs leaves the schedule noted as running, which is
+            // how a host on its way out tells the lease this gate holds from one left to run out on
+            // purpose.
+            memory.gate_started(&schedule.id);
+            let evaluated = evaluate_gate(
                 gate,
                 config.gate_timeout,
                 gate_cwd.as_deref(),
                 tools,
-                Some(job.session_id),
+                Some(schedule.session_id),
             )
-            .await
-            {
+            .await;
+            memory.gate_ended(&schedule.id);
+            match evaluated {
                 Ok(outcome) => {
                     // An evaluation that produced an answer, whichever answer it was, ends any
                     // standing failure: the probe works.
-                    memory.clear_probe_failure(&job.id);
+                    memory.clear_probe_failure(&schedule.id);
                     // Persist the new baseline even when it did not fire; that is exactly how a
                     // `changed` gate stops firing once it has seen the new value.
                     //
@@ -868,23 +573,22 @@ pub(crate) async fn prepare(
                     claim.gate_baseline = Some(outcome.baseline);
                     if !outcome.fired {
                         // The occurrence is spent: the condition was asked and said no. A recurring
-                        // job moves to its next occurrence and a one-shot's moment has passed,
-                        // which is the documented rule and the same thing `complete_claim` does
-                        // after a turn. The only difference is that no turn ran.
-                        tracing::debug!("gate for job {short_id} declined to fire");
+                        // schedule moves to its next occurrence and a one-shot's moment has passed,
+                        // which is the documented rule and the same thing a fire's write does. The
+                        // only difference is that nothing is queued.
+                        tracing::debug!("gate for schedule {short_id} declined to fire");
                         match schedule_store
                             .complete_claim(
-                                &job.id,
+                                &schedule.id,
                                 &claim.owner,
                                 claim.next_fire_at,
-                                None,
                                 claim.gate_baseline.as_deref(),
                             )
                             .await
                         {
-                            Ok(ClaimClosed::Yes) => {}
+                            Ok(ClaimClosed::Yes(())) => {}
                             Ok(ClaimClosed::RowGone) => tracing::debug!(
-                                "job {short_id}'s gate declined and its row was removed while the \
+                                "schedule {short_id}'s gate declined and its row was removed while the \
                                  probe ran"
                             ),
                             // The lease was taken from under this host while the probe ran, so the
@@ -892,11 +596,11 @@ pub(crate) async fn prepare(
                             // the visible symptom is a `changed` gate firing twice for one change,
                             // which reads as a flapping probe rather than a lost write.
                             Ok(ClaimClosed::LeaseLost) => tracing::warn!(
-                                "job {short_id}'s gate declined after its lease expired; the \
+                                "schedule {short_id}'s gate declined after its lease expired; the \
                                  occurrence may be evaluated again"
                             ),
                             Err(error) => tracing::warn!(
-                                "job {short_id} declined but failed to close its occurrence: {error}"
+                                "schedule {short_id} declined but failed to close its occurrence: {error}"
                             ),
                         }
                         return Ok(None);
@@ -907,42 +611,43 @@ pub(crate) async fn prepare(
                     // Loud on purpose: a watcher whose probe breaks produces the same silence as a
                     // watcher with nothing to report, and that is the failure most likely to go
                     // unnoticed for weeks. Counted as well as logged, so the model hears about it
-                    // too once the condition is standing, since a scheduled job exists precisely
+                    // too once the condition is standing, since a schedule exists precisely
                     // because nobody is reading the log. The row as it stands now, before this
                     // arm's own disposal, which writes neither half of the witness; see
                     // [`standing_probe_failure`].
-                    let failures = memory.record_probe_failure(&job, &error);
-                    tracing::warn!("gate for job {short_id} failed: {error} (failure {failures})");
+                    let failures = memory.record_probe_failure(&schedule, &error);
+                    tracing::warn!(
+                        "gate for schedule {short_id} failed: {error} (failure {failures})"
+                    );
                     // The same disposal a refusal gets, and for the same reason: the condition was
-                    // not answered, so this occurrence is over. A recurring job advances to its
-                    // next one; releasing the lease instead would leave the row due on the very
-                    // next sweep, so a six-hour job whose server is down would be re-probed every
-                    // `poll_interval`, and a probe that hangs would burn the whole `gate_timeout`
-                    // out of each sweep.
+                    // not answered, so this occurrence is over. A recurring schedule advances to
+                    // its next one; releasing the lease instead would leave the row due on the very
+                    // next sweep, so a six-hour schedule whose server is down would be re-probed
+                    // every `poll_interval`, and a probe that hangs would burn the whole
+                    // `gate_timeout` out of each sweep.
                     //
-                    // `fired_at` and `gate_baseline` are both `None`: nothing fired and nothing was
-                    // measured, so the next successful evaluation compares against the last value
-                    // actually observed and reports the change that happened while the probe was
-                    // broken.
+                    // No baseline: nothing was measured, so the next successful evaluation compares
+                    // against the last value actually observed and reports the change that
+                    // happened while the probe was broken.
                     match claim.next_fire_at {
                         Some(next) => match schedule_store
-                            .complete_claim(&job.id, &claim.owner, Some(next), None, None)
+                            .complete_claim(&schedule.id, &claim.owner, Some(next), None)
                             .await
                         {
-                            Ok(ClaimClosed::Yes) => {}
+                            Ok(ClaimClosed::Yes(())) => {}
                             Ok(ClaimClosed::RowGone) => tracing::debug!(
-                                "job {short_id}'s gate failed and its row was removed while the \
+                                "schedule {short_id}'s gate failed and its row was removed while the \
                                  probe ran"
                             ),
                             // Said out loud because it is the state this whole arm exists to
                             // avoid, and it is otherwise indistinguishable from a probe that is
                             // simply failing often.
                             Ok(ClaimClosed::LeaseLost) => tracing::warn!(
-                                "job {short_id}'s gate failed after its lease expired; it is probed \
+                                "schedule {short_id}'s gate failed after its lease expired; it is probed \
                                  again on the next sweep"
                             ),
                             Err(error) => tracing::warn!(
-                                "job {short_id}'s gate failed and then failed to close its \
+                                "schedule {short_id}'s gate failed and then failed to close its \
                                  occurrence: {error}"
                             ),
                         },
@@ -950,10 +655,10 @@ pub(crate) async fn prepare(
                         // to advance to, and releasing the lease would make the row due on the
                         // very next sweep, so an MCP server restarting anywhere near its due time
                         // would park it after three claims. Holding the lease is the backoff: the
-                        // job is retried once per `claim_lease`, and the attempt ceiling still
+                        // schedule is retried once per `claim_lease`, and the attempt ceiling still
                         // applies to those retries.
                         None => tracing::debug!(
-                            "job {short_id}'s gate failed; it is retried after \
+                            "schedule {short_id}'s gate failed; it is retried after \
                              `[schedule].claim_lease`"
                         ),
                     }
@@ -963,20 +668,57 @@ pub(crate) async fn prepare(
         }
     };
 
-    // The schedule is advanced by `run_due` once the turn has actually been delivered, not here.
-    // Until then this host holds a lease and the row is untouched, so a crash costs a retry rather
-    // than the occurrence.
-    let schedule = job.schedule.describe();
-    tracing::info!("firing scheduled job {short_id} ({schedule})");
-    Ok(Some((claim, Wakeup {
-        job,
+    // The occurrence is spent and the fire queued in one write, scoped to this host's lease.
+    let fire = Fire {
+        schedule_id: schedule.id.clone(),
         gate_output,
-        late_by,
-        coalesced,
-    })))
+        occurrences: coalesced.saturating_add(1),
+        due_at: schedule.next_fire_at,
+        fired_at: now,
+    };
+    match schedule_store
+        .queue_fire(
+            &schedule,
+            &claim.owner,
+            claim.next_fire_at,
+            claim.gate_baseline.as_deref(),
+            fire,
+        )
+        .await
+    {
+        Ok(ClaimClosed::Yes(queued)) => {
+            let timing = schedule.timing.describe();
+            tracing::info!("queued schedule {short_id}'s fire ({timing})");
+            Ok(Some((schedule, queued)))
+        }
+        // A cancellation wins: the schedule's row went while its gate ran, and nothing is queued
+        // for a schedule that no longer exists.
+        Ok(ClaimClosed::RowGone) => {
+            tracing::debug!(
+                "schedule {short_id} was canceled while its gate ran; nothing is queued"
+            );
+            Ok(None)
+        }
+        // Its own sentence because the remedy differs from the `Err` below: an error is a database
+        // problem, this is a `claim_lease` shorter than the gate took.
+        Ok(ClaimClosed::LeaseLost) => {
+            tracing::warn!(
+                "schedule {short_id}'s lease expired before its fire was queued, so it is left to \
+                 the host holding it now; raise `[schedule].claim_lease` past the gate's run"
+            );
+            Ok(None)
+        }
+        Err(error) => {
+            tracing::warn!(
+                "failed to queue schedule {short_id}'s fire: {error}; it is tried again after \
+                 `[schedule].claim_lease`"
+            );
+            Ok(None)
+        }
+    }
 }
 
-/// Run a gate and decide whether the job it guards should fire.
+/// Run a gate and decide whether the schedule it guards should fire.
 ///
 /// Errors are for the gate itself failing (spawn failure, timeout, a tool that cannot be reached),
 /// never for the condition being false. The distinction matters: a watcher that goes quiet because
@@ -1004,9 +746,9 @@ pub(crate) async fn run_probe(
         GateProbe::Shell { command } => run_shell_probe(command, timeout, cwd).await,
         GateProbe::Tool { name, arguments } => {
             let Some(tools) = tools else {
-                // Not a misconfiguration to report at creation: the host that authored the job can
-                // dispatch tools, and this is a *different* host picking the row up. Declining is
-                // the same answer a disconnected server gets, for the same reason.
+                // Not a misconfiguration to report at creation: the host that authored the schedule
+                // can dispatch tools, and this is a *different* host picking the row up. Declining
+                // is the same answer a disconnected server gets, for the same reason.
                 return Err(format!(
                     "gate calls `{name}`, which this process cannot dispatch"
                 ));
@@ -1158,7 +900,7 @@ pub(crate) fn apply_predicate(
             // A pattern that no longer compiles cannot be an error here: `evaluate_gate` reserves
             // `Err` for a probe that broke, and this one ran fine. It is refused at creation, so
             // reaching this means a hand-edited row; declining is the safe direction and the
-            // warning says which job to fix.
+            // warning says which schedule to fix.
             let fired = match regex::Regex::new(pattern) {
                 Ok(regex) => regex.is_match(&probe.text),
                 Err(error) => {
@@ -1178,7 +920,7 @@ pub(crate) fn apply_predicate(
                 Pointed::Absent => None,
                 // An `Err`, like a probe that could not be spawned: the pointer describes a shape
                 // this result does not have, so no predicate over it has an honest answer. The
-                // caller declines the occurrence and warns, naming the job.
+                // caller declines the occurrence and warns, naming the schedule.
                 Pointed::NotADocument => {
                     return Err(format!(
                         "gate points at `{}` but the probe did not return JSON: {}",
@@ -1222,9 +964,9 @@ pub(crate) fn apply_predicate(
 /// was measured, so there is nothing to conclude.
 ///
 /// Collapsing them costs real turns: `{"at": "/chats", "is": "empty"}` reads a missing value as
-/// empty and fires, so a server that started returning an error string or prose would fire the job
-/// on every interval. `not_empty` and `changed` fail toward silence, which is survivable; `empty`
-/// alone fails toward spending.
+/// empty and fires, so a server that started returning an error string or prose would fire the
+/// schedule on every interval. `not_empty` and `changed` fail toward silence, which is survivable;
+/// `empty` alone fails toward spending.
 pub(crate) enum Pointed {
     /// The document parsed and the pointer resolved to this.
     Found(serde_json::Value),

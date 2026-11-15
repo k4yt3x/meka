@@ -1629,19 +1629,19 @@ impl ToolRegistry {
     ///
     /// Nothing session-scoped is registered: a gate is a predicate, and `memory_*` / `skill_*` /
     /// `checklist_*` are not questions about the world. What it does get is the read-only built-ins
-    /// a watcher wants (`file_read`, `web_fetch`), built against the job's cwd rather
+    /// a watcher wants (`file_read`, `web_fetch`), built against the schedule's cwd rather
     /// than the host process's, for the same reason a shell gate runs there.
     ///
     /// Construction is allocation only, no I/O, so a caller may build one per evaluation.
     /// `SilentFrontend` because nobody is watching a scheduled fire, and empty roots.
     ///
     /// Empty roots is not the same as nowhere: `WriteScope::confined_to` at `read` still admits the
-    /// job's own directory. A gate may only call a tool that resolves to `read`, and nothing Meka
-    /// ships writes at that level, but `tool_permissions` can lower one that does, and it then
-    /// writes under the session's cwd, unattended, for as long as the job exists: the operator's
-    /// own instruction, which is why this does not claim writes are impossible. `shell_execute`
-    /// cannot be opened this way, since it re-derives its own confinement rather than trusting
-    /// the level.
+    /// schedule's own directory. A gate may only call a tool that resolves to `read`, and nothing
+    /// Meka ships writes at that level, but `tool_permissions` can lower one that does, and it then
+    /// writes under the session's cwd, unattended, for as long as the schedule exists: the
+    /// operator's own instruction, which is why this does not claim writes are impossible.
+    /// `shell_execute` cannot be opened this way, since it re-derives its own confinement rather
+    /// than trusting the level.
     pub(crate) fn for_gate(core: &CoreMaterials, site: crate::session::ToolSite) -> Result<Self> {
         let registry = Self::new_with_filter(core.builtin_filter.clone());
         registry.register_core_tools(core, site)?;

@@ -71,6 +71,7 @@ pub(crate) enum SseEventType {
     InboxDeferred,
     InboxFailed,
     InboxWithdrawn,
+    ScheduleFired,
     ConversationRewound,
     ChecklistUpdated,
     ApprovalResolved,
@@ -130,6 +131,7 @@ impl SseEventType {
             Self::InboxDeferred => "inbox.deferred",
             Self::InboxFailed => "inbox.failed",
             Self::InboxWithdrawn => "inbox.withdrawn",
+            Self::ScheduleFired => "schedule.fired",
             Self::ConversationRewound => "conversation.rewound",
             Self::ChecklistUpdated => "checklist.updated",
             Self::ApprovalResolved => "approval.resolved",
@@ -276,6 +278,10 @@ pub(crate) fn translate(
         FrontendEvent::InboxDelivered { item_ids } => (
             SseEventType::InboxDelivered,
             serde_json::json!({ "item_ids": item_ids }),
+        ),
+        FrontendEvent::InboxWithdrawn { item_id } => (
+            SseEventType::InboxWithdrawn,
+            serde_json::json!({ "item_id": item_id }),
         ),
         FrontendEvent::Nudged { kind, text } => (
             SseEventType::Nudged,
@@ -574,7 +580,7 @@ mod tests {
             FrontendEvent::MessageAppended {
                 message,
                 outcomes: Vec::new(),
-                late: None,
+                late: Vec::new(),
             },
             SessionCapabilities::default(),
         )
@@ -686,6 +692,19 @@ mod tests {
         assert_eq!(data["compaction_id"], "c1");
         assert_eq!(data["interrupted"], true);
         assert_eq!(data["error"], "Interrupted");
+    }
+
+    /// A fire a tool call withdrew is said as any other withdrawal is, by the item's id.
+    #[test]
+    fn translate_inbox_withdrawn() {
+        let item_id = uuid::Uuid::new_v4();
+        let (event_type, data) = translate(
+            FrontendEvent::InboxWithdrawn { item_id },
+            SessionCapabilities::default(),
+        )
+        .expect("translates");
+        assert_eq!(event_type.as_str(), "inbox.withdrawn");
+        assert_eq!(data, serde_json::json!({ "item_id": item_id.to_string() }));
     }
 
     #[test]

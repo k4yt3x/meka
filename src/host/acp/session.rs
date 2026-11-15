@@ -55,6 +55,9 @@ pub(super) struct ServerState {
     /// Set once the editor has disconnected or a signal has arrived, ahead of the turns being
     /// stopped, so nothing starts an out-of-band turn in the drain that follows.
     pub(super) leaving: std::sync::atomic::AtomicBool,
+    /// Woken when any turn ends, the moment a session may have become able to take a turn on what
+    /// waits in its inbox; the inbox driver listens on it.
+    pub(super) inbox_wake: Arc<tokio::sync::Notify>,
 }
 
 impl ServerState {
@@ -71,6 +74,7 @@ impl ServerState {
             transport_dead,
             released: std::sync::Mutex::default(),
             leaving: std::sync::atomic::AtomicBool::new(false),
+            inbox_wake: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -303,6 +307,7 @@ async fn reopen_released(
         crate::host::Opening::Hydrate,
         super::frontend::EditorThread::Inherited,
         session_lock,
+        Arc::clone(&state.inbox_wake),
     )
     .await
     .map_err(|error| build_failure_error("failed to build session runtime", &error, relay))?;
@@ -436,6 +441,7 @@ pub(super) async fn handle_load_session(
         crate::host::Opening::Hydrate,
         super::frontend::EditorThread::Empty,
         session_lock,
+        Arc::clone(&state.inbox_wake),
     )
     .await
     {
@@ -678,6 +684,7 @@ pub(super) async fn handle_resume_session(
         crate::host::Opening::Hydrate,
         super::frontend::EditorThread::Inherited,
         session_lock,
+        Arc::clone(&state.inbox_wake),
     )
     .await
     {
@@ -943,6 +950,7 @@ pub(super) async fn handle_fork_session(
         crate::host::Opening::Hydrate,
         super::frontend::EditorThread::Inherited,
         session_lock,
+        Arc::clone(&state.inbox_wake),
     )
     .await
     {
@@ -1410,6 +1418,7 @@ pub(super) async fn build_session_runtime(
     // under.
     thread: super::frontend::EditorThread,
     session_lock: crate::fs::FileLock,
+    inbox_wake: Arc<tokio::sync::Notify>,
 ) -> anyhow::Result<BuiltSession> {
     let cwd = SharedCwd::new(cwd_path);
     // `--additional-workspace-directory` is a flag on the process the editor launched, so it
@@ -1435,7 +1444,7 @@ pub(super) async fn build_session_runtime(
 
     // Created here rather than beside the `SessionEntry` so the frontend and the entry share one
     // cell: the entry's cancel handler writes it, the frontend's client round-trips read it.
-    let cancel = crate::host::CancelCell::default();
+    let cancel = crate::host::CancelCell::notifying(inbox_wake);
     let acp_frontend = Arc::new(AcpFrontend::new(link, cwd.clone(), cancel.clone(), thread));
     let frontend: Arc<dyn Frontend> = acp_frontend.clone();
 

@@ -2040,7 +2040,7 @@ mod tests {
                 Vec::new(),
             ),
             outcomes: Vec::new(),
-            late: None,
+            late: Vec::new(),
         };
         let frontend_with_ring = |ring: usize| {
             let frontend = HttpFrontend::new();

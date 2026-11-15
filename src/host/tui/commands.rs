@@ -1038,7 +1038,7 @@ fn parse_memory_slash(rest: &str) -> SlashCommand {
 }
 
 /// `/schedule`: bare lists; `show <id>` prints one in full; `cancel <id>` cancels. There is no
-/// `create`: a job's prompt is prose the agent writes for its own future self.
+/// `create`: a schedule's prompt is prose the agent writes for its own future self.
 fn parse_schedule_slash(rest: &str) -> SlashCommand {
     let rest = rest.trim();
     if let Some(id) = rest.strip_prefix("show").map(str::trim)

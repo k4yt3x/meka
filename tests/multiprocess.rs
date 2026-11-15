@@ -271,24 +271,24 @@ enabled = ["read", "unrestricted"]
             .unwrap_or(false)
     }
 
-    /// Plant scheduled jobs directly, since creating one through Meka needs an agent turn to ask
-    /// for it and what is under test here is what happens to a job that already exists.
+    /// Plant schedules directly, since creating one through Meka needs an agent turn to ask
+    /// for it and what is under test here is what happens to a schedule that already exists.
     ///
-    /// `overdue_by` puts a job's occurrence that far in the past, so it is due the moment a
+    /// `overdue_by` puts a schedule's occurrence that far in the past, so it is due the moment a
     /// scheduler looks. Pair it with a long `every` and exactly one occurrence exists for the whole
     /// life of the test: whatever advances the row puts the next one out of reach.
     ///
     /// All of them in one transaction, because a host polling every 200 ms can otherwise read a
-    /// due list between two inserts. A list holding only some of the planted jobs is one where the
-    /// interleaving the test is built around never happens, and the test then passes without
+    /// due list between two inserts. A list holding only some of the planted schedules is one where
+    /// the interleaving the test is built around never happens, and the test then passes without
     /// exercising anything -- which is the worst outcome available to a race test.
-    fn plant_jobs(&self, jobs: &[PlantedJob<'_>]) {
+    fn plant_schedules(&self, schedules: &[PlantedSchedule<'_>]) {
         // `chrono` is not a dev-dependency of the test crate, and SQLite renders the one shape
         // Meka's own writer produces: UTC with an explicit offset.
         let mut connection = rusqlite::Connection::open(self.database()).expect("open the store");
         let transaction = connection.transaction().expect("begin");
-        for job in jobs {
-            let due = std::time::SystemTime::now() - job.overdue_by;
+        for schedule in schedules {
+            let due = std::time::SystemTime::now() - schedule.overdue_by;
             let seconds = i64::try_from(
                 due.duration_since(std::time::UNIX_EPOCH)
                     .expect("after the epoch")
@@ -304,43 +304,43 @@ enabled = ["read", "unrestricted"]
                 .expect("render the timestamp");
             transaction
                 .execute(
-                    "INSERT INTO scheduled_jobs (id, session_id, kind, spec, prompt, \
+                    "INSERT INTO schedules (id, session_id, kind, spec, prompt, \
                      gate_kind, gate_spec_json, gate_permission, created_at, next_fire_at) \
                      VALUES (?1, ?2, 'every', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     rusqlite::params![
-                        format!("job-{}", job.name),
-                        job.session_id,
-                        job.every,
-                        job.prompt,
-                        job.gate_command.map(|_| "shell"),
-                        job.gate_command.map(|command| {
+                        format!("schedule-{}", schedule.name),
+                        schedule.session_id,
+                        schedule.every,
+                        schedule.prompt,
+                        schedule.gate_command.map(|_| "shell"),
+                        schedule.gate_command.map(|command| {
                             serde_json::json!({
                                 "shell": { "command": command },
                                 "when": "succeeded",
                             })
                             .to_string()
                         }),
-                        job.gate_command.map(|_| "unrestricted"),
+                        schedule.gate_command.map(|_| "unrestricted"),
                         due,
                         due,
                     ],
                 )
-                .expect("plant the job");
+                .expect("plant the schedule");
         }
         transaction.commit().expect("commit");
     }
 }
 
-/// The arguments [`Cluster::plant_job`] takes, named rather than positional because four of the
-/// six are strings and a call site of bare literals says nothing.
-struct PlantedJob<'a> {
+/// The arguments [`Cluster::plant_schedule`] takes, named rather than positional because four of
+/// the six are strings and a call site of bare literals says nothing.
+struct PlantedSchedule<'a> {
     name: &'a str,
     session_id: &'a str,
     every: &'a str,
     prompt: &'a str,
-    /// `None` for an ungated job, which fires a turn every occurrence. A gate that exits non-zero
-    /// under `succeeded` declines instead, which claims the occurrence without spending a turn --
-    /// the cheapest observable a scheduler test can have.
+    /// `None` for an ungated schedule, which fires a turn every occurrence. A gate that exits
+    /// non-zero under `succeeded` declines instead, which claims the occurrence without spending a
+    /// turn -- the cheapest observable a scheduler test can have.
     gate_command: Option<&'a str>,
     overdue_by: Duration,
 }
@@ -631,47 +631,48 @@ fn a_conversation_being_written_cannot_be_forked_out_from_under_itself() {
     assert_eq!(cluster.session_count(), 2);
 }
 
-/// How long the decoy job's gate blocks the host that claimed it. Long enough that the other host
-/// has tens of poll ticks inside the window, short enough that a test costs seconds.
+/// How long the decoy schedule's gate blocks the host that claimed it. Long enough that the other
+/// host has tens of poll ticks inside the window, short enough that a test costs seconds.
 const DECOY_GATE: Duration = Duration::from_secs(3);
 
-/// Plant a decoy alongside the job under test, so the two hosts *must* contend for it.
+/// Plant a decoy alongside the schedule under test, so the two hosts *must* contend for it.
 ///
 /// Left to their own tickers, two servers rarely collide: the first to tick claims the occurrence
 /// and puts the next one an hour out, and the second finds nothing due. Waiting for their phases to
 /// align by chance is what makes a race test flaky, so this arranges the collision instead.
 ///
-/// The decoy is more overdue than the real job, and `list_due_scheduled_jobs` orders by fire time,
+/// The decoy is more overdue than the real schedule, and `list_due_schedules` orders by fire time,
 /// so every host takes it first. Exactly one host can claim it; that host then sits inside the
 /// decoy's gate command for [`DECOY_GATE`] while still holding the due list it read *before* the
-/// claim -- a list in which the real job is unclaimed. The other host takes the real job during
-/// that window. When the blocked host reaches the real job it is holding a copy of a row that has
-/// moved, which is the exact interleaving two servers hit by chance in production.
+/// claim -- a list in which the real schedule is unclaimed. The other host takes the real schedule
+/// during that window. When the blocked host reaches the real schedule it is holding a copy of a
+/// row that has moved, which is the exact interleaving two servers hit by chance in production.
 ///
 /// Both rows land in one transaction, so no host can ever see a due list with one of them in it.
-fn plant_a_decoy_and_the_job(cluster: &Cluster, session: &str, job: PlantedJob<'_>) {
+fn plant_a_decoy_and_the_schedule(cluster: &Cluster, session: &str, schedule: PlantedSchedule<'_>) {
     let decoy = format!("sleep {}; exit 1", DECOY_GATE.as_secs());
-    cluster.plant_jobs(&[
-        PlantedJob {
+    cluster.plant_schedules(&[
+        PlantedSchedule {
             name: "decoy",
             session_id: session,
             every: "1h",
             prompt: "never delivered: the gate declines",
             gate_command: Some(&decoy),
-            // More overdue than the job under test, so it sorts first in every host's due list.
+            // More overdue than the schedule under test, so it sorts first in every host's due
+            // list.
             overdue_by: Duration::from_secs(600),
         },
-        job,
+        schedule,
     ]);
 }
 
 /// Two servers, one overdue occurrence, one gate execution.
 ///
-/// `every = "1h"` is what makes the count exact rather than statistical: the job is due once, and
-/// whichever host claims it puts the next occurrence an hour out, so a second gate run can only be
-/// a second claim of the *same* occurrence. Before the claim was a compare-and-swap both hosts ran
-/// it -- 64 microseconds apart in the audit that found this -- and for an ungated job that is two
-/// agent turns and two lots of spend, hourly, forever.
+/// `every = "1h"` is what makes the count exact rather than statistical: the schedule is due once,
+/// and whichever host claims it puts the next occurrence an hour out, so a second gate run can only
+/// be a second claim of the *same* occurrence. Before the claim was a compare-and-swap both hosts
+/// ran it -- 64 microseconds apart in the audit that found this -- and for an ungated schedule that
+/// is two agent turns and two lots of spend, hourly, forever.
 #[test]
 fn two_servers_do_not_both_claim_one_scheduled_occurrence() {
     let cluster = Cluster::new("[schedule]\npoll_interval = \"200ms\"\n");
@@ -689,7 +690,7 @@ fn two_servers_do_not_both_claim_one_scheduled_occurrence() {
 
     let log = cluster.path("gate.log");
     let gate = record_a_run_then_decline(&log);
-    plant_a_decoy_and_the_job(&cluster, &session, PlantedJob {
+    plant_a_decoy_and_the_schedule(&cluster, &session, PlantedSchedule {
         name: "shared",
         session_id: &session,
         every: "1h",
@@ -703,8 +704,8 @@ fn two_servers_do_not_both_claim_one_scheduled_occurrence() {
         Duration::from_secs(30),
         || gate_runs(&log) >= 1,
     );
-    // Past the decoy's gate, so the host it blocked has reached the job under test and been told
-    // no. Without that answer it runs the gate a second time, here.
+    // Past the decoy's gate, so the host it blocked has reached the schedule under test and been
+    // told no. Without that answer it runs the gate a second time, here.
     std::thread::sleep(DECOY_GATE + Duration::from_secs(2));
     let logs = format!(
         "--- server one ---\n{}\n--- server two ---\n{}",
@@ -729,8 +730,9 @@ fn two_servers_do_not_both_claim_one_scheduled_occurrence() {
 /// The store is rewound to the shape a 0.42 release left, stamp included, so both processes find
 /// work waiting rather than racing over nothing. The rewind covers what the replay reads by name:
 /// the `provider_credentials` view, without which an unversioned store is classified past every
-/// step this test races, the `messages` and `blobs` columns the frozen 0.46 conversions name, and
-/// the recall table under the name the frozen 0.46 step creates it by.
+/// step this test races, the `messages` and `blobs` columns the frozen 0.46 conversions name, the
+/// recall table under the name the frozen 0.46 step creates it by, and the schedules table under
+/// the name the frozen steps read it by.
 #[test]
 fn two_processes_migrating_one_store_apply_it_once() {
     let cluster = Cluster::new("");
@@ -738,7 +740,8 @@ fn two_processes_migrating_one_store_apply_it_once() {
         let connection = rusqlite::Connection::open(cluster.database()).expect("open the store");
         connection
             .execute_batch(
-                "ALTER TABLE scheduled_jobs DROP COLUMN gate_kind;
+                "ALTER TABLE schedules RENAME TO scheduled_jobs;
+                 ALTER TABLE scheduled_jobs DROP COLUMN gate_kind;
                  ALTER TABLE scheduled_jobs DROP COLUMN gate_spec_json;
                  ALTER TABLE scheduled_jobs DROP COLUMN claimed_by;
                  ALTER TABLE scheduled_jobs DROP COLUMN claim_expires_at;
@@ -787,8 +790,8 @@ fn two_processes_migrating_one_store_apply_it_once() {
     assert!(version >= 3, "the store reached head, got {version}");
 
     for (table, column) in [
-        ("scheduled_jobs", "claimed_by"),
-        ("scheduled_jobs", "gate_kind"),
+        ("schedules", "claimed_by"),
+        ("schedules", "gate_kind"),
         ("sessions", "profile"),
     ] {
         let occurrences: i64 = connection
@@ -1047,6 +1050,226 @@ fn a_fresh_run_still_stops_when_no_default_can_be_picked() {
         !refused.contains("127.0.0.1:9/"),
         "nothing should have been sent anywhere: {refused}"
     );
+}
+
+/// A session another process holds is that process's to drive. `meka serve` does nothing with it,
+/// pass after pass: its waiting item is neither read nor written, so a turn of the holder is
+/// offered the item the whole time. Once the lock is let go, a server loads the session and
+/// delivers it.
+#[test]
+fn a_server_leaves_the_inbox_of_a_session_another_process_holds_to_it() {
+    let cluster = Cluster::new("[schedule]\npoll_interval = \"200ms\"\n");
+    let reply = serde_json::json!([
+        {"type": "text", "text": "done"},
+        {"type": "message_end", "stop_reason": "end_turn"},
+    ]);
+    cluster.script(serde_json::json!([reply, reply, reply]));
+    let made = cluster.run(&["--oneshot", "-p", "the held session"]);
+    assert!(made.status.success(), "{made:?}");
+    let held = cluster.only_session();
+    let made = cluster.run(&["--oneshot", "-p", "the free session"]);
+    assert!(made.status.success(), "{made:?}");
+    let free = cluster.read(|connection| {
+        connection.query_row("SELECT id FROM sessions WHERE id != ?1", [&held], |row| {
+            row.get::<_, String>(0)
+        })
+    });
+
+    // The stand-in for a screen open on the session: the lock `Store::lock_session` takes.
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(
+            cluster
+                .install
+                .data_dir()
+                .join("locks")
+                .join(format!("{held}.lock")),
+        )
+        .expect("open the session's lock file");
+    lock.try_lock().expect("nobody holds the session yet");
+
+    let mut alpha = cluster.serve("alpha");
+    let plant = |session_id: &str| -> String {
+        support::plant_inbox_item(&cluster.database(), session_id, "steer", "check the tests")
+    };
+    let state = |item_id: &str| -> (u32, Option<String>, Option<String>) {
+        cluster.read(|connection| {
+            connection.query_row(
+                "SELECT attempts, not_before, delivered_at FROM inbox_items WHERE id = ?1",
+                [item_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+        })
+    };
+    let held_item = plant(&held);
+    // Each delivery on the free session is a pass that listed the held one beside it, and more
+    // passes run while each turn does.
+    for _ in 0..2 {
+        let free_item = plant(&free);
+        wait_until(
+            "the free session's item to be delivered",
+            Duration::from_secs(30),
+            || state(&free_item).2.is_some(),
+        );
+    }
+    let logs = alpha.stop();
+    let (attempts, not_before, delivered_at) = state(&held_item);
+    assert_eq!(
+        (attempts, not_before.as_deref(), delivered_at.as_deref()),
+        (0, None, None),
+        "the held session's item was touched\n{logs}"
+    );
+    // A driver that went as far as trying to load the session would say so, and one that then
+    // woke itself over the item it left would say so on every pass.
+    assert!(
+        !logs.contains(&held),
+        "the server acted on the held session\n{logs}"
+    );
+
+    drop(lock);
+    let _beta = cluster.serve("beta");
+    wait_until(
+        "the item to be delivered once the session is free",
+        Duration::from_secs(30),
+        || state(&held_item).2.is_some(),
+    );
+}
+
+/// A schedule on a session another process holds is that process's to check, since its turns are
+/// the ones that read the fire: `meka serve` beside it neither queues a second fire for it nor
+/// touches the fire it has waiting, while it fires another session's schedule from the same due
+/// list.
+#[test]
+fn a_server_neither_fires_nor_touches_the_schedules_of_a_session_another_process_holds() {
+    let cluster = Cluster::new("[schedule]\npoll_interval = \"200ms\"\n");
+    let reply = serde_json::json!([
+        {"type": "text", "text": "done"},
+        {"type": "message_end", "stop_reason": "end_turn"},
+    ]);
+    cluster.script(serde_json::json!([reply, reply, reply]));
+    let made = cluster.run(&["--oneshot", "-p", "the held session"]);
+    assert!(made.status.success(), "{made:?}");
+    let held = cluster.only_session();
+    let made = cluster.run(&["--oneshot", "-p", "the free session"]);
+    assert!(made.status.success(), "{made:?}");
+    let free = cluster.read(|connection| {
+        connection.query_row("SELECT id FROM sessions WHERE id != ?1", [&held], |row| {
+            row.get::<_, String>(0)
+        })
+    });
+
+    // The stand-in for a screen open on the session: the lock `Store::lock_session` takes.
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(
+            cluster
+                .install
+                .data_dir()
+                .join("locks")
+                .join(format!("{held}.lock")),
+        )
+        .expect("open the session's lock file");
+    lock.try_lock().expect("nobody holds the session yet");
+
+    // The held session's the more overdue, so every sweep is offered it ahead of the free one's.
+    cluster.plant_schedules(&[
+        PlantedSchedule {
+            name: "held",
+            session_id: &held,
+            every: "1h",
+            prompt: "the held session's schedule",
+            gate_command: None,
+            overdue_by: Duration::from_secs(600),
+        },
+        PlantedSchedule {
+            name: "free",
+            session_id: &free,
+            every: "1h",
+            prompt: "the free session's schedule",
+            gate_command: None,
+            overdue_by: Duration::from_secs(60),
+        },
+    ]);
+    // The fire the holder queued for an earlier occurrence, waiting for its next pause.
+    let waiting = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    cluster.read(|connection| {
+        connection.execute(
+            "INSERT INTO inbox_items (id, session_id, class, source, body, created_at, \
+             schedule_id, occurrences, due_at, fired_at) \
+             VALUES (?1, ?2, 'steer', '', 'the held session''s schedule', ?3, 'schedule-held', 2, \
+             ?3, ?3)",
+            rusqlite::params![waiting, held, now],
+        )
+    });
+    let schedule_of = |name: &str| -> (String, u32, Option<String>, Option<String>) {
+        cluster.read(|connection| {
+            connection.query_row(
+                "SELECT next_fire_at, attempts, claimed_by, last_fired_at FROM schedules \
+                 WHERE id = ?1",
+                [format!("schedule-{name}")],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+        })
+    };
+    let held_before = schedule_of("held");
+
+    let mut alpha = cluster.serve("alpha");
+    wait_until(
+        "the free session's fire to be delivered",
+        Duration::from_secs(30),
+        || {
+            cluster.read(|connection| {
+                connection.query_row(
+                    "SELECT count(*) FROM inbox_items WHERE session_id = ?1 \
+                     AND schedule_id IS NOT NULL AND delivered_at IS NOT NULL",
+                    [&free],
+                    |row| row.get::<_, i64>(0),
+                )
+            }) > 0
+        },
+    );
+    let logs = alpha.stop();
+
+    assert_eq!(
+        schedule_of("held"),
+        held_before,
+        "the held session's schedule was claimed or spent\n{logs}"
+    );
+    // An item's id, count and attempts, and when it may run next and when it was appended.
+    type Row = (String, u32, u32, Option<String>, Option<String>);
+    let items: Vec<Row> = cluster.read(|connection| {
+        let mut statement = connection.prepare(
+            "SELECT id, occurrences, attempts, not_before, appended_at FROM inbox_items \
+                 WHERE session_id = ?1",
+        )?;
+        let rows = statement.query_map([&held], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?;
+        rows.collect()
+    });
+    assert_eq!(
+        items,
+        [(waiting, 2, 0, None, None)],
+        "the held session's waiting fire was joined or touched\n{logs}"
+    );
+    assert!(
+        !logs.contains(&held),
+        "the server acted on the held session\n{logs}"
+    );
+    drop(lock);
 }
 
 /// `DELETE /v1/sessions/{id}` goes through the same locked door `meka session remove` does: a

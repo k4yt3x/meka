@@ -200,7 +200,7 @@ pub(crate) fn take_background_flag(
 /// What every door does with a call's arguments before a tool sees them, so no door can forget a
 /// step. A call whose arguments were not a JSON object (see
 /// [`crate::provider::finalize_tool_arguments`]) is refused with the reason, `unparsed` being what
-/// the model sent; a door with no call behind it, the job gate, passes `None`. Meka's own
+/// the model sent; a door with no call behind it, the schedule gate, passes `None`. Meka's own
 /// parameters are type-checked, because a wrong type read as absent would be a silent no-op the
 /// model has no way to notice. And `background` is taken out, since it is spliced into the schema
 /// by the registry and consumed by the dispatcher, so no tool, least of all a remote MCP server,
@@ -713,7 +713,7 @@ pub(crate) struct ToolOutput {
     /// Set from MCP's `structuredContent`. That value is *also* rendered into `content` as a
     /// fenced JSON block so the model can reason over it, but that rendering is a presentation
     /// choice and the format string is free to change. Anything evaluating a result (a
-    /// scheduled job's gate predicate is the one caller today) must read this field rather
+    /// schedule's gate predicate is the one caller today) must read this field rather
     /// than parse the markdown back out, or a readability tweak to the block silently changes
     /// what the predicate decides.
     ///

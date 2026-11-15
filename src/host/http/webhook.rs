@@ -1,7 +1,7 @@
 //! Outbound webhooks for `meka serve`.
 //!
 //! Everything else in the HTTP API answers a question a client asked. This is the one direction
-//! that has to work when nobody is asking: a scheduled job fires at 3am and a background task
+//! that has to work when nobody is asking: a schedule fires at 3am and a background task
 //! finishes twenty minutes after the turn that started it, and without a push the only trace either
 //! leaves is rows in SQLite that something has to poll to discover.
 //!
@@ -15,7 +15,7 @@
 //!
 //! **Delivery never blocks the work that triggered it.** Each send is a detached task with bounded
 //! retries. A webhook receiver that hangs must not wedge the scheduler behind it, because the next
-//! job is someone else's.
+//! schedule is someone else's.
 
 use std::{sync::Arc, time::Duration};
 
@@ -127,7 +127,7 @@ pub(crate) struct WebhookDispatcher {
 impl WebhookDispatcher {
     pub(crate) fn new(endpoints: Vec<ResolvedWebhook>) -> Self {
         // One client for the process: it pools connections, which matters for a receiver being hit
-        // once per scheduled job. Built only when something is configured, so the common
+        // once per schedule. Built only when something is configured, so the common
         // no-webhooks deployment pays nothing.
         let client = if endpoints.is_empty() {
             None
@@ -358,9 +358,9 @@ impl DeliveryTask {
                     //
                     // 429 and 408 are the exceptions: both say "not now" rather than "not ever",
                     // and they are what a receiver returns for precisely the traffic shape this
-                    // module produces. Several jobs sharing a cron minute deliver as a burst, and
-                    // dropping a rate-limited delivery would lose the 9am report to the one thing
-                    // the receiver was explicitly asking Meka to wait out.
+                    // module produces. Several schedules sharing a cron minute deliver as a burst,
+                    // and dropping a rate-limited delivery would lose the 9am report to the one
+                    // thing the receiver was explicitly asking Meka to wait out.
                     let retryable = matches!(
                         status,
                         reqwest::StatusCode::TOO_MANY_REQUESTS

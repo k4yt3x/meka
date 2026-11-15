@@ -85,7 +85,7 @@ pub(crate) enum TurnSource {
     Client,
     /// The inbox driver, on items another session, agent or client left.
     Inbox,
-    /// A scheduled job firing.
+    /// A schedule firing.
     Schedule,
     /// Finished background work delivered as a turn of its own.
     Background,

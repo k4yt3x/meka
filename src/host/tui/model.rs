@@ -1174,6 +1174,31 @@ impl Transcript {
         }
     }
 
+    /// Let the waiting prompt items go that the inbox gave up on or took back: each is a prompt
+    /// nothing ran, no longer said to wait for a turn that will not read it.
+    pub(crate) fn mark_withdrawn(&mut self, ids: &[Uuid]) {
+        for index in 0..self.tail.len() {
+            if let Some(Entry {
+                item:
+                    Item::Prompt {
+                        class,
+                        inbox_id,
+                        delivered: false,
+                        ran_under,
+                        ..
+                    },
+                ..
+            }) = self.tail.get_mut(index)
+                && inbox_id.is_some_and(|id| ids.contains(&id))
+            {
+                *class = None;
+                *inbox_id = None;
+                *ran_under = RanUnder::Unrecorded;
+                self.touch(index);
+            }
+        }
+    }
+
     /// Give the prompt at `index`, once delivered, the level of the running turn it joined.
     fn join_running_turn(&mut self, index: usize) {
         let Some(level) = self.turn_level else {
@@ -1487,20 +1512,34 @@ impl Transcript {
                     }
                 }
             }
-            // A typed prompt is never withdrawn here, and a scheduled fire's withdrawal is the
-            // schedule's own bookkeeping.
+            // A typed prompt is never withdrawn here, and an inbox turn's withdrawal is the inbox's
+            // own bookkeeping.
             FrontendEvent::PromptWithdrawn => {}
-            // Words another client posted, landing at a round boundary: drawn where they land,
-            // as a replay draws them.
-            FrontendEvent::InboxAppended { blocks } => {
-                for block in &blocks {
-                    if let Some(item) = self.inbox_prompt(block) {
+            // Words another client posted and a schedule's fire, landing at a round boundary:
+            // drawn where they land, as a replay draws them. A fire is said as the stage direction
+            // a replay says, with how late it ran, which only the live announcement knows.
+            FrontendEvent::InboxAppended { blocks, late } => {
+                for (position, block) in blocks.iter().enumerate() {
+                    if let ContentBlock::Scheduled {
+                        schedule_id,
+                        prompt,
+                        ..
+                    } = block
+                    {
+                        self.close_streams();
+                        self.push_left_to_replay(Item::note(crate::render::fire_direction(
+                            schedule_id,
+                            prompt,
+                            lateness_of(&late, position),
+                        )));
+                    } else if let Some(item) = self.inbox_prompt(block) {
                         self.close_streams();
                         self.push(item);
                     }
                 }
             }
             FrontendEvent::InboxDelivered { item_ids } => self.mark_delivered(&item_ids),
+            FrontendEvent::InboxWithdrawn { item_id } => self.mark_withdrawn(&[item_id]),
             // The reply is recorded as it came, with no words to draw, so the screen says what
             // happened in its own words, as the replay of the log says it.
             FrontendEvent::NoAnswer => {
@@ -1557,9 +1596,15 @@ impl Transcript {
                 let mut ahead = self.opening_at.take();
                 for (position, block) in message.content.iter().enumerate() {
                     let item = match block {
-                        ContentBlock::Scheduled { job_id, prompt, .. } => {
-                            Item::note(crate::render::fire_direction(job_id, prompt, late))
-                        }
+                        ContentBlock::Scheduled {
+                            schedule_id,
+                            prompt,
+                            ..
+                        } => Item::note(crate::render::fire_direction(
+                            schedule_id,
+                            prompt,
+                            lateness_of(&late, position),
+                        )),
                         ContentBlock::BackgroundReport { .. } => {
                             Item::note(crate::background::report_direction(&outcomes))
                         }
@@ -2124,9 +2169,15 @@ impl Transcript {
                     // Folded into the words around it by `conversation::mentions_inline`.
                     ContentBlock::Resource { .. } => {}
                     // Meka's words: a replay says the stage direction the live screen said.
-                    ContentBlock::Scheduled { job_id, prompt, .. } => {
+                    ContentBlock::Scheduled {
+                        schedule_id,
+                        prompt,
+                        ..
+                    } => {
                         let entry = self.entry(Item::note(crate::render::fire_direction(
-                            job_id, prompt, None,
+                            schedule_id,
+                            prompt,
+                            None,
                         )));
                         out.push(entry);
                     }
@@ -2447,6 +2498,17 @@ fn background_row(started: &crate::conversation::BackgroundStart) -> String {
     }
 }
 
+/// How late the fire whose block is at `position` among its announcement's blocks ran, when the
+/// announcement says so.
+fn lateness_of(
+    late: &[crate::frontend::LateFire],
+    position: usize,
+) -> Option<crate::frontend::FireLateness> {
+    late.iter()
+        .find(|fire| fire.block == position)
+        .map(|fire| fire.lateness)
+}
+
 /// What a compaction's row shows it did: the checkpoint's rounds, or, on a boundary that recorded
 /// none, the memories its record names, each as the call that wrote it, since a memory is the one
 /// durable thing a checkpoint leaves and those names were observed from its calls.
@@ -2713,7 +2775,7 @@ mod tests {
                 provider_fields: None,
             },
             outcomes: Vec::new(),
-            late: None,
+            late: Vec::new(),
         });
         assert_eq!(
             ran(&live),
@@ -3086,6 +3148,37 @@ mod tests {
             delivered: true,
             ..
         }));
+    }
+
+    /// A steer the inbox gave up on or took back no longer says it waits: it is a prompt nothing
+    /// ran, and the others keep their marks.
+    #[test]
+    fn a_steer_the_inbox_lets_go_of_no_longer_says_it_waits() {
+        let mut transcript = transcript();
+        let steer = |id| Item::Prompt {
+            text: "also check the logs".into(),
+            class: Some(InboxClass::Steer),
+            inbox_id: Some(id),
+            delivered: false,
+            ran_under: RanUnder::Level(crate::permission::Permission::Read),
+        };
+        let given_up = Uuid::new_v4();
+        let still_waiting = Uuid::new_v4();
+        transcript.push(steer(given_up));
+        transcript.push(steer(still_waiting));
+        transcript.mark_withdrawn(&[given_up]);
+        assert!(
+            matches!(items(&transcript)[0], Item::Prompt {
+                class: None,
+                inbox_id: None,
+                delivered: false,
+                ran_under: RanUnder::Unrecorded,
+                ..
+            }),
+            "{:?}",
+            items(&transcript)[0]
+        );
+        assert_eq!(items(&transcript)[1], &steer(still_waiting));
     }
 
     /// Two checklist updates with nothing between them are one item, the latest; one after an
@@ -3810,7 +3903,7 @@ mod tests {
         live.apply(FrontendEvent::MessageAppended {
             message: opening.clone(),
             outcomes: Vec::new(),
-            late: None,
+            late: Vec::new(),
         });
         let mut replayed = transcript();
         replayed.load_page_above(page(vec![Event::Append(opening)], 1, false));
@@ -4329,9 +4422,9 @@ mod tests {
                 }]),
                 said("Noted."),
                 user(vec![context(), ContentBlock::Scheduled {
-                    job_id: "1a2b3c4d-0000-4000-8000-000000000000".to_string(),
+                    schedule_id: "1a2b3c4d-0000-4000-8000-000000000000".to_string(),
                     prompt: "remind me to stretch".to_string(),
-                    text: "[Scheduled job 1a2b3c4d fired now]\n\nremind me to stretch".to_string(),
+                    text: "[Schedule 1a2b3c4d fired now]\n\nremind me to stretch".to_string(),
                 }]),
                 said("Stretching."),
                 user(vec![context(), ContentBlock::BackgroundReport {
@@ -4370,12 +4463,12 @@ mod tests {
             })
             .collect();
         assert_eq!(notes, vec![
-            "Scheduled job 1a2b3c4d fired: remind me to stretch",
+            "Schedule 1a2b3c4d fired: remind me to stretch",
             "Background task 7f3a1c22 finished after 30s",
             "Background task report",
         ]);
         assert!(
-            !shown.iter().any(|item| matches!(item, Item::Prompt { text, .. } if text.contains("[Scheduled") || text.contains("[Background"))),
+            !shown.iter().any(|item| matches!(item, Item::Prompt { text, .. } if text.contains("[Schedule ") || text.contains("[Background"))),
             "nothing Meka wrote is shown as a prompt: {shown:?}"
         );
     }
@@ -4918,9 +5011,9 @@ mod tests {
                         text: "[Background task reporting]\nok".to_string(),
                     },
                     ContentBlock::Scheduled {
-                        job_id: "1a2b3c4d-0000-4000-8000-000000000000".to_string(),
+                        schedule_id: "1a2b3c4d-0000-4000-8000-000000000000".to_string(),
                         prompt: "stretch".to_string(),
-                        text: "[Scheduled job 1a2b3c4d fired]\n\nstretch".to_string(),
+                        text: "[Schedule 1a2b3c4d fired]\n\nstretch".to_string(),
                     },
                     ContentBlock::Text {
                         text: "typed".to_string(),
@@ -4930,10 +5023,13 @@ mod tests {
                 provider_fields: None,
             },
             outcomes: vec![task],
-            late: Some(crate::frontend::FireLateness {
-                late_by: chrono::Duration::hours(2),
-                coalesced: 0,
-            }),
+            late: vec![crate::frontend::LateFire {
+                block: 2,
+                lateness: crate::frontend::FireLateness {
+                    late_by: chrono::Duration::hours(2),
+                    coalesced: 0,
+                },
+            }],
         });
         let drawn = items(&transcript);
         let notes: Vec<&str> = drawn
@@ -4945,7 +5041,7 @@ mod tests {
             .collect();
         assert_eq!(notes, [
             "Background task 7f3a1c22 finished after 30s",
-            "Scheduled job 1a2b3c4d fired 2h late, replacing 1 missed occurrence: stretch",
+            "Schedule 1a2b3c4d fired 2h late, replacing 1 missed occurrence: stretch",
         ]);
         assert!(
             !drawn
@@ -4990,7 +5086,7 @@ mod tests {
                 provider_fields: None,
             },
             outcomes: Vec::new(),
-            late: None,
+            late: Vec::new(),
         });
         let prompts = |transcript: &Transcript| -> Vec<(String, bool)> {
             items(transcript)
@@ -5479,7 +5575,7 @@ mod tests {
                 provider_fields: None,
             },
             outcomes: Vec::new(),
-            late: None,
+            late: Vec::new(),
         });
         assert_eq!(shape(&reported), vec!["note", "prompt"]);
     }
@@ -5612,6 +5708,7 @@ mod tests {
         };
         transcript.apply(FrontendEvent::InboxAppended {
             blocks: vec![block(mine, "mine"), block(Uuid::new_v4(), "from afar")],
+            late: Vec::new(),
         });
         let prompts: Vec<&str> = items(&transcript)
             .into_iter()
@@ -5621,6 +5718,138 @@ mod tests {
             })
             .collect();
         assert_eq!(prompts, vec!["mine", "from afar"]);
+    }
+
+    /// A fire read behind a round's results is said where it lands, as the stage direction a
+    /// replay says, with how late it ran when the announcement names it; a replay of the message
+    /// says the same row after the round's results, without the lateness.
+    #[test]
+    fn a_fire_read_behind_a_round_is_said_where_it_lands_and_replayed_there() {
+        let schedule_id = "1a2b3c4d-0000-4000-8000-000000000000";
+        let fire = || ContentBlock::Scheduled {
+            schedule_id: schedule_id.into(),
+            prompt: "check the deploy".into(),
+            text: "[Schedule 1a2b3c4d fired now]\n\ncheck the deploy".into(),
+        };
+        let shown = |transcript: &Transcript| -> Vec<String> {
+            items(transcript)
+                .into_iter()
+                .map(|item| match item {
+                    Item::ToolCall { id, .. } => format!("call {id}"),
+                    Item::Notice { text, .. } => text.clone(),
+                    other => format!("{other:?}"),
+                })
+                .collect()
+        };
+        let live = |late: Vec<crate::frontend::LateFire>| {
+            let mut transcript = transcript();
+            transcript.apply(FrontendEvent::ToolCallStarted {
+                id: "c1".into(),
+                name: "shell_execute".into(),
+                input: serde_json::json!({"command": "ls"}),
+                display_summary: Some("ls".into()),
+                unparsed: None,
+            });
+            transcript.apply(FrontendEvent::ToolCallCompleted {
+                id: "c1".into(),
+                name: "shell_execute".into(),
+                is_error: false,
+                content: vec![ToolResultContent::Text { text: "a\n".into() }],
+                metadata: None,
+                display: None,
+            });
+            transcript.apply(FrontendEvent::InboxAppended {
+                blocks: vec![fire()],
+                late,
+            });
+            shown(&transcript)
+        };
+        assert_eq!(
+            live(vec![crate::frontend::LateFire {
+                block: 0,
+                lateness: crate::frontend::FireLateness {
+                    late_by: chrono::Duration::hours(2),
+                    coalesced: 2,
+                },
+            }]),
+            [
+                "call c1",
+                "Schedule 1a2b3c4d fired 2h late, replacing 3 missed occurrences: check the deploy"
+            ]
+        );
+        let on_time = live(Vec::new());
+        assert_eq!(on_time, [
+            "call c1",
+            "Schedule 1a2b3c4d fired: check the deploy"
+        ]);
+
+        let mut replayed = transcript();
+        replayed.load_page_above(page(
+            vec![
+                Event::Append(Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: "c1".into(),
+                        name: "shell_execute".into(),
+                        input: serde_json::json!({"command": "ls"}),
+                        unparsed: None,
+                        provider_fields: None,
+                    }],
+                    provider_fields: None,
+                }),
+                Event::Append(Message {
+                    role: Role::User,
+                    content: vec![
+                        ContentBlock::ToolResult {
+                            tool_use_id: "c1".into(),
+                            content: vec![ToolResultContent::Text { text: "a\n".into() }],
+                            is_error: false,
+                            display: None,
+                        },
+                        fire(),
+                    ],
+                    provider_fields: None,
+                }),
+            ],
+            1,
+            false,
+        ));
+        assert_eq!(shown(&replayed), on_time);
+    }
+
+    /// Two fires of one schedule read together, as a rewind that put an older one back beside the
+    /// one waiting leaves them, each say how late they ran.
+    #[test]
+    fn two_fires_of_one_schedule_read_together_each_say_their_own_lateness() {
+        let fire = || ContentBlock::Scheduled {
+            schedule_id: "1a2b3c4d-0000-4000-8000-000000000000".into(),
+            prompt: "check the deploy".into(),
+            text: "[Schedule 1a2b3c4d fired]\n\ncheck the deploy".into(),
+        };
+        let late = |block, hours, coalesced| crate::frontend::LateFire {
+            block,
+            lateness: crate::frontend::FireLateness {
+                late_by: chrono::Duration::hours(hours),
+                coalesced,
+            },
+        };
+        let mut transcript = transcript();
+        transcript.apply(FrontendEvent::InboxAppended {
+            blocks: vec![fire(), fire()],
+            late: vec![late(0, 2, 2), late(1, 1, 0)],
+        });
+        let drawn = items(&transcript);
+        let notes: Vec<&str> = drawn
+            .iter()
+            .filter_map(|item| match item {
+                Item::Notice { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notes, [
+            "Schedule 1a2b3c4d fired 2h late, replacing 3 missed occurrences: check the deploy",
+            "Schedule 1a2b3c4d fired 1h late, replacing 1 missed occurrence: check the deploy",
+        ]);
     }
 
     fn succeeded() -> FrontendEvent {
@@ -5904,6 +6133,7 @@ mod tests {
                 body: "mine".into(),
                 text: "mine".into(),
             }],
+            late: Vec::new(),
         });
         transcript.apply(FrontendEvent::TurnEnded {
             turn_id: Uuid::new_v4(),
@@ -6010,7 +6240,7 @@ mod tests {
                 provider_fields: None,
             },
             outcomes: Vec::new(),
-            late: None,
+            late: Vec::new(),
         });
         assert!(
             matches!(items(&transcript)[..], [

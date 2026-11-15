@@ -2371,12 +2371,12 @@ pub(crate) enum ContentBlock {
         body: String,
         text: String,
     },
-    /// A scheduled job's fire as the model read it: `text` is the header, the job's words and the
-    /// gate's output when it had one, `prompt` the job's words alone. Its own block, so a replay
-    /// says the stage direction the live screen said rather than showing a prompt nobody typed,
-    /// and a title or a search reads the job's words.
+    /// A schedule's fire as the model read it: `text` is the header, the schedule's words and the
+    /// gate's output when it had one, `prompt` the schedule's words alone. Its own block, so a
+    /// replay says the stage direction the live screen said rather than showing a prompt nobody
+    /// typed, and a title or a search reads the schedule's words.
     Scheduled {
-        job_id: String,
+        schedule_id: String,
         prompt: String,
         text: String,
     },
@@ -2531,7 +2531,7 @@ impl ContentBlock {
     }
 
     /// The words a person sent in this block, for a title and the search index: typed text, an
-    /// inbox item's body under the header Meka wrote, a scheduled job's prompt under its fire
+    /// inbox item's body under the header Meka wrote, a schedule's prompt under its fire
     /// header, the words typed with an invocation (a file attached among them by its mention, as
     /// the editor showed it) or, with none, the name it invoked. `None` for what Meka wrote, a
     /// stand-in it put where content was included, a resource block of its own, and for a block
@@ -2838,7 +2838,7 @@ impl Message {
     }
 
     /// Whether this message is shaped as a prompt to the model: user role, words rather than
-    /// results. The user's turn, a scheduled job's, or a nudge. A compaction splits on it and keeps
+    /// results. The user's turn, a schedule's, or a nudge. A compaction splits on it and keeps
     /// a trailing one, since the model has it to answer whoever wrote it.
     pub(crate) fn is_prompt(&self) -> bool {
         self.role == Role::User && !self.carries_tool_results()
@@ -2881,7 +2881,7 @@ impl Message {
     }
 
     /// The user message a turn appends: Meka's context block, then what follows it as blocks, a
-    /// background report and the words as typed or a scheduled job's fire, each absent when the
+    /// background report and the words as typed or a schedule's fire, each absent when the
     /// turn has none, then any input images. The words are left out when there are none, so
     /// [`Self::text_content`] stays what the user typed.
     pub(crate) fn turn_opening(
@@ -3259,7 +3259,7 @@ impl Message {
 /// The prompt is persisted eagerly, before the first provider call, so a crash mid-roundtrip cannot
 /// lose it. That is right when losing it would be losing something, and wrong when the prompt will
 /// simply be produced again. Whoever submits the turn knows which, so each host states it through
-/// `TurnInput::retaining`: the scheduler per job, the HTTP API from the client's own request.
+/// `TurnInput::retaining`: the scheduler per schedule, the HTTP API from the client's own request.
 ///
 /// One spelling per value, [`Self::name`], is what `Display`, `FromStr` and serde all go through.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -3268,13 +3268,13 @@ pub(crate) enum PromptRetention {
     /// Keep it. A human typed it and can see the error, or it carries something that exists nowhere
     /// else: a background-task outcome, whose row is stamped `delivered` before the turn starts
     /// and handed out again only if the turn is refused before it opens or cannot store it, or a
-    /// one-shot job's fire, whose row is retired with the turn.
+    /// one-shot schedule's fire, whose row is retired with the turn.
     #[default]
     Keep,
-    /// Withdraw it, because whoever produced it will produce it again: a recurring job on its next
-    /// occurrence, whose fire says how many were missed, or a client that resends a failed turn and
-    /// said so. Left in place, an outage would deposit one unanswered user message per attempt for
-    /// as long as it lasted.
+    /// Withdraw it, because whoever produced it will produce it again: a recurring schedule on its
+    /// next occurrence, whose fire says how many were missed, or a client that resends a failed
+    /// turn and said so. Left in place, an outage would deposit one unanswered user message per
+    /// attempt for as long as it lasted.
     Withdraw,
 }
 

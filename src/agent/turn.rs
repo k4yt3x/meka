@@ -35,11 +35,49 @@ impl TurnOutcome {
         }
     }
 }
-/// What a turn is asked. Either a prompt somebody typed (a user, a scheduled job, a spawning
-/// agent) or a batch of finished background work that earned a turn of its own, with the images
-/// attached, whether the prompt is withdrawn if the turn fails, and the outcomes riding ahead of
-/// it. Built by every host and every out-of-band driver alike, so the join into one user message
-/// and the retention rule live here and nowhere else.
+/// The inbox items a turn's opening took, told to the driver that opened the turn. They are the
+/// items it handed in as they are by then: a fire an occurrence joined meanwhile has another id.
+/// What a stop or a failure deals with afterwards is what the opening took, not what the driver
+/// read. Empty until the turn opens, and for one that ends before it does.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OpenedOn(Arc<std::sync::Mutex<Vec<Uuid>>>);
+
+impl OpenedOn {
+    /// The ids the opening took, in the order its message carries them.
+    pub(crate) fn ids(&self) -> Vec<Uuid> {
+        crate::sync::lock(&self.0).clone()
+    }
+
+    fn record(&self, ids: &[Uuid]) {
+        *crate::sync::lock(&self.0) = ids.to_vec();
+    }
+}
+
+/// Whether `item`, waiting now, is one of the items `handed_in` to a turn: the same item, or a fire
+/// among them under the id an occurrence that joined it has given it since. A join keeps the item's
+/// age, so the same schedule and the same `created_at` are the same fire; one queued after the fire
+/// handed in was withdrawn is another fire, which the turn was not opened on.
+pub(crate) fn stands_for_any(
+    item: &crate::store::inbox::InboxItem,
+    handed_in: &[crate::store::inbox::InboxItem],
+) -> bool {
+    use crate::store::inbox::InboxOrigin;
+    handed_in.iter().any(|given| {
+        given.id == item.id
+            || (given.created_at == item.created_at
+                && matches!(
+                    (&given.origin, &item.origin),
+                    (InboxOrigin::Fire(given), InboxOrigin::Fire(waiting))
+                        if given.schedule_id == waiting.schedule_id
+                ))
+    })
+}
+
+/// What a turn is asked. Either a prompt somebody typed (a user, a spawning agent), the inbox
+/// items a driver opens it on, or a batch of finished background work that earned a turn of its
+/// own, with the images attached, whether the prompt is withdrawn if the turn fails, and the
+/// outcomes riding ahead of it. Built by every host and every out-of-band driver alike, so the
+/// join into one user message and the retention rule live here and nowhere else.
 pub(crate) struct TurnInput {
     prompt: Prompt,
     images: Vec<ImageSource>,
@@ -50,8 +88,10 @@ pub(crate) struct TurnInput {
     /// what is waiting for itself once it knows its session, so no door can forget; a driver
     /// that opens a turn on items it already read hands them over here instead.
     inbox: Vec<crate::store::inbox::InboxItem>,
-    /// Where the prompt came from, as the billing header reports it. Each door sets its own; the
-    /// scheduler restates a fired job's, since its words are typed by nobody.
+    /// Where the driver that handed items in is told which the opening took.
+    opened_on: OpenedOn,
+    /// Where the prompt came from, as the billing header reports it. Each door sets its own; a
+    /// turn opened on fires alone is a schedule's, since its words are typed by nobody.
     origin: crate::provider::TurnOrigin,
     /// The id the turn's row and every event about it carry. Minted here, and replaced by a host
     /// that announces the turn under an id of its own, so the feed and the rows agree.
@@ -63,14 +103,6 @@ enum Prompt {
     /// invocation, the resources an editor attached among the words, in the order sent. Empty
     /// for a turn opened on images or inbox items alone.
     Sent(Vec<ContentBlock>),
-    /// A scheduled job's fire: the job, its words, the text the model reads, header and gate
-    /// output included, and how late it was when that is worth announcing.
-    Scheduled {
-        job_id: String,
-        prompt: String,
-        text: String,
-        late: Option<crate::frontend::FireLateness>,
-    },
     Outcomes(Vec<crate::store::background::BackgroundTask>),
 }
 
@@ -99,6 +131,7 @@ impl TurnInput {
             retention: PromptRetention::Keep,
             riding: Vec::new(),
             inbox: Vec::new(),
+            opened_on: OpenedOn::default(),
             origin: crate::provider::TurnOrigin::Human,
             turn_id: Uuid::new_v4(),
         })
@@ -125,60 +158,38 @@ impl TurnInput {
             retention: PromptRetention::Keep,
             riding: Vec::new(),
             inbox: Vec::new(),
+            opened_on: OpenedOn::default(),
             origin: crate::provider::TurnOrigin::Human,
             turn_id: Uuid::new_v4(),
         })
     }
 
-    /// A scheduled job's fire: `job_id` the job, `prompt` its words, `text` what the model reads
-    /// (the fire's header, the words, the gate's output when it had one), `late` its lateness
-    /// when that is worth announcing. Refused when the words are blank, for the reason
-    /// [`Self::from_parts`] refuses them.
-    pub(crate) fn scheduled(
-        job_id: String,
-        prompt: String,
-        text: String,
-        late: Option<crate::frontend::FireLateness>,
-    ) -> crate::error::Result<Self> {
-        if prompt.trim().is_empty() {
-            return Err(MekaError::EmptyPrompt);
-        }
-        Ok(Self {
-            prompt: Prompt::Scheduled {
-                job_id,
-                prompt,
-                text,
-                late,
-            },
-            images: Vec::new(),
-            retention: PromptRetention::Keep,
-            riding: Vec::new(),
-            inbox: Vec::new(),
-            origin: crate::provider::TurnOrigin::Scheduled,
-            turn_id: Uuid::new_v4(),
-        })
-    }
-
     /// A turn opened on inbox items alone, by a driver that found the session idle with them
-    /// waiting. Refused empty for the reason [`Self::from_parts`] refuses blank words.
+    /// waiting: a schedule's turn when every item is a fire, a peer's otherwise. Refused empty for
+    /// the reason [`Self::from_parts`] refuses blank words.
     pub(crate) fn inbox(items: Vec<crate::store::inbox::InboxItem>) -> crate::error::Result<Self> {
         if items.is_empty() {
             return Err(MekaError::EmptyPrompt);
         }
+        let origin = match crate::store::inbox::fired_schedules(&items) {
+            Some(_) => crate::provider::TurnOrigin::Scheduled,
+            None => crate::provider::TurnOrigin::Peer,
+        };
         Ok(Self {
             prompt: Prompt::Sent(Vec::new()),
             images: Vec::new(),
             retention: PromptRetention::Keep,
             riding: Vec::new(),
             inbox: items,
-            origin: crate::provider::TurnOrigin::Peer,
+            opened_on: OpenedOn::default(),
+            origin,
             turn_id: Uuid::new_v4(),
         })
     }
 
     /// What was sent after a host expanded a slash command in it. The prompt was admitted on what
     /// was sent, ahead of the session being taken, and an expansion only adds to it; nothing to
-    /// replace on a fire or a batch of outcomes, which no host expands.
+    /// replace on a batch of outcomes, which no host expands.
     pub(crate) fn expanded(mut self, parts: Vec<ContentBlock>) -> Self {
         if let Prompt::Sent(sent) = &mut self.prompt {
             *sent = parts;
@@ -196,15 +207,10 @@ impl TurnInput {
             retention: PromptRetention::Keep,
             riding: Vec::new(),
             inbox: Vec::new(),
+            opened_on: OpenedOn::default(),
             origin: crate::provider::TurnOrigin::TaskNotification,
             turn_id: Uuid::new_v4(),
         }
-    }
-
-    /// Where the prompt came from, when the door that admitted it is not the one that knows.
-    pub(crate) fn originating(mut self, origin: crate::provider::TurnOrigin) -> Self {
-        self.origin = origin;
-        self
     }
 
     /// Run the turn under the id a host has already announced it by.
@@ -213,8 +219,14 @@ impl TurnInput {
         self
     }
 
-    /// What becomes of the prompt if the turn ends unanswered: the scheduler's answer per job, the
-    /// HTTP client's per turn; see [`PromptRetention`].
+    /// Tell `opened_on` which inbox items the opening takes; see [`OpenedOn`].
+    pub(crate) fn telling(mut self, opened_on: OpenedOn) -> Self {
+        self.opened_on = opened_on;
+        self
+    }
+
+    /// What becomes of the prompt if the turn ends unanswered: the inbox driver's answer for its
+    /// items, the HTTP client's per turn; see [`PromptRetention`].
     pub(crate) fn retaining(mut self, retention: PromptRetention) -> Self {
         self.retention = retention;
         self
@@ -232,7 +244,7 @@ impl TurnInput {
     }
 
     /// The words the turn answers, for a compaction to quote: what was sent as the model reads
-    /// it, a scheduled job's own, or nothing for a turn that only delivers background outcomes.
+    /// it, or nothing for a turn that only delivers background outcomes.
     fn words(&self) -> String {
         match &self.prompt {
             Prompt::Sent(parts) => Message {
@@ -241,35 +253,16 @@ impl TurnInput {
                 provider_fields: None,
             }
             .text_paragraphs(),
-            Prompt::Scheduled { prompt, .. } => prompt.clone(),
             Prompt::Outcomes(_) => String::new(),
         }
     }
 
-    /// The words as the blocks the turn's message carries: what was sent, or a scheduled job's
-    /// fire; none for a turn opened on a report, an image or inbox items alone.
+    /// The words as the blocks the turn's message carries: what was sent; none for a turn opened
+    /// on a report, an image or inbox items alone.
     fn spoken(&self) -> Vec<ContentBlock> {
         match &self.prompt {
             Prompt::Sent(parts) => parts.clone(),
-            Prompt::Scheduled {
-                job_id,
-                prompt,
-                text,
-                ..
-            } => vec![ContentBlock::Scheduled {
-                job_id: job_id.clone(),
-                prompt: prompt.clone(),
-                text: text.clone(),
-            }],
             Prompt::Outcomes(_) => Vec::new(),
-        }
-    }
-
-    /// How late a fire was, for the announcement of the message that carries it.
-    fn lateness(&self) -> Option<crate::frontend::FireLateness> {
-        match &self.prompt {
-            Prompt::Scheduled { late, .. } => *late,
-            Prompt::Sent(_) | Prompt::Outcomes(_) => None,
         }
     }
 
@@ -278,7 +271,7 @@ impl TurnInput {
     fn outcome_rows(&self) -> Vec<crate::store::background::BackgroundTask> {
         match &self.prompt {
             Prompt::Outcomes(outcomes) => outcomes.clone(),
-            Prompt::Sent(_) | Prompt::Scheduled { .. } => self.riding.clone(),
+            Prompt::Sent(_) => self.riding.clone(),
         }
     }
 
@@ -289,8 +282,8 @@ impl TurnInput {
     fn report(&self) -> Option<ContentBlock> {
         let (tasks, text) = match &self.prompt {
             Prompt::Outcomes(outcomes) => (outcomes, crate::background::render_outcomes(outcomes)),
-            _ if self.riding.is_empty() => return None,
-            _ => (
+            Prompt::Sent(_) if self.riding.is_empty() => return None,
+            Prompt::Sent(_) => (
                 &self.riding,
                 crate::background::render_outcomes_riding(&self.riding),
             ),
@@ -304,15 +297,43 @@ impl TurnInput {
 
 /// The block an inbox item takes in the conversation: what the model reads, the header Meka
 /// writes with the item's words under it, beside the item's own facts, so every reader shows the
-/// words as the person's without reading the header back.
+/// words as the person's, or a fire's as its schedule's, without reading the header back.
 fn inbox_block(item: &crate::store::inbox::InboxItem, mid_turn: bool) -> ContentBlock {
-    ContentBlock::Inbox {
-        item_id: Some(item.id),
-        class: Some(item.class),
-        source: item.source.clone(),
-        body: item.body.clone(),
-        text: prompt::render_inbox_item(item, mid_turn),
+    let text = prompt::render_inbox_item(item, mid_turn);
+    match &item.origin {
+        crate::store::inbox::InboxOrigin::Sent { source } => ContentBlock::Inbox {
+            item_id: Some(item.id),
+            class: Some(item.class),
+            source: source.clone(),
+            body: item.body.clone(),
+            text,
+        },
+        crate::store::inbox::InboxOrigin::Fire(fire) => ContentBlock::Scheduled {
+            schedule_id: fire.schedule_id.clone(),
+            prompt: item.body.clone(),
+            text,
+        },
     }
+}
+
+/// The fires among `items` whose lateness is worth saying, for the announcement of the blocks
+/// they are read in, where the items' blocks start at `first`.
+fn late_fires(
+    items: &[crate::store::inbox::InboxItem],
+    first: usize,
+) -> Vec<crate::frontend::LateFire> {
+    items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| match &item.origin {
+            crate::store::inbox::InboxOrigin::Fire(fire) => crate::frontend::FireLateness::of(fire)
+                .map(|lateness| crate::frontend::LateFire {
+                    block: first + index,
+                    lateness,
+                }),
+            crate::store::inbox::InboxOrigin::Sent { .. } => None,
+        })
+        .collect()
 }
 
 /// How many times a single turn may emergency-compact-and-retry after the provider reports a
@@ -622,12 +643,12 @@ struct TurnMaterials {
     spoken: Vec<ContentBlock>,
     images: Vec<ImageSource>,
     inbox: Vec<crate::store::inbox::InboxItem>,
+    /// Told which inbox items the opening takes; see [`OpenedOn`].
+    opened_on: OpenedOn,
     /// The finished background work the turn delivers; see [`TurnInput::report`].
     report: Option<ContentBlock>,
     /// The rows behind `report`, for the announcement of the opening.
     outcomes: Vec<crate::store::background::BackgroundTask>,
-    /// How late a fire was, for the same announcement.
-    late: Option<crate::frontend::FireLateness>,
     turn_id: Uuid,
     /// Who opened the turn, in the API's words, for its row.
     source: crate::store::turns::TurnSource,
@@ -884,6 +905,7 @@ impl Arrivals {
                         .iter()
                         .map(|item| inbox_block(item, true))
                         .collect(),
+                    late: late_fires(&self.items, 0),
                 })
                 .await;
         }
@@ -1051,16 +1073,16 @@ impl Agent {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        // Jobs can be changed by another client, so a cached list would miss cancellations and
+        // Schedules can be changed by another client, so a cached list would miss cancellations and
         // holds. Skipped when no tool opens the index, so `[schedule] enabled = false` pays no
         // round trip per turn for a section nothing would render.
         let scheduled = if prompt::schedule_index_is_live(&catalog) {
             self.store
                 .schedule_store()
-                .list_scheduled_jobs(session_id)
+                .list_schedules(session_id)
                 .await
                 .unwrap_or_else(|error| {
-                    tracing::warn!("failed to load scheduled jobs for context: {error}");
+                    tracing::warn!("failed to load schedules for context: {error}");
                     Vec::new()
                 })
         } else {
@@ -1273,10 +1295,10 @@ impl Agent {
         let spoken = input.spoken();
         let report = input.report();
         let outcomes = input.outcome_rows();
-        let late = input.lateness();
         let TurnInput {
             images,
             inbox,
+            opened_on,
             origin,
             turn_id,
             ..
@@ -1346,9 +1368,9 @@ impl Agent {
                 spoken,
                 images,
                 inbox,
+                opened_on,
                 report,
                 outcomes,
-                late,
                 turn_id,
                 source,
             })
@@ -1589,9 +1611,9 @@ impl Agent {
             spoken,
             images,
             inbox,
+            opened_on,
             report,
             outcomes,
-            late,
             turn_id,
             source,
         } = materials;
@@ -1625,22 +1647,32 @@ impl Agent {
                 permission,
             )
             .await;
-        // What arrived for the session since its last turn rides this one's opening, whoever
-        // started it: read here, where every turn passes, rather than at each host's door, and
-        // read as late as possible, right ahead of the save that stamps it, so a withdrawal has
-        // until then to take an item back. A driver that opened this turn on items hands them in
-        // as the fallback for a read that fails; they are still pending, so the read finds them
-        // itself, minus any withdrawn since.
+        // What arrived for the session since its last turn rides this one's opening: read here,
+        // where every turn passes, rather than at each host's door, and read as late as possible,
+        // right ahead of the save that stamps it, so a withdrawal has until then to take an item
+        // back. A turn a driver opened on items opens on those and no other: its origin and the ids
+        // its host announced it with were decided from the driver's read, so what arrived after
+        // that read waits for the turn's next pause. A fire among them is taken under the id it has
+        // now: a compaction or a wait for an MCP server can stand between the two reads, an
+        // occurrence that joins the fire meanwhile gives it another id, and a turn that held out
+        // for the id it was handed would open on nothing for as long as that goes on. The items
+        // handed in are also the fallback for a read that fails.
+        let handed_in = inbox;
         let inbox = match self
             .store
             .inbox_store()
             .take_pending(session_id, &[], chrono::Utc::now())
             .await
         {
-            Ok(items) => items,
+            Ok(mut items) => {
+                if !handed_in.is_empty() {
+                    items.retain(|item| stands_for_any(item, &handed_in));
+                }
+                items
+            }
             Err(error) => {
                 tracing::warn!("failed to read the inbox at the turn's opening: {error}");
-                inbox
+                handed_in
             }
         };
         if spoken.is_empty() && images.is_empty() && inbox.is_empty() && report.is_none() {
@@ -1664,6 +1696,8 @@ impl Agent {
             report.into_iter().chain(spoken).collect(),
             images,
         );
+        // The items' blocks follow everything the message holds so far.
+        let late = late_fires(&inbox, user_message.content.len());
         // After the words, one block each: an item is somebody else's message, and joined to the
         // words it would read as part of them.
         user_message
@@ -1711,6 +1745,7 @@ impl Agent {
                 false
             }
         };
+        opened_on.record(&inbox_ids);
         self.cells
             .frontend
             .emit(FrontendEvent::TurnOpened { permission })
@@ -2788,10 +2823,15 @@ impl Agent {
             tracing::warn!("failed to record the turn: {error}");
             return;
         }
-        let ending = crate::store::turns::TurnEnding::failed(
-            error,
-            crate::store::turns::TurnUsage::from(&spent),
-        )
+        let usage = crate::store::turns::TurnUsage::from(&spent);
+        let ending = match error {
+            // Everything the turn was opened on was taken back while it was starting. Nothing
+            // failed, and its driver closes it as a turn somebody stopped; the row says the same.
+            MekaError::EmptyPrompt => {
+                crate::store::turns::TurnEnding::canceled(usage, CancelReason::Client)
+            }
+            _ => crate::store::turns::TurnEnding::failed(error, usage),
+        }
         .served_by(self.serving_fallback());
         if let Err(error) = self.store.turn_store().close_turn(turn_id, &ending).await {
             tracing::warn!("failed to record the turn's ending: {error}");
@@ -2883,8 +2923,8 @@ impl Agent {
 
         match result {
             // A prompt its caller will produce again is withdrawn when the turn produced nothing
-            // at all, however it ended: a recurring job regenerates it on its next occurrence, and
-            // a drained `meka serve` hands the occurrence back, so keeping it guarantees a
+            // at all, however it ended: a recurring schedule regenerates it on its next occurrence,
+            // and a drained `meka serve` hands the occurrence back, so keeping it guarantees a
             // duplicate; an HTTP client that asked for this resends. The log-length condition is
             // the one that decides: an unchanged count since the prompt means nothing appended,
             // where the materialized tail alone cannot tell a prompt from a compaction summary.
@@ -3077,7 +3117,8 @@ impl Agent {
             .emit(FrontendEvent::MessageAppended {
                 message: arrived,
                 outcomes: arrivals.outcomes().to_vec(),
-                late: None,
+                // Behind the report, as `Arrivals::blocks` puts them.
+                late: late_fires(arrivals.items(), usize::from(arrivals.report.is_some())),
             })
             .await;
     }
@@ -3223,7 +3264,10 @@ impl Agent {
             let text = match arrivals.items() {
                 [
                     crate::store::inbox::InboxItem {
-                        source: Some(source),
+                        origin:
+                            crate::store::inbox::InboxOrigin::Sent {
+                                source: Some(source),
+                            },
                         ..
                     },
                 ] => format!("Interrupted the answer to read a message from '{source}'."),
@@ -3712,6 +3756,83 @@ mod tests {
         }
     }
 
+    /// A schedule's fire, due at `due_at` and fired half an hour later, standing for three
+    /// occurrences and with what its gate printed.
+    fn late_fire(due_at: chrono::DateTime<chrono::Utc>) -> crate::store::inbox::Fire {
+        crate::store::inbox::Fire {
+            schedule_id: "1a2b3c4d-0000-4000-8000-000000000000".to_string(),
+            gate_output: Some("state: failed".to_string()),
+            occurrences: 3,
+            due_at,
+            fired_at: due_at + chrono::Duration::minutes(30),
+        }
+    }
+
+    /// A pending item of `origin` with `body`, as a read of the inbox hands one over.
+    fn pending_item(
+        origin: crate::store::inbox::InboxOrigin,
+        body: &str,
+    ) -> crate::store::inbox::InboxItem {
+        crate::store::inbox::InboxItem {
+            id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            class: InboxClass::Steer,
+            origin,
+            body: body.to_string(),
+            created_at: chrono::Utc::now(),
+            attempts: 0,
+            not_before: None,
+            last_error: None,
+            appended_at: None,
+            delivered_at: None,
+            withdrawn_at: None,
+            failure: None,
+        }
+    }
+
+    /// A tool that queues a schedule's fire for its own session while it runs, as a sweep would,
+    /// and keeps the item's id.
+    struct FireWhileRunning {
+        store: Store,
+        planted: std::sync::Mutex<Option<Uuid>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for FireWhileRunning {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "fire_while_running".to_string(),
+                description: "test".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+                ..Default::default()
+            }
+        }
+
+        fn required_permission(&self) -> crate::permission::Permission {
+            crate::permission::Permission::Read
+        }
+
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            context: crate::tools::ToolContext,
+        ) -> Result<crate::tools::ToolOutput> {
+            let session_id = context.session_id.expect("a tool runs inside a session");
+            let id = self
+                .store
+                .schedule_store()
+                .queue_fire_for_test(
+                    session_id,
+                    "Check the deploy and report.",
+                    late_fire(chrono::Utc::now()),
+                )
+                .await?
+                .item_id;
+            *self.planted.lock().expect("the slot") = Some(id);
+            Ok(crate::tools::ToolOutput::text("ran".to_string(), false))
+        }
+    }
+
     /// One tool round calling `enqueue_while_running`, then a text reply.
     fn a_tool_round_then_done() -> Vec<Vec<MockEvent>> {
         vec![
@@ -3831,6 +3952,560 @@ mod tests {
             })
             .expect("the tool round was persisted");
         assert_eq!(text_blocks(persisted).len(), 1);
+    }
+
+    /// A fire queued while a tool runs is read behind the round's results as its schedule's
+    /// block, marked as in the conversation by the round's own save, announced where it landed
+    /// with its lateness, and reported read once the provider accepts the request carrying it.
+    #[tokio::test]
+    async fn a_fire_lands_after_the_rounds_tool_results_and_is_delivered_on_the_next_accepted_request()
+     {
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            tool_round(vec![call(
+                "call-0",
+                "fire_while_running",
+                serde_json::json!({}),
+            )]),
+            text_round("done"),
+        ]));
+        let store = Store::for_test().await;
+        let tool = Arc::new(FireWhileRunning {
+            store: store.clone(),
+            planted: std::sync::Mutex::new(None),
+        });
+        let registry = crate::tools::ToolRegistry::new();
+        registry
+            .register(Arc::clone(&tool) as Arc<dyn crate::tools::Tool>)
+            .expect("register the test tool");
+        let mut agent =
+            build_test_agent(Arc::clone(&provider) as Arc<dyn Provider>, registry, &store);
+        let frontend = Arc::new(crate::frontend::testing::RecordingFrontend::new());
+        agent.cells.frontend = frontend.clone();
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("work".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the turn runs");
+        let fire_id = tool
+            .planted
+            .lock()
+            .expect("the slot")
+            .expect("the tool ran");
+
+        let requests = provider.streams();
+        assert_eq!(requests.len(), 2, "the tool round and the request after it");
+        let boundary = requests[1].messages.last().expect("the round's results");
+        assert!(
+            matches!(
+                boundary.content.first(),
+                Some(ContentBlock::ToolResult { .. })
+            ),
+            "the results lead the message: {boundary:?}"
+        );
+        let fired = |message: &Message| -> Vec<(String, String, String)> {
+            message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Scheduled {
+                        schedule_id,
+                        prompt,
+                        text,
+                    } => Some((schedule_id.clone(), prompt.clone(), text.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        let read = fired(boundary);
+        assert!(
+            matches!(
+                read.as_slice(),
+                [(schedule_id, prompt, text)]
+                    if schedule_id == "1a2b3c4d-0000-4000-8000-000000000000"
+                        && prompt == "Check the deploy and report."
+                        && text.starts_with("[Schedule 1a2b3c4d fired ")
+                        && text.contains(
+                            " while you were working]\n[Late by 30m; this fire replaces 3 \
+                             missed occurrence(s)]\n\nCheck the deploy and report."
+                        )
+            ),
+            "{boundary:?}"
+        );
+
+        let session_id = agent.session_id().expect("the turn created a session");
+        let stored = store.load_events(session_id).await.expect("load events");
+        let persisted = stored
+            .iter()
+            .filter_map(|event| match event {
+                crate::conversation::Event::Append(message) => Some(message),
+                _ => None,
+            })
+            .find(|message| {
+                matches!(
+                    message.content.first(),
+                    Some(ContentBlock::ToolResult { .. })
+                )
+            })
+            .expect("the tool round was persisted");
+        assert_eq!(fired(persisted), read, "the round on disk holds the fire");
+        assert_eq!(
+            store
+                .inbox_store()
+                .get(fire_id)
+                .await
+                .expect("get")
+                .expect("row")
+                .state(),
+            InboxState::Delivered
+        );
+
+        let events = frontend.events();
+        let appended = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    FrontendEvent::InboxAppended { blocks, late }
+                        if matches!(blocks.as_slice(), [ContentBlock::Scheduled { .. }])
+                            && late.as_slice() == [crate::frontend::LateFire {
+                                block: 0,
+                                lateness: crate::frontend::FireLateness {
+                                    late_by: chrono::Duration::minutes(30),
+                                    coalesced: 2,
+                                },
+                            }]
+                )
+            })
+            .unwrap_or_else(|| panic!("the fire is announced where it landed: {events:?}"));
+        let delivered = events
+            .iter()
+            .position(|event| {
+                matches!(event, FrontendEvent::InboxDelivered { item_ids } if item_ids == &[fire_id])
+            })
+            .unwrap_or_else(|| panic!("the fire is reported read: {events:?}"));
+        assert!(appended < delivered, "{events:?}");
+    }
+
+    /// A fire waiting when a driver opens a turn on it rides the opening as its schedule's block,
+    /// announced with its lateness, and the turn is the schedule's: its row says so, and so does
+    /// the origin its requests report.
+    #[tokio::test]
+    async fn a_turn_opened_on_a_fire_reads_it_in_its_opening_as_the_schedule_s() {
+        let (agent, provider, store, session_id, frontend) =
+            agent_with_session(vec![text_round("on it")]).await;
+        let inbox = store.inbox_store();
+        let fire_id = store
+            .schedule_store()
+            .queue_fire_for_test(
+                session_id,
+                "Check the deploy and report.",
+                late_fire(chrono::Utc::now()),
+            )
+            .await
+            .expect("queue")
+            .item_id;
+        let waiting = inbox
+            .take_pending(session_id, &[], chrono::Utc::now())
+            .await
+            .expect("pending");
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::inbox(waiting).expect("items"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the turn runs");
+
+        let request = provider.streams().into_iter().next().expect("one request");
+        let opening = request.messages.last().expect("the opening");
+        assert!(
+            matches!(
+                opening.content.as_slice(),
+                [
+                    ContentBlock::TurnContext { .. },
+                    ContentBlock::Scheduled { schedule_id, text, .. },
+                ] if schedule_id == "1a2b3c4d-0000-4000-8000-000000000000"
+                    && text.starts_with("[Schedule 1a2b3c4d fired ")
+                    && !text.contains("while you were working")
+                    && text.contains("]\n[Late by 30m; this fire replaces 3 missed occurrence(s)]")
+            ),
+            "{opening:?}"
+        );
+        assert_eq!(
+            request.turn_origin,
+            Some(crate::provider::TurnOrigin::Scheduled)
+        );
+        let turns = store
+            .turn_store()
+            .load_turns(session_id)
+            .await
+            .expect("turns");
+        assert_eq!(turns.iter().map(|turn| turn.source).collect::<Vec<_>>(), [
+            crate::store::turns::TurnSource::Schedule
+        ]);
+        assert_eq!(
+            inbox.get(fire_id).await.expect("get").expect("row").state(),
+            InboxState::Delivered
+        );
+        let events = frontend.events();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                FrontendEvent::MessageAppended { late, .. }
+                    if late.iter().map(|fire| fire.block).collect::<Vec<_>>() == [1]
+            )),
+            "{events:?}"
+        );
+    }
+
+    /// A turn opened on fires alone is the schedule's; one opened on a fire and a message
+    /// somebody sent is a peer's, as one opened on messages alone is.
+    #[tokio::test]
+    async fn a_turn_opened_on_a_fire_and_a_message_is_a_peer_s() {
+        let store = Store::for_test().await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        let inbox = store.inbox_store();
+        store
+            .schedule_store()
+            .queue_fire_for_test(
+                session_id,
+                "Check the deploy and report.",
+                late_fire(chrono::Utc::now()),
+            )
+            .await
+            .expect("queue");
+        inbox
+            .enqueue(
+                NewInboxItem::from_parts(
+                    session_id,
+                    InboxClass::Steer,
+                    Some("test".to_string()),
+                    "and this",
+                )
+                .expect("item"),
+            )
+            .await
+            .expect("enqueue");
+        let waiting = inbox
+            .take_pending(session_id, &[], chrono::Utc::now())
+            .await
+            .expect("pending");
+        let fires: Vec<_> = waiting
+            .iter()
+            .filter(|item| matches!(item.origin, crate::store::inbox::InboxOrigin::Fire(_)))
+            .cloned()
+            .collect();
+        assert_eq!(fires.len(), 1);
+        assert_eq!(
+            crate::agent::TurnInput::inbox(fires).expect("items").origin,
+            crate::provider::TurnOrigin::Scheduled
+        );
+        assert_eq!(
+            crate::agent::TurnInput::inbox(waiting)
+                .expect("items")
+                .origin,
+            crate::provider::TurnOrigin::Peer
+        );
+    }
+
+    /// A driver's turn opens on the items the driver took and no other: its origin, and the ids
+    /// its host announced it with, were decided from that read. A fire that arrives between the
+    /// read and the opening is read at the turn's next pause, as one that came while the turn
+    /// worked, and a followup waits for the turn's end.
+    #[tokio::test]
+    async fn a_driver_s_turn_opens_on_the_items_it_was_handed_and_no_later_arrival() {
+        let (agent, provider, store, session_id, _frontend) =
+            agent_with_session(vec![text_round("the first"), text_round("and the second")]).await;
+        let inbox = store.inbox_store();
+        let first = store
+            .schedule_store()
+            .queue_fire_for_test(session_id, "First.", late_fire(chrono::Utc::now()))
+            .await
+            .expect("queue")
+            .item_id;
+        let handed_in = inbox
+            .take_pending(session_id, &[], chrono::Utc::now())
+            .await
+            .expect("pending");
+        let second = store
+            .schedule_store()
+            .queue_fire_for_test(session_id, "Second.", crate::store::inbox::Fire {
+                schedule_id: "2b3c4d5e-0000-4000-8000-000000000000".to_string(),
+                ..late_fire(chrono::Utc::now())
+            })
+            .await
+            .expect("queue")
+            .item_id;
+        let followup = inbox
+            .enqueue(
+                NewInboxItem::from_parts(
+                    session_id,
+                    InboxClass::Followup,
+                    Some("test".to_string()),
+                    "and this",
+                )
+                .expect("item"),
+            )
+            .await
+            .expect("enqueue")
+            .id;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::inbox(handed_in).expect("items"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the turn runs");
+
+        let requests = provider.streams();
+        assert_eq!(requests.len(), 2, "the turn goes on to answer the arrival");
+        let opening = requests[0].messages.last().expect("the opening");
+        assert!(
+            matches!(
+                opening.content.as_slice(),
+                [
+                    ContentBlock::TurnContext { .. },
+                    ContentBlock::Scheduled { schedule_id, .. },
+                ] if schedule_id == "1a2b3c4d-0000-4000-8000-000000000000"
+            ),
+            "the opening holds the fire the driver took and nothing else: {opening:?}"
+        );
+        let behind = requests[1]
+            .messages
+            .last()
+            .expect("the message behind the reply");
+        assert!(
+            behind.content.iter().any(|block| matches!(
+                block,
+                ContentBlock::Scheduled { schedule_id, text, .. }
+                    if schedule_id == "2b3c4d5e-0000-4000-8000-000000000000"
+                        && text.contains("while you were working")
+            )),
+            "{behind:?}"
+        );
+        let turns = store
+            .turn_store()
+            .load_turns(session_id)
+            .await
+            .expect("turns");
+        assert_eq!(turns.iter().map(|turn| turn.source).collect::<Vec<_>>(), [
+            crate::store::turns::TurnSource::Schedule
+        ]);
+        let state = |id| {
+            let inbox = inbox.clone();
+            async move { inbox.get(id).await.expect("get").expect("row").state() }
+        };
+        assert_eq!(
+            (
+                state(first).await,
+                state(second).await,
+                state(followup).await
+            ),
+            (
+                InboxState::Delivered,
+                InboxState::Delivered,
+                InboxState::Pending
+            )
+        );
+    }
+
+    /// A fire handed to a turn, and joined by an occurrence before the turn opens, is still what
+    /// the turn opens on: its schedule's waiting fire as it is by then, under the id it has by
+    /// then, which the driver that handed it in is told.
+    #[tokio::test]
+    async fn a_fire_joined_before_its_turn_opens_is_opened_on_as_it_is_by_then() {
+        let (agent, provider, store, session_id, _frontend) =
+            agent_with_session(vec![text_round("on it")]).await;
+        let inbox = store.inbox_store();
+        let first = store
+            .schedule_store()
+            .queue_fire_for_test(session_id, "Check.", late_fire(chrono::Utc::now()))
+            .await
+            .expect("queue")
+            .item_id;
+        let handed_in = inbox
+            .take_pending(session_id, &[], chrono::Utc::now())
+            .await
+            .expect("pending");
+        let joined = store
+            .schedule_store()
+            .queue_fire_for_test(session_id, "Check.", late_fire(chrono::Utc::now()))
+            .await
+            .expect("queue");
+        assert_eq!(
+            joined.replaces,
+            Some(first),
+            "the occurrence joined the fire"
+        );
+        let opened_on = crate::agent::OpenedOn::default();
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::inbox(handed_in)
+                    .expect("items")
+                    .telling(opened_on.clone()),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the turn runs");
+
+        assert_eq!(opened_on.ids(), [joined.item_id]);
+        let request = provider.streams().into_iter().next().expect("one request");
+        let opening = request.messages.last().expect("the opening");
+        assert!(
+            matches!(
+                opening.content.as_slice(),
+                [
+                    ContentBlock::TurnContext { .. },
+                    ContentBlock::Scheduled { text, .. },
+                ] if text.contains("this fire replaces 6 missed occurrence(s)")
+            ),
+            "{opening:?}"
+        );
+        assert_eq!(
+            inbox
+                .get(joined.item_id)
+                .await
+                .expect("get")
+                .expect("row")
+                .state(),
+            InboxState::Delivered
+        );
+    }
+
+    /// A fire queued after the one a turn was handed was withdrawn is another fire: the turn was
+    /// announced with the first one's id, and nothing ties the second to it. The turn opens on
+    /// nothing, and the second fire waits for a turn opened on it.
+    #[tokio::test]
+    async fn a_fire_queued_after_the_one_handed_in_was_withdrawn_is_another_fire() {
+        let (agent, provider, store, session_id, _frontend) =
+            agent_with_session(vec![text_round("never asked")]).await;
+        let inbox = store.inbox_store();
+        let first = store
+            .schedule_store()
+            .queue_fire_for_test(session_id, "Check.", late_fire(chrono::Utc::now()))
+            .await
+            .expect("queue")
+            .item_id;
+        let handed_in = inbox
+            .take_pending(session_id, &[], chrono::Utc::now())
+            .await
+            .expect("pending");
+        inbox.withdraw(first, None, None).await.expect("withdraw");
+        let fresh = store
+            .schedule_store()
+            .queue_fire_for_test(session_id, "Check.", late_fire(chrono::Utc::now()))
+            .await
+            .expect("queue");
+        assert_eq!(
+            fresh.replaces, None,
+            "precondition: a fire of its own, not a join"
+        );
+        let opened_on = crate::agent::OpenedOn::default();
+        let mut messages = Conversation::new();
+        let error = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::inbox(handed_in)
+                    .expect("items")
+                    .telling(opened_on.clone()),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect_err("what the turn was opened on is gone");
+        assert!(matches!(error, MekaError::EmptyPrompt), "{error:?}");
+        assert!(opened_on.ids().is_empty());
+        assert!(provider.streams().is_empty(), "nothing was asked");
+        assert_eq!(
+            inbox
+                .get(fresh.item_id)
+                .await
+                .expect("get")
+                .expect("row")
+                .state(),
+            InboxState::Pending,
+            "the later fire waits for a turn of its own"
+        );
+    }
+
+    /// A turn that compacted on its way in and then found everything it was opened on taken back
+    /// failed at nothing. Its row says what its driver says of it, a turn somebody stopped.
+    #[tokio::test]
+    async fn an_opening_emptied_behind_a_compaction_is_recorded_as_a_stopped_turn() {
+        let (mut agent, provider, store, session_id, _frontend) = agent_with_session(vec![
+            text_round("the first answer"),
+            text_round("a summary"),
+        ])
+        .await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("the first question".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the first turn runs");
+        // Any turn that has ended is past this window, so the next one compacts before it opens.
+        agent.options.turn_retention = Some(std::time::Duration::from_nanos(1));
+        let inbox = store.inbox_store();
+        let item = inbox
+            .enqueue(
+                NewInboxItem::from_parts(session_id, InboxClass::Steer, None, "taken back")
+                    .expect("item"),
+            )
+            .await
+            .expect("enqueue")
+            .id;
+        let handed_in = inbox
+            .take_pending(session_id, &[], chrono::Utc::now())
+            .await
+            .expect("pending");
+        inbox.withdraw(item, None, None).await.expect("withdraw");
+
+        let error = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::inbox(handed_in).expect("items"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect_err("there is nothing to open on");
+        assert!(matches!(error, MekaError::EmptyPrompt), "{error:?}");
+        assert_eq!(
+            provider.completions().len(),
+            1,
+            "precondition: the compaction ran on the way in"
+        );
+        let turns = store
+            .turn_store()
+            .load_turns(session_id)
+            .await
+            .expect("turns");
+        let last = turns.last().expect("the emptied turn's row");
+        assert_eq!(
+            (last.status, last.reason, last.error.is_some()),
+            (
+                Some(crate::store::turns::TurnStatus::Canceled),
+                Some(CancelReason::Client),
+                false
+            ),
+            "{last:?}"
+        );
     }
 
     #[tokio::test]
@@ -4140,7 +4815,7 @@ mod tests {
             "the announcement is the message the conversation holds"
         );
         assert_eq!(message.text_content(), "hello");
-        assert!(outcomes.is_empty() && late.is_none());
+        assert!(outcomes.is_empty() && late.is_empty());
         // The level the opening told the model is announced ahead of it, and is the row's.
         let opened = position(|event| matches!(event, FrontendEvent::TurnOpened { .. }));
         assert!(started < opened && opened < announced, "opened at {opened}");
@@ -4197,22 +4872,27 @@ mod tests {
         assert!(!parent.is_cancelled(), "a derived stop does not reach up");
     }
 
-    /// What the door says about the prompt is what the request reports: the scheduler restates
-    /// a fired job's origin on words nobody typed, and a typed prompt is a person's.
+    /// What the door says about the prompt is what the request reports: a turn opened on a fire
+    /// is a schedule's, words nobody typed, and a typed prompt is a person's.
     #[tokio::test]
     async fn a_turns_requests_report_the_origin_its_door_stated() {
-        let (agent, provider, _store, _session, _frontend) =
+        let (agent, provider, store, session, _frontend) =
             agent_with_session(vec![text_round("ok"), text_round("ok")]).await;
+        store
+            .schedule_store()
+            .queue_fire_for_test(session, "news", late_fire(chrono::Utc::now()))
+            .await
+            .expect("queue");
+        let fires = store
+            .inbox_store()
+            .take_pending(session, &[], chrono::Utc::now())
+            .await
+            .expect("pending");
         let mut messages = Conversation::new();
         agent
             .run_turn(
                 &mut messages,
-                crate::agent::TurnInput::from_parts(
-                    "[Scheduled job fired] news".into(),
-                    Vec::new(),
-                )
-                .expect("a prompt")
-                .originating(crate::provider::TurnOrigin::Scheduled),
+                crate::agent::TurnInput::inbox(fires).expect("a fire"),
                 crate::agent::TurnCancellation::new(),
             )
             .await
@@ -4235,7 +4915,7 @@ mod tests {
             Some(crate::provider::TurnOrigin::Scheduled),
             Some(crate::provider::TurnOrigin::Human),
         ]);
-        // The position goes with it: the job's turn is the first and no person opened it, the
+        // The position goes with it: the schedule's turn is the first and no person opened it, the
         // typed one is the second and the first a person opened.
         let positions: Vec<_> = provider
             .streams()
@@ -6587,9 +7267,9 @@ mod tests {
         ))
     }
 
-    /// The case that motivated this: Meka up, provider unreachable, a job firing on its interval
-    /// for the length of the outage. Each fire persists its prompt before the call and then fails,
-    /// so without withdrawal the conversation collects one unanswered message per fire.
+    /// The case that motivated this: Meka up, provider unreachable, a schedule firing on its
+    /// interval for the length of the outage. Each fire persists its prompt before the call and
+    /// then fails, so without withdrawal the conversation collects one unanswered message per fire.
     #[tokio::test]
     async fn a_provider_outage_leaves_no_residue_from_scheduled_fires() {
         let (agent, store) = agent_for_test(unreachable_provider(12)).await;
@@ -6600,7 +7280,7 @@ mod tests {
                 .run_turn(
                     &mut messages,
                     crate::agent::TurnInput::from_parts(
-                        "[Scheduled job 7f3a1b2c fired] check the news".to_string(),
+                        "[Schedule 7f3a1b2c fired] check the news".to_string(),
                         Vec::new(),
                     )
                     .expect("a prompt")
@@ -8147,9 +8827,9 @@ mod tests {
         );
     }
 
-    /// `meka serve` cancels its shutdown token before draining, and a scheduled turn's token is a
-    /// child of it, so a job due during a shutdown is interrupted with its prompt already on disk,
-    /// and the occurrence is then handed back, so the identical prompt arrives again on the next
+    /// `meka serve` cancels its shutdown token before draining, and an inbox turn's token is a
+    /// child of it, so a fire read during a shutdown is interrupted with its prompt already on
+    /// disk, and its item is then offered again, so the identical prompt arrives again on the next
     /// run. Keeping it would guarantee a duplicate, which is why interruption withdraws too.
     #[tokio::test]
     async fn a_fire_interrupted_before_it_began_withdraws_its_prompt() {
@@ -8162,7 +8842,7 @@ mod tests {
             .run_turn(
                 &mut messages,
                 crate::agent::TurnInput::from_parts(
-                    "[Scheduled job 7f3a1b2c fired] check the news".to_string(),
+                    "[Schedule 7f3a1b2c fired] check the news".to_string(),
                     Vec::new(),
                 )
                 .expect("a prompt")
@@ -8174,7 +8854,7 @@ mod tests {
         assert!(matches!(error, crate::error::MekaError::Interrupted));
         assert!(
             messages.is_empty(),
-            "the occurrence comes back, so the prompt must not linger: {:?}",
+            "the item comes back, so the prompt must not linger: {:?}",
             messages.as_slice()
         );
     }
@@ -8367,7 +9047,7 @@ mod tests {
             .run_turn(
                 &mut messages,
                 crate::agent::TurnInput::from_parts(
-                    "[Scheduled job 7f3a1b2c fired] check the news".to_string(),
+                    "[Schedule 7f3a1b2c fired] check the news".to_string(),
                     Vec::new(),
                 )
                 .expect("a prompt")
@@ -8418,7 +9098,7 @@ mod tests {
             .run_turn(
                 &mut messages,
                 crate::agent::TurnInput::from_parts(
-                    "[Scheduled job 7f3a1b2c fired] check the news".to_string(),
+                    "[Schedule 7f3a1b2c fired] check the news".to_string(),
                     Vec::new(),
                 )
                 .expect("a prompt")
@@ -12641,6 +13321,120 @@ mod tests {
         );
     }
 
+    /// A fire is read as its schedule's block: a header naming the schedule and when it fired, and
+    /// mid-turn that it fired while the model worked; the lateness line when it ran late or stands
+    /// for more than one occurrence, and not otherwise; the schedule's words; and what its gate
+    /// printed, quoted.
+    #[test]
+    fn a_fire_is_read_as_its_schedule_s_block() {
+        let fired_at = chrono::DateTime::parse_from_rfc3339("2026-11-15T14:33:00Z")
+            .expect("time")
+            .with_timezone(&chrono::Utc);
+        let fire = |late_by: i64, occurrences: u32, gate_output: Option<&str>| {
+            pending_item(
+                crate::store::inbox::InboxOrigin::Fire(crate::store::inbox::Fire {
+                    schedule_id: "1a2b3c4d-0000-4000-8000-000000000000".to_string(),
+                    gate_output: gate_output.map(str::to_string),
+                    occurrences,
+                    due_at: fired_at - chrono::Duration::seconds(late_by),
+                    fired_at,
+                }),
+                "Check the deploy and report.",
+            )
+        };
+        let fired = crate::text::format_timestamp(fired_at, crate::text::Precision::Minutes);
+        assert_eq!(
+            inbox_block(&fire(5, 1, None), false),
+            ContentBlock::Scheduled {
+                schedule_id: "1a2b3c4d-0000-4000-8000-000000000000".to_string(),
+                prompt: "Check the deploy and report.".to_string(),
+                text: format!("[Schedule 1a2b3c4d fired {fired}]\n\nCheck the deploy and report."),
+            }
+        );
+        let text = |item| match inbox_block(&item, true) {
+            ContentBlock::Scheduled { text, .. } => text,
+            other => panic!("not a fire's block: {other:?}"),
+        };
+        assert_eq!(
+            text(fire(5, 1, None)),
+            format!(
+                "[Schedule 1a2b3c4d fired {fired} while you were working]\n\nCheck the deploy and \
+                 report."
+            )
+        );
+        assert_eq!(
+            text(fire(30 * 60, 1, None)),
+            format!(
+                "[Schedule 1a2b3c4d fired {fired} while you were working]\n[Late by 30m; this \
+                 fire replaces 1 missed occurrence(s)]\n\nCheck the deploy and report."
+            )
+        );
+        assert_eq!(
+            text(fire(5, 3, Some("state: failed\nsince 14:00\n"))),
+            format!(
+                "[Schedule 1a2b3c4d fired {fired} while you were working]\n[Late by 5s; this \
+                 fire replaces 3 missed occurrence(s)]\n\nCheck the deploy and report.\n\n[Gate \
+                 output]\n> state: failed\n> since 14:00"
+            )
+        );
+    }
+
+    /// Arrivals appended as a message of their own, behind a reply or a cut answer, are announced
+    /// with how late each fire among them ran, as arrivals added to a message are, each by where
+    /// its block is: behind the report that leads.
+    #[tokio::test]
+    async fn a_message_appended_whole_is_announced_with_its_fires_lateness() {
+        let (agent, _provider, _store, session_id, frontend) = agent_with_session(Vec::new()).await;
+        let now = chrono::Utc::now();
+        let arrivals = Arrivals::new(
+            vec![
+                pending_item(
+                    crate::store::inbox::InboxOrigin::Fire(late_fire(now)),
+                    "Check the deploy and report.",
+                ),
+                pending_item(
+                    crate::store::inbox::InboxOrigin::Sent { source: None },
+                    "and this",
+                ),
+            ],
+            vec![crate::store::background::BackgroundTask {
+                id: "7f3a1c22-0000-4000-8000-000000000000".to_string(),
+                session_id,
+                tool: "shell_execute".to_string(),
+                label: "make".to_string(),
+                status: crate::store::background::TaskStatus::Completed,
+                outcome: Some("ok\n".to_string()),
+                scratchpad_entry: None,
+                started_at: now,
+                finished_at: Some(now),
+                announced_at: None,
+                delivered_at: None,
+                subagent_id: None,
+            }],
+        );
+        let arrived = Message {
+            role: Role::User,
+            content: arrivals.blocks(),
+            provider_fields: None,
+        };
+        agent.announce_arrived(arrived, &arrivals).await;
+        let late: Vec<Vec<crate::frontend::LateFire>> = frontend
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                FrontendEvent::MessageAppended { late, .. } => Some(late),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(late, [vec![crate::frontend::LateFire {
+            block: 1,
+            lateness: crate::frontend::FireLateness {
+                late_by: chrono::Duration::minutes(30),
+                coalesced: 2,
+            },
+        }]]);
+    }
+
     /// What arrived at a boundary is announced in the order the boundary's blocks hold it, the
     /// report and then the items, so a screen draws them as a replay of the log will.
     #[tokio::test]
@@ -12652,7 +13446,7 @@ mod tests {
                 id: Uuid::new_v4(),
                 session_id,
                 class: crate::conversation::InboxClass::Steer,
-                source: None,
+                origin: crate::store::inbox::InboxOrigin::Sent { source: None },
                 body: "look here".to_string(),
                 created_at: now,
                 attempts: 0,
@@ -15831,17 +16625,33 @@ mod tests {
         ]));
         let (mut agent, store) = agent_for_test(provider).await;
         let live = watch(&mut agent);
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        agent.cells().session_id.set(session_id);
+        let now = chrono::Utc::now();
+        store
+            .schedule_store()
+            .queue_fire_for_test(session_id, "check the build", crate::store::inbox::Fire {
+                schedule_id: "7f3a1c22-0000-4000-8000-000000000000".to_string(),
+                gate_output: None,
+                occurrences: 1,
+                due_at: now,
+                fired_at: now,
+            })
+            .await
+            .expect("queue the fire");
+        let fires = store
+            .inbox_store()
+            .take_pending(session_id, &[], now)
+            .await
+            .expect("pending");
         let mut messages = Conversation::new();
         agent
             .run_turn(
                 &mut messages,
-                crate::agent::TurnInput::scheduled(
-                    "7f3a1c22-0000-4000-8000-000000000000".to_string(),
-                    "check the build".to_string(),
-                    "[Scheduled job 7f3a1c22 fired]\ncheck the build".to_string(),
-                    None,
-                )
-                .expect("a fire"),
+                crate::agent::TurnInput::inbox(fires).expect("a fire"),
                 crate::agent::TurnCancellation::new(),
             )
             .await

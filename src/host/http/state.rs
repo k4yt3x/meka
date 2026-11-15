@@ -47,9 +47,6 @@ pub(crate) struct ServerState {
     /// Woken when an inbox item is enqueued and when any turn ends, which are the two moments a
     /// session may have become able to take a turn on what is waiting.
     pub(crate) inbox_wake: Arc<tokio::sync::Notify>,
-    /// Sessions a driver task is draining right now, so a wake that arrives mid-drain does not
-    /// start a second driver on the same session.
-    pub(crate) inbox_draining: Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>,
     /// The listing's change feed; see [`super::feed::ServerFeed`].
     pub(crate) server_feed: super::feed::SharedServerFeed,
     /// The feeds of the sub-agents this process is running; see
@@ -105,7 +102,6 @@ impl ServerState {
             webhooks: super::webhook::WebhookDispatcher::new(config_webhooks),
             reconstruction_locks: super::reattach::ReconstructionLocks::default(),
             inbox_wake: Arc::new(tokio::sync::Notify::new()),
-            inbox_draining: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             server_feed: Arc::new(std::sync::Mutex::new(super::feed::ServerFeed::new(
                 super::feed::FEED_BROADCAST_CAPACITY,
                 stream_replay_events,

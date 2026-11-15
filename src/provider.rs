@@ -218,7 +218,7 @@ pub(crate) struct MainThreadResponses {
 pub(crate) enum TurnOrigin {
     /// Words a person typed, whichever host they arrived through.
     Human,
-    /// A scheduled job firing.
+    /// A schedule firing.
     Scheduled,
     /// Inbox items from another session, agent or client.
     Peer,

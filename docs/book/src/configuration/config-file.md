@@ -1126,17 +1126,16 @@ There is deliberately no environment variable and no CLI flag here: whether an a
 
 ## `[schedule]`
 
-Controls the wakeups the agent schedules for itself. See the [Scheduling](../usage/scheduling.md) guide.
+Controls the schedules the agent sets for itself. See the [Scheduling](../usage/scheduling.md) guide.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `enabled` | bool | `true` | Register the `schedule_*` tools and run the scheduler |
-| `poll_interval` | duration | `"10s"` | How often due jobs are checked; `"0s"` is refused at startup |
-| `missed_grace` | duration | `"24h"` | How late a one-shot job may be and still fire after downtime |
+| `poll_interval` | duration | `"10s"` | How often due schedules are checked; `"0s"` is refused at startup |
+| `missed_grace` | duration | `"24h"` | How late a one-shot schedule may be and still fire after downtime |
 | `gate_timeout` | duration | `"30s"` | Wall-clock budget for a gate probe; `"0s"` is refused at startup |
 | `claim_lease` | duration | `"1h"` | How long a host's claim on a due occurrence is good for |
-| `max_jobs` | int | `50` | Per-session ceiling, refused at `schedule_create`; `0` is refused at startup |
-| `max_consecutive_fires` | int | `5` | Per-session ceiling on turns spent in one sweep |
+| `max_schedules` | int | `50` | Per-session ceiling, refused at `schedule_create`; `0` is refused at startup |
 
 ```toml
 [schedule]
@@ -1145,21 +1144,18 @@ poll_interval = "10s"
 missed_grace = "24h"
 gate_timeout = "30s"
 claim_lease = "1h"
-max_jobs = 50
-max_consecutive_fires = 5
+max_schedules = 50
 ```
 
-`poll_interval` is the real resolution floor: a job whose interval is shorter than the tick fires once per tick, not once per interval.
+`poll_interval` is the real resolution floor: a schedule whose interval is shorter than the tick fires once per tick, not once per interval. It is also how often each host looks for inbox items no wake told it of, such as a retry coming due or an item another process wrote, whether or not scheduling itself is enabled.
 
-`missed_grace` applies only to one-shot jobs. Recurring jobs need no equivalent, because their occurrences are one period apart, so the most recent missed one is always less than a period old; the scheduler coalesces the rest into a single catch-up fire.
+`missed_grace` applies only to one-shot schedules. Recurring schedules need no equivalent, because their occurrences are one period apart, so the most recent missed one is always less than a period old; the scheduler coalesces the rest into a single catch-up fire.
 
-`claim_lease` is how long a crashed host's occurrence stays unavailable before another host takes it. A due job is leased rather than consumed, so the row survives until the turn is delivered and a host that dies mid-delivery costs a retry rather than the occurrence. Raise it only if a gate probe plus a turn could plausibly exceed an hour; lowering it below that risks a second host taking an occurrence the first is still running, which the session lock catches at the cost of a deferral and a re-run gate probe. A host refuses to start on a value at or under `gate_timeout`, since a lease that cannot outlast the host's own probe is never right; that check does not cover the two seconds or so a probe stopped at its timeout takes to end its processes and hand over its output, nor the turn after the probe, which is unbounded, so leave headroom on top of it.
+`claim_lease` is how long a crashed host's occurrence stays unavailable before another host takes it, and how long a one-shot whose gate cannot be evaluated waits between tries. A due schedule is leased rather than consumed while its check runs, so the row survives until its fire is queued, and a host that dies in between costs a retry rather than the occurrence. It should exceed a gate probe: a lease that expires while the holder's probe still runs lets a second host take the same occurrence and run the probe again. A host refuses to start on a value at or under `gate_timeout`, since a lease that cannot outlast the host's own probe is never right; that check does not cover the two seconds or so a probe stopped at its timeout takes to end its processes and hand over its output, so leave headroom on top of it.
 
-`max_consecutive_fires` interleaves sessions: without it, one session's whole backlog runs to completion before another session's single due job is reached. Jobs past the budget keep their occurrence, run no gate, and are taken by the next sweep most-overdue first. It bounds a batch rather than a rate: sweeps do not overlap and the next starts as soon as the last ends, so a backlog still produces one turn per job, just in interleaved groups. `0` is refused, since it would hold every job over forever; use `enabled = false` to turn scheduling off.
+Setting `enabled = false` keeps the three `schedule_*` tool schemas out of every request and leaves existing schedules on disk without firing.
 
-Setting `enabled = false` keeps the three `schedule_*` tool schemas out of every request and leaves existing jobs on disk without firing.
-
-As with `[skills]` and `[memory]`, there is no environment variable and no CLI flag: whether an agent may schedule its own turns is a property of the installation.
+As with `[skills]` and `[memory]`, there is no environment variable and no CLI flag: whether an agent may set its own schedules is a property of the installation.
 
 ## `[background]`
 
@@ -1176,7 +1172,7 @@ enabled = true
 max_tasks = 10
 ```
 
-**Alone among the capability blocks, this one is off by default.** `[schedule]`, `[skills]`, and `[memory]` add capability without changing when a turn ends; this changes the contract of the primary interaction into "you asked, it answered, and something else may interrupt you later". That is right for an unattended assistant and wrong for someone using the screen as a command line. A scheduled job also takes an explicit act to create, whereas `background` is offered on every tool whose call can outlast a round, so an agent will reach for it unprompted.
+**Alone among the capability blocks, this one is off by default.** `[skills]` and `[memory]` add capability without changing when a turn ends; this changes the contract of the primary interaction into "you asked, it answered, and something else may interrupt you later". That is right for an unattended assistant and wrong for someone using the screen as a command line. A schedule's fire can keep a turn going too, but a schedule takes an explicit act to create, whereas `background` is offered on every tool whose call can outlast a round, so an agent will reach for it unprompted.
 
 Setting `enabled = false` keeps the `background` property out of every tool schema and the two `task_*` tools out of every request, rather than advertising a parameter that would only ever be refused.
 
@@ -1194,7 +1190,7 @@ Delete sessions not updated for longer than this, at startup and then hourly for
 
 The screen's recall entries, the lines Up and Ctrl+R bring back, are swept with it: an entry older than this window, or than [`turn_retention`](#sessionturn_retention) when that is the shorter, is deleted, since what a person typed must not outlive the conversation it went into.
 
-Three kinds of session are spared whatever their timestamp says. A session another Meka process has open is skipped, and the sweep reports how many: `updated_at` moves when the conversation changes, not when a session is opened, so an interactive session left open past the window looks expired while somebody is in front of it. A [pinned](../usage/sessions.md#pinning-a-session) session is never expired, nor is any parent of one: a pin is you saying keep this. And a session with a scheduled job still ahead of it is never expired, nor is any parent of one: a gated watcher that evaluates every tick and rarely fires looks untouched for exactly as long as it is working, and deleting it would take the schedule with it.
+Three kinds of session are spared whatever their timestamp says. A session another Meka process has open is skipped, and the sweep reports how many: `updated_at` moves when the conversation changes, not when a session is opened, so an interactive session left open past the window looks expired while somebody is in front of it. A [pinned](../usage/sessions.md#pinning-a-session) session is never expired, nor is any parent of one: a pin is you saying keep this. And a session with a schedule still ahead of it is never expired, nor is any parent of one: a gated watcher that evaluates every tick and rarely fires looks untouched for exactly as long as it is working, and deleting it would take the schedule with it.
 
 **Default: unset, meaning nothing is deleted.** `"0s"` is refused at startup, since it would delete everything on every launch. Conversation history isn't reproducible, so Meka keeps it until told otherwise. Use `meka session remove --older-than-days <DAYS>` to prune manually instead.
 
@@ -1682,7 +1678,7 @@ docs = true
 
 ### `serve.max_concurrent_turns`
 
-Process-wide cap on in-flight turns across all sessions, counting every turn: one a client submits and one the server starts on its own for an inbox item, a scheduled job or a finished background task. When the cap is reached, a new turn submission returns `429 Too Many Requests` with a `Retry-After` header, and an autonomous turn waits for a free slot (the next turn's end or the next tick) rather than running past the cap. Leave it **unset** for no limit; `0` is refused at startup, because a cap of zero would 429 every turn rather than mean "unlimited".
+Process-wide cap on in-flight turns across all sessions, counting every turn: one a client submits and one the server starts on its own for an inbox item, a schedule's fire among them, or a finished background task. When the cap is reached, a new turn submission returns `429 Too Many Requests` with a `Retry-After` header, and an autonomous turn waits for a free slot (the next turn's end or the next tick) rather than running past the cap. Leave it **unset** for no limit; `0` is refused at startup, because a cap of zero would 429 every turn rather than mean "unlimited".
 
 | Type | Default |
 |------|---------|
@@ -1716,7 +1712,7 @@ How long a queued inbox item is retried for after a turn on it failed, from when
 |------|---------|
 | `string` (duration) | `"1h"` |
 
-The ceiling bounds the whole wait: a retry never lands past it, whatever the upstream said about when it would be back, so a deployment states its own patience here, and every item shows the deadline it sets as `retry_until`. Set `"0s"` to give an item up on its first failure, for a client that owns redelivery itself. A failure no retry would change, a rejected credential or a request the upstream judged wrong, gives the item up at once regardless; one waiting can change, the upstream unavailable, a required MCP server not ready, Meka's own store or disk refusing, is retried within the ceiling. See [The inbox](../usage/http-api.md#the-inbox).
+The ceiling bounds the whole wait: a retry never lands past it, whatever the upstream said about when it would be back, so a deployment states its own patience here, and every item shows the deadline it sets as `retry_until`. Set `"0s"` to give an item up on its first failure, for a client that owns redelivery itself. A schedule's fire waiting in the inbox is an item like any other and is retried within the same ceiling; on the screen and in an editor the ceiling is the default hour. A failure no retry would change, a rejected credential or a request the upstream judged wrong, gives the item up at once regardless; one waiting can change, the upstream unavailable, a required MCP server not ready, Meka's own store or disk refusing, is retried within the ceiling. See [The inbox](../usage/http-api.md#the-inbox).
 
 ### `serve.idle_timeout`
 
@@ -1738,7 +1734,7 @@ How often the background GC scanner runs. Accepts duration strings; `"0s"` is re
 
 ### `serve.delete_on_idle`
 
-When `true`, idle-evicted sessions also have their SQLite row deleted, unless a pin or a scheduled job anywhere in the session's tree keeps it, as `[session].retention` spares one. When `false` (default), only the in-memory state is dropped and the session can be re-attached later.
+When `true`, idle-evicted sessions also have their SQLite row deleted, unless a pin or a schedule anywhere in the session's tree keeps it, as `[session].retention` spares one. When `false` (default), only the in-memory state is dropped and the session can be re-attached later.
 
 | Type | Default |
 |------|---------|
@@ -1815,7 +1811,7 @@ Scopes are flat: `memory:r` does not imply `memory:w`, and neither implies the o
 
 ### `[[serve.webhooks]]`
 
-Outbound endpoints Meka POSTs to when something happens that no client is waiting on: a scheduled job firing, a background task finishing. Omit the block entirely and Meka never makes an outbound request.
+Outbound endpoints Meka POSTs to when something happens that no client is waiting on: a schedule firing, a background task finishing. Omit the block entirely and Meka never makes an outbound request.
 
 ```toml
 [[serve.webhooks]]

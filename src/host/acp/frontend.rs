@@ -883,11 +883,14 @@ impl Frontend for AcpFrontend {
             FrontendEvent::BackgroundReported { tasks, .. } => {
                 background_report_update(&tasks, self.client_state.renders_notices())
             }
-            // Inbox items added behind a round, a nudge or a cut prompt: the editor did not type
-            // them, so they are shown as the user turn they are, as an opening's are.
-            FrontendEvent::InboxAppended { blocks } => {
+            // Inbox items added behind a round, a nudge or a cut prompt, a fire among them: the
+            // editor did not type them, so they are shown as the user turn they are, as an
+            // opening's are.
+            FrontendEvent::InboxAppended { blocks, .. } => {
                 for block in &blocks {
-                    if let crate::conversation::ContentBlock::Inbox { text, .. } = block {
+                    if let crate::conversation::ContentBlock::Inbox { text, .. }
+                    | crate::conversation::ContentBlock::Scheduled { text, .. } = block
+                    {
                         self.send_update(super::schedule::out_of_band_prompt_update(text));
                     }
                 }
@@ -965,13 +968,14 @@ impl Frontend for AcpFrontend {
                 return;
             }
             // Screen signage. The editor named the session it created, and the `session/prompt`
-            // response is what tells it the turn is over. A withdrawn prompt is a scheduled fire's,
+            // response is what tells it the turn is over. A withdrawn prompt is an inbox turn's,
             // never one the editor sent, so its transcript has nothing to amend. Spelled out rather
             // than left to a catch-all so a variant added later has to be placed here on purpose.
             FrontendEvent::SessionStarted { .. }
             | FrontendEvent::TurnFinished
             | FrontendEvent::PromptWithdrawn
             | FrontendEvent::InboxDelivered { .. }
+            | FrontendEvent::InboxWithdrawn { .. }
             | FrontendEvent::Nudged { .. } => return,
         };
 

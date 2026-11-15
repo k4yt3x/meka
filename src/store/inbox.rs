@@ -1,10 +1,10 @@
 //! The session inbox: the `inbox_items` table.
 //!
-//! A message for a session from outside its turn: an HTTP client, or a parent agent steering a
-//! worker. A `steer` is read by the running turn at its next round boundary; an `interrupt` cuts
-//! the answer the turn is streaming and is read at the boundary otherwise; a `followup` waits for
-//! the turn to end. Any of them rides the opening of the next turn, or opens one when nothing is
-//! running.
+//! A message for a session from outside its turn: an HTTP client, a parent agent steering a
+//! worker, or a schedule's fire. A `steer` is read by the running turn at its next round boundary;
+//! an `interrupt` cuts the answer the turn is streaming and is read at the boundary otherwise; a
+//! `followup` waits for the turn to end. Any of them rides the opening of the next turn, or opens
+//! one when nothing is running.
 //!
 //! An item is `pending` until its text is in the conversation log (`appended_at`), `appended` until
 //! a request carrying it is accepted by the provider (`delivered_at`), and `withdrawn` when it was
@@ -52,16 +52,67 @@ impl InboxState {
     }
 }
 
+/// Where an item came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InboxOrigin {
+    /// A message somebody sent: who, as the header names them (what the client said, or `your
+    /// parent agent`), or nobody. `None` when the client named nobody, and the header then names
+    /// nobody: who sent a message is the client's fact, not one Meka guesses from the token that
+    /// carried it.
+    Sent { source: Option<String> },
+    /// A schedule's fire.
+    Fire(Fire),
+}
+
+/// What a fire is, beside its schedule's words (the item's `body`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Fire {
+    pub(crate) schedule_id: String,
+    /// What the schedule's gate printed, when it has a gate and the gate printed anything.
+    pub(crate) gate_output: Option<String>,
+    /// How many occurrences the fire stands for, at least 1.
+    pub(crate) occurrences: u32,
+    /// When the first of them was due.
+    pub(crate) due_at: DateTime<Utc>,
+    /// When the last of them fired.
+    pub(crate) fired_at: DateTime<Utc>,
+}
+
+/// Where a fire's write left it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QueuedFire {
+    /// The item that stands for the fire now.
+    pub(crate) item_id: Uuid,
+    /// The id the waiting fire it joined had, when it joined one.
+    pub(crate) replaces: Option<Uuid>,
+    /// How many occurrences the item stands for now.
+    pub(crate) occurrences: u32,
+}
+
+/// The schedules a turn opened on `items` is for: each fire's schedule, once and in order, when
+/// every item is a fire, and `None` when any is a message somebody sent. The one rule for whose a
+/// driver's turn is, read for the origin its requests report and for the source its row and its
+/// feed name.
+pub(crate) fn fired_schedules(items: &[InboxItem]) -> Option<Vec<String>> {
+    let mut schedule_ids: Vec<String> = Vec::new();
+    for item in items {
+        let InboxOrigin::Fire(fire) = &item.origin else {
+            return None;
+        };
+        if !schedule_ids.contains(&fire.schedule_id) {
+            schedule_ids.push(fire.schedule_id.clone());
+        }
+    }
+    Some(schedule_ids)
+}
+
 /// One row of the inbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InboxItem {
     pub(crate) id: Uuid,
     pub(crate) session_id: Uuid,
     pub(crate) class: InboxClass,
-    /// Who sent it, as the header names them: what the client said, or `your parent agent`.
-    /// `None` when the client named nobody, and the header then names nobody: who sent a message
-    /// is the client's fact, not one Meka guesses from the token that carried it.
-    pub(crate) source: Option<String>,
+    pub(crate) origin: InboxOrigin,
     pub(crate) body: String,
     pub(crate) created_at: DateTime<Utc>,
     /// Turns that opened on this item and failed before the provider accepted anything.
@@ -81,13 +132,15 @@ pub(crate) struct InboxItem {
 
 impl InboxItem {
     /// Where the item is in its life, read off its stamps: `pending` until its text is in the
-    /// conversation, `appended` until a provider accepted a request carrying it, then
-    /// `delivered`; `withdrawn` once taken back, whatever it was before.
+    /// conversation, `appended` until a provider accepted a request carrying it, then `delivered`,
+    /// which nothing unsays: a withdrawal that came once the text was in the conversation keeps the
+    /// item from being offered again, not from having been read. Short of that, `withdrawn` once
+    /// taken back, whatever it was before.
     pub(crate) fn state(&self) -> InboxState {
-        if self.withdrawn_at.is_some() {
-            InboxState::Withdrawn
-        } else if self.delivered_at.is_some() {
+        if self.delivered_at.is_some() {
             InboxState::Delivered
+        } else if self.withdrawn_at.is_some() {
+            InboxState::Withdrawn
         } else if self.appended_at.is_some() {
             InboxState::Appended
         } else {
@@ -166,7 +219,8 @@ pub(crate) struct InboxStore {
 }
 
 const COLUMNS: &str = "id, session_id, class, source, body, created_at, attempts, appended_at, \
-                       delivered_at, withdrawn_at, failure, not_before, last_error";
+                       delivered_at, withdrawn_at, failure, not_before, last_error, schedule_id, \
+                       gate_output, occurrences, due_at, fired_at";
 
 /// A row is offered to a turn while its text is not yet in the log, it has not been taken back,
 /// and any retry wait has passed.
@@ -335,7 +389,9 @@ impl InboxStore {
     /// Stamp every appended, undelivered item of a session as delivered, answering their ids.
     ///
     /// Called when the provider accepts a request: one turn runs per session, so everything
-    /// appended and not yet delivered is in that request.
+    /// appended and not yet delivered is in that request. That holds for an item withdrawn once its
+    /// text was in the conversation, a fire whose schedule was canceled: the model reads it all the
+    /// same, and the stamp says so beside the withdrawal.
     pub(crate) async fn mark_delivered(&self, session_id: Uuid) -> Result<Vec<Uuid>> {
         let session_id = session_id.to_string();
         let delivered_at = Utc::now().to_rfc3339();
@@ -352,7 +408,7 @@ impl InboxStore {
                     let mut statement = transaction.prepare(
                         "SELECT id FROM inbox_items WHERE session_id = ?1 \
                          AND appended_at IS NOT NULL AND delivered_at IS NULL \
-                         AND withdrawn_at IS NULL ORDER BY created_at, rowid",
+                         ORDER BY created_at, rowid",
                     )?;
                     let rows = statement.query_map([&session_id], |row| row.get::<_, String>(0))?;
                     rows.collect::<rusqlite::Result<Vec<String>>>()?
@@ -593,6 +649,11 @@ impl InboxStore {
                         failure: row.get(10)?,
                         not_before: row.get(11)?,
                         last_error: row.get(12)?,
+                        schedule_id: row.get(13)?,
+                        gate_output: row.get(14)?,
+                        occurrences: row.get(15)?,
+                        due_at: row.get(16)?,
+                        fired_at: row.get(17)?,
                     })
                 })?;
                 rows.collect()
@@ -663,7 +724,9 @@ pub(super) fn stamp_appended(
 }
 
 /// Offer `ids` again inside the transaction that takes their message out of the log: the
-/// counterpart of [`stamp_appended`], and `pub(super)` for the same reason.
+/// counterpart of [`stamp_appended`], and `pub(super)` for the same reason. One withdrawn while its
+/// text was in the conversation leaves the conversation with the message and stays withdrawn: it is
+/// offered to nobody, and no later request is taken to have delivered it.
 pub(super) fn reset_pending_in(
     transaction: &rusqlite::Transaction<'_>,
     ids: &[String],
@@ -673,8 +736,9 @@ pub(super) fn reset_pending_in(
         return Ok(());
     }
     let mut statement = transaction.prepare(
-        "UPDATE inbox_items SET appended_at = NULL, not_before = ?2 \
-         WHERE id = ?1 AND delivered_at IS NULL AND withdrawn_at IS NULL",
+        "UPDATE inbox_items SET appended_at = NULL, \
+         not_before = CASE WHEN withdrawn_at IS NULL THEN ?2 END \
+         WHERE id = ?1 AND delivered_at IS NULL",
     )?;
     for id in ids {
         statement.execute(rusqlite::params![id, not_before])?;
@@ -682,19 +746,118 @@ pub(super) fn reset_pending_in(
     Ok(())
 }
 
-/// Offer every appended, undelivered item of a session again, inside the transaction that
-/// removes the tail of its log. Those are exactly the items whose text has not yet been in an
-/// accepted request, which is the tail a rewind takes.
+/// Offer every appended, undelivered item of a session again, inside the transaction that removes
+/// the tail of its log. Those are exactly the items whose text has not yet been in an accepted
+/// request, which is the tail a rewind takes. One withdrawn meanwhile leaves the conversation with
+/// them and stays withdrawn.
 pub(super) fn reset_appended_in(
     transaction: &rusqlite::Transaction<'_>,
     session_id: &str,
 ) -> rusqlite::Result<()> {
     transaction.execute(
         "UPDATE inbox_items SET appended_at = NULL, not_before = NULL WHERE session_id = ?1 \
-         AND appended_at IS NOT NULL AND delivered_at IS NULL AND withdrawn_at IS NULL",
+         AND appended_at IS NOT NULL AND delivered_at IS NULL",
         [session_id],
     )?;
     Ok(())
+}
+
+/// Queue `fire`, of the schedule whose words are `body`, inside the transaction that spends its
+/// occurrence. `pub(super)` rather than a method, as [`stamp_appended`] is: the transaction
+/// belongs to the schedules store, and the two writes commit together or not at all.
+///
+/// A schedule has one waiting fire. When it has a pending one (not in the conversation, not
+/// withdrawn), the occurrence joins it: the count grows by `fire`'s, and the gate's output and
+/// when it fired become `fire`'s, while the item keeps its age, when its first occurrence was due
+/// and its retry state. The joined item takes a new id. A turn may have read the item a moment ago
+/// and be about to stamp it as in the conversation by the id it read; under that id the stamp
+/// touches nothing, the item stays pending and the next pause reads it whole, so the model can be
+/// told of an occurrence twice and cannot lose one. The newest pending fire is the one joined: a
+/// rewind can put an older one back beside it, and both are read. Otherwise the fire is a new
+/// `steer`.
+pub(super) fn queue_fire_in(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    body: &str,
+    fire: &Fire,
+    now: &str,
+) -> rusqlite::Result<QueuedFire> {
+    let id = Uuid::new_v4();
+    let waiting: Option<(String, i64)> = transaction
+        .query_row(
+            "SELECT id, occurrences FROM inbox_items WHERE schedule_id = ?1 \
+             AND appended_at IS NULL AND withdrawn_at IS NULL \
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            [&fire.schedule_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((waiting_id, waiting_occurrences)) = waiting else {
+        transaction.execute(
+            "INSERT INTO inbox_items (id, session_id, class, source, body, created_at, \
+             schedule_id, gate_output, occurrences, due_at, fired_at) \
+             VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                id.to_string(),
+                session_id,
+                InboxClass::Steer.name(),
+                body,
+                now,
+                fire.schedule_id,
+                fire.gate_output,
+                fire.occurrences,
+                fire.due_at.to_rfc3339(),
+                fire.fired_at.to_rfc3339(),
+            ],
+        )?;
+        return Ok(QueuedFire {
+            item_id: id,
+            replaces: None,
+            occurrences: fire.occurrences,
+        });
+    };
+    transaction.execute(
+        "UPDATE inbox_items SET id = ?2, occurrences = occurrences + ?3, gate_output = ?4, \
+         fired_at = ?5 WHERE id = ?1",
+        rusqlite::params![
+            waiting_id,
+            id.to_string(),
+            fire.occurrences,
+            fire.gate_output,
+            fire.fired_at.to_rfc3339(),
+        ],
+    )?;
+    let replaces = Uuid::parse_str(&waiting_id).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(QueuedFire {
+        item_id: id,
+        replaces: Some(replaces),
+        occurrences: u32::try_from(waiting_occurrences)
+            .unwrap_or(u32::MAX)
+            .saturating_add(fire.occurrences),
+    })
+}
+
+/// Withdraw every fire of `schedule_id` that no request has delivered, inside the transaction that
+/// deletes the schedule, and answer the ids of the items withdrawn as the rows hold them. A fire
+/// the model has not read is the canceled schedule's, its text in the conversation or not, and
+/// withdrawn it is one no failed turn or rewind offers again. One whose text is in the conversation
+/// cannot be unsaid: a request that carries it and is accepted all the same delivers it
+/// ([`InboxStore::mark_delivered`]). One a provider already accepted is history and stays.
+pub(super) fn withdraw_fires_in(
+    transaction: &rusqlite::Transaction<'_>,
+    schedule_id: &str,
+    now: &str,
+) -> rusqlite::Result<Vec<String>> {
+    transaction
+        .prepare(
+            "UPDATE inbox_items SET withdrawn_at = ?2, failure = 'its schedule was canceled', \
+             last_error = NULL, not_before = NULL \
+             WHERE schedule_id = ?1 AND delivered_at IS NULL AND withdrawn_at IS NULL RETURNING id",
+        )?
+        .query_map(rusqlite::params![schedule_id, now], |row| row.get(0))?
+        .collect()
 }
 
 /// A raw row, decoded outside the connection call so a bad row names itself.
@@ -712,6 +875,11 @@ struct InboxRow {
     failure: Option<String>,
     not_before: Option<String>,
     last_error: Option<String>,
+    schedule_id: Option<String>,
+    gate_output: Option<String>,
+    occurrences: Option<i64>,
+    due_at: Option<String>,
+    fired_at: Option<String>,
 }
 
 impl InboxRow {
@@ -725,12 +893,28 @@ impl InboxRow {
                 })
                 .transpose()
         };
+        let origin = match self.schedule_id {
+            None => InboxOrigin::Sent {
+                source: (!self.source.is_empty()).then_some(self.source),
+            },
+            Some(schedule_id) => InboxOrigin::Fire(Fire {
+                schedule_id,
+                gate_output: self.gate_output,
+                occurrences: self
+                    .occurrences
+                    .and_then(|count| u32::try_from(count).ok())
+                    .filter(|count| *count >= 1)
+                    .ok_or_else(|| format!("bad occurrences: {:?}", self.occurrences))?,
+                due_at: stamp(self.due_at)?.ok_or("missing due_at")?,
+                fired_at: stamp(self.fired_at)?.ok_or("missing fired_at")?,
+            }),
+        };
         Ok(InboxItem {
             id: Uuid::parse_str(&self.id).map_err(|error| format!("bad id: {error}"))?,
             session_id: Uuid::parse_str(&self.session_id)
                 .map_err(|error| format!("bad session id: {error}"))?,
             class: self.class.parse()?,
-            source: (!self.source.is_empty()).then_some(self.source),
+            origin,
             body: self.body,
             created_at: stamp(Some(self.created_at))?.ok_or("missing created_at")?,
             attempts: u32::try_from(self.attempts.max(0)).unwrap_or(u32::MAX),
@@ -925,9 +1109,205 @@ mod tests {
             .await
             .expect("enqueue");
         let unnamed = inbox.get(unnamed.id).await.expect("get").expect("row");
-        assert_eq!(unnamed.source, None);
+        assert_eq!(unnamed.origin, InboxOrigin::Sent { source: None });
         let named = inbox.get(named.id).await.expect("get").expect("row");
-        assert_eq!(named.source, Some("test".to_string()));
+        assert_eq!(named.origin, InboxOrigin::Sent {
+            source: Some("test".to_string())
+        });
+    }
+
+    /// A row that names a schedule reads back as that schedule's fire, with its facts; one whose
+    /// count is not a count or that lacks a time is no fire, and is quarantined as any row this
+    /// build cannot read is.
+    #[tokio::test]
+    async fn a_row_naming_a_schedule_reads_as_its_fire_and_one_missing_a_fact_is_quarantined() {
+        let (store, session_id) = store_with_session().await;
+        let inbox = store.inbox_store();
+        let due_at = DateTime::parse_from_rfc3339("2026-11-15T14:03:00Z")
+            .expect("time")
+            .with_timezone(&Utc);
+        let fire = Fire {
+            schedule_id: "1a2b3c4d-0000-4000-8000-000000000000".to_string(),
+            gate_output: Some("state: failed\n".to_string()),
+            occurrences: 3,
+            due_at,
+            fired_at: due_at + chrono::Duration::minutes(30),
+        };
+        let id = store
+            .schedule_store()
+            .queue_fire_for_test(session_id, "check the deploy", fire.clone())
+            .await
+            .expect("queue")
+            .item_id;
+        let read = inbox.get(id).await.expect("get").expect("row");
+        assert_eq!(read.origin, InboxOrigin::Fire(fire));
+        assert_eq!(
+            (read.class, read.body.as_str()),
+            (InboxClass::Steer, "check the deploy")
+        );
+
+        for (column, value) in [
+            ("occurrences", Some("0")),
+            ("occurrences", None),
+            ("due_at", None),
+            ("fired_at", None),
+        ] {
+            let broken = store
+                .schedule_store()
+                .queue_fire_for_test(session_id, "broken", Fire {
+                    schedule_id: "5e6f7a8b".to_string(),
+                    gate_output: None,
+                    occurrences: 1,
+                    due_at,
+                    fired_at: due_at,
+                })
+                .await
+                .expect("queue")
+                .item_id;
+            store
+                .connection
+                .call(move |connection| -> rusqlite::Result<usize> {
+                    connection.execute(
+                        &format!("UPDATE inbox_items SET {column} = ?2 WHERE id = ?1"),
+                        rusqlite::params![broken.to_string(), value],
+                    )
+                })
+                .await
+                .expect("break the row");
+            let pending = inbox
+                .take_pending(session_id, &[], Utc::now())
+                .await
+                .expect("the read survives the row");
+            assert_eq!(
+                pending.iter().map(|item| item.id).collect::<Vec<_>>(),
+                [id],
+                "{column} = {value:?}"
+            );
+            let (withdrawn_at, failure): (Option<String>, Option<String>) = store
+                .connection
+                .call(move |connection| {
+                    connection.query_row(
+                        "SELECT withdrawn_at, failure FROM inbox_items WHERE id = ?1",
+                        [broken.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                })
+                .await
+                .expect("the row");
+            assert!(
+                withdrawn_at.is_some()
+                    && failure
+                        .as_deref()
+                        .is_some_and(|why| why.starts_with("unreadable")),
+                "{column} = {value:?}: {failure:?}"
+            );
+        }
+    }
+
+    /// A turn's stamp by the id a fire had before an occurrence joined it touches nothing: the
+    /// fire stays pending, and the next read takes it whole under its new id, so an occurrence can
+    /// be read twice and never lost.
+    #[tokio::test]
+    async fn a_stamp_by_the_id_a_joined_fire_had_touches_nothing_and_the_fire_is_read_again() {
+        let (store, session_id) = store_with_session().await;
+        let inbox = store.inbox_store();
+        let schedule = crate::schedule::Schedule {
+            attempts: 0,
+            id: Uuid::new_v4().to_string(),
+            session_id,
+            timing: crate::schedule::Timing::parse_every("1h").expect("parses"),
+            prompt: "check the deploy".to_string(),
+            gate: None,
+            created_at: Utc::now(),
+            last_fired_at: None,
+            next_fire_at: Utc::now(),
+        };
+        store
+            .schedule_store()
+            .create_schedule(&schedule, usize::MAX)
+            .await
+            .expect("create the schedule");
+        let fire = |schedule: &crate::schedule::Schedule| {
+            let store = store.clone();
+            let schedule = schedule.clone();
+            async move {
+                let now = Utc::now();
+                assert!(
+                    store
+                        .schedule_store()
+                        .claim_occurrence(
+                            &schedule.id,
+                            schedule.next_fire_at,
+                            "host",
+                            now,
+                            now + chrono::Duration::hours(1),
+                        )
+                        .await
+                        .expect("claim")
+                );
+                store
+                    .schedule_store()
+                    .queue_fire(
+                        &schedule,
+                        "host",
+                        Some(schedule.next_fire_at + chrono::Duration::hours(1)),
+                        None,
+                        Fire {
+                            schedule_id: schedule.id.clone(),
+                            gate_output: None,
+                            occurrences: 1,
+                            due_at: schedule.next_fire_at,
+                            fired_at: now,
+                        },
+                    )
+                    .await
+                    .expect("queue")
+            }
+        };
+        fire(&schedule).await;
+        let read = inbox
+            .take_pending(session_id, &[], Utc::now())
+            .await
+            .expect("a turn reads the inbox");
+        let [read] = read.as_slice() else {
+            panic!("one fire waits: {read:?}");
+        };
+
+        let advanced = store
+            .schedule_store()
+            .list_schedules(session_id)
+            .await
+            .expect("list")
+            .into_iter()
+            .next()
+            .expect("the schedule");
+        fire(&advanced).await;
+        store
+            .save_event_marking_inbox(
+                session_id,
+                &crate::conversation::Event::Append(crate::conversation::Message::user_turn(
+                    "",
+                    "the fire as the turn read it",
+                    Vec::new(),
+                )),
+                &[read.id],
+                None,
+            )
+            .await
+            .expect("the turn's stamp, by the id it read");
+
+        let again = inbox
+            .take_pending(session_id, &[], Utc::now())
+            .await
+            .expect("the next pause reads the inbox");
+        let [again] = again.as_slice() else {
+            panic!("the fire is still waiting: {again:?}");
+        };
+        assert_ne!(again.id, read.id);
+        let InboxOrigin::Fire(facts) = &again.origin else {
+            panic!("a fire: {again:?}");
+        };
+        assert_eq!(facts.occurrences, 2, "and it stands for both occurrences");
     }
 
     /// A deferred item shows when it runs next and why it waits, and both read back off the row.

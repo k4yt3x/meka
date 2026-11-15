@@ -324,8 +324,8 @@ The flag speaks for the streaming client: a feed reader that opened the stream w
 is asked regardless, since attending is that declaration made per connection.
 
 Set `answers_prompts_on_return: true` on a session a person drives through a client that comes and
-goes, a browser tab say. A gated call in a turn no request holds, a detached turn, an inbox turn, a
-scheduled fire, then parks whether or not anyone is attending, survives the last attending reader
+goes, a browser tab say. A gated call in a turn no request holds, a detached turn, an inbox turn, one
+opened on a schedule's fire, then parks whether or not anyone is attending, survives the last attending reader
 leaving, and closes only on an answer, the turn's cancellation or its 30-minute expiry; the client
 that comes back is handed it with the feed's replay and answers it. The session is busy for as
 long as the prompt waits. A held turn keeps the grace rule, since its request leaving stops the
@@ -373,7 +373,7 @@ so it is a sibling under the same parent rather than a session this endpoint cou
 readable through every endpoint on this page (`/history`, `/context`, `/context/messages`, `/turns`,
 `/export`) and drivable through none of them: `POST /v1/sessions/{id}/turns` answers `422` with
 `/errors/session-not-drivable`, as do `/compact`, `/responses/{request_id}`, `/fork`, a
-`POST /v1/jobs` naming one, and `PATCH /v1/sessions/{id}`. A sub-agent
+`POST /v1/schedules` naming one, and `PATCH /v1/sessions/{id}`. A sub-agent
 runs under the tools, permission ceiling and profile its spawn call set, which live in its
 spawn record and which only its parent can reconstruct, so the conversation is continued with the
 `agent_followup` tool from the parent rather than over HTTP.
@@ -477,7 +477,7 @@ GET    /v1/sessions/{id}/turns/{turn_id}   One turn, with its ending once it has
 
 **One turn at a time per session.** A second `POST /turns` while another is running returns `409 Conflict`. Across sessions, turns run fully concurrently. A client that would rather hand the message over and be told when the model read it uses the [inbox](#the-inbox) instead of waiting for the session to be free.
 
-`POST /cancel` takes an optional body `{"turn_id": "..."}`. Without one it stops whatever is running. With one it stops only that turn, and answers `409` `turn-mismatch` naming the turn actually in flight when it is another, so a client that watched a turn cannot stop the scheduled fire or the inbox turn that replaced it. Every `turn.started` on the [session feed](#the-session-feed) carries the id to name.
+`POST /cancel` takes an optional body `{"turn_id": "..."}`. Without one it stops whatever is running. With one it stops only that turn, and answers `409` `turn-mismatch` naming the turn actually in flight when it is another, so a client that watched a turn cannot stop the turn that replaced it, one opened on a schedule's fire or an inbox item, say. Every `turn.started` on the [session feed](#the-session-feed) carries the id to name.
 
 The turn request body accepts six fields:
 
@@ -519,7 +519,14 @@ The body is `{"message": "...", "class": "steer" | "followup" | "interrupt", "so
 - **`followup`** waits for the running turn to end.
 - **`interrupt`** does not wait for the answer being written. While the provider is streaming, the stream is dropped within a second, the text that had arrived is kept as the answer so far, and the message follows it as the next thing the model reads; the same turn carries on, with no terminal in between, and the feed says so with a `notice`. A cut can land inside a thinking block or after a tool call was announced and never run: the `notice` is what closes those. While a tool runs, nothing is cut: the message is read at the round boundary after the tool's results, exactly as a `steer` is. A profile that does not stream has nothing partial to keep: the reply being generated is dropped whole and the request goes again with the message. The cost is the request sent again, which the prompt cache mostly absorbs, and the part of the answer that was never written. For "stop, do this instead"; a `steer` is enough for "also, when you get to it".
 
-Every class rides the opening of the next turn when nothing is running, whoever starts that turn, and opens a turn of its own when nothing else does. A turn that has been admitted but has not yet sent its first request is not running yet in this sense: an item that lands in that moment rides its opening, whatever its class. The model reads each item under a header Meka writes: `[Message from <source>, arrived <time>]`, with `while you were working` added when it landed mid-turn. Without a `source`, or with a blank one, the header is `[Message arrived <time>]` and names nobody: who sent a message is the client's to say, and Meka does not guess it from the token that carried it. `GET /v1/sessions/{id}/inbox` omits `source` for such an item. The body is verbatim, so a client relaying text from strangers fences it itself.
+Every class rides the opening of the next turn when nothing is running, whoever starts that turn, and opens a turn of its own when nothing else does. A turn that has been admitted but has not yet sent its first request is not running yet in this sense: an item that lands in that moment rides its opening, whatever its class. The exception is a turn the inbox itself opened: it opens on the items it was opened for, the ones its `turn.started` names, and an item that lands while it opens is read at its next pause, or waits for its end, as its class says. A fire among them is taken as it is by then: when an occurrence joined it while the turn was starting, the opening carries it under its new id, which `schedule.fired` tied to the one `turn.started` named by `replaces`, and `inbox.delivered` names the new one. A fire queued after the one the turn was opened for was withdrawn is another fire, and waits for a turn of its own. The model reads each item under a header Meka writes: `[Message from <source>, arrived <time>]`, with `while you were working` added when it landed mid-turn. Without a `source`, or with a blank one, the header is `[Message arrived <time>]` and names nobody: who sent a message is the client's to say, and Meka does not guess it from the token that carried it. `GET /v1/sessions/{id}/inbox` omits `source` for such an item. The body is verbatim, so a client relaying text from strangers fences it itself.
+
+Not every item is a message. A [schedule](./scheduling.md#what-a-fire-is)'s fire is queued here too, as a `steer`, by the scheduler rather than through this endpoint. `GET /v1/sessions/{id}/inbox` lists it with the `schedule_id` and the number of `occurrences` it stands for in place of a `source`, it counts in `inbox_pending`, `DELETE` withdraws it, and it is retried and given up on by the rules below; the model reads it as a [`scheduled` block](#history) rather than under a message header. A schedule has one waiting fire: an occurrence that fires while it is unread joins it, and the item takes a new id each time, [`schedule.fired`](#payloads) naming the one it had in `replaces`, so the old id answers `404`. Canceling the schedule withdraws every fire of it the model has not read, so none is offered again, and the feed reports each as `inbox.withdrawn` when the cancel was made through this server, by `DELETE /v1/schedules/{schedule_id}` or the model's own `schedule_cancel`; a cancel another process made (`meka schedule cancel`, a screen) is not on this server's feed, and the item leaves the list all the same. `inbox.withdrawn` is final for a fire that was still waiting. One whose text is already in the conversation cannot be unsaid: the next request the provider accepts carries it, be it the one already on its way or a later turn's, and then the model reads the fire, the item is `delivered`, and `inbox.delivered` names it after its `inbox.withdrawn`.
+
+```json
+{"id": "...", "session_id": "...", "class": "steer", "schedule_id": "6f9a0424-...", "occurrences": 3,
+ "state": "pending", "created_at": "2026-11-15T12:31:57Z", "retry_until": "2026-11-15T13:31:57Z"}
+```
 
 The answer is `202` with the item and its state:
 
@@ -530,13 +537,13 @@ The answer is `202` with the item and its state:
 
 `retry_until` is the deadline for retries, the item's enqueue plus [`[serve] inbox_retry_ceiling`](../configuration/config-file.md#serveinbox_retry_ceiling): an attempt that fails after it is not retried, and the item is given up on. An item not yet tried still runs when its turn comes, whatever the time, so under a short ceiling a fresh item can show a `retry_until` already past and be delivered all the same. A fresh item answers `pending`, unless a turn already running read it in the meantime. A replayed key answers with what the earlier item has become: beside its `state`, the `not_before` and `last_error` it shows while it waits, or the `failure` and `last_error` it was given up on with, so a producer that lost its place learns the item's fate from the same call that enqueued it, without listing an inbox that no longer shows a withdrawn item.
 
-An item is `pending` until its text is in the conversation, `appended` until the provider accepts a request carrying it, then `delivered`; `withdrawn` is a `DELETE`, a canceled turn, or Meka giving up. **Delivered means the model read it**, not that it was written down: the feed's `inbox.delivered` fires when the provider accepts the request, and names the turn that carried the item. A rewind that takes an `appended` item's text out of the context before it was delivered offers the item again. `GET /v1/sessions/{id}` reports `inbox_pending` beside `turn_in_flight` while the session is loaded.
+An item is `pending` until its text is in the conversation, `appended` until the provider accepts a request carrying it, then `delivered`; `withdrawn` is a `DELETE`, a canceled turn, a canceled schedule for its fire, or Meka giving up. **Delivered means the model read it**, not that it was written down: the feed's `inbox.delivered` fires when the provider accepts the request, and names the turn that carried the item. A rewind that takes an `appended` item's text out of the context before it was delivered offers the item again. `GET /v1/sessions/{id}` reports `inbox_pending` beside `turn_in_flight` while the session is loaded.
 
 `Idempotency-Key` works here as on `POST /turns`: the same key with another `message` or `class` is refused with `409` `idempotency`. One difference matters to a bridge: the key is recorded on the row rather than in memory, so a retry that lands after a Meka restart still finds its earlier item and answers it with `replayed: true`, and the key stays bound to that item for the session's life, withdrawn or delivered. The item is durable before the `202`; a session evicted for idleness is revived to run it, and a process that restarts finds it waiting.
 
-A turn opened on inbox items that fails before anything from the model reached the conversation withdraws its prompt and offers the items again, when waiting can change the answer: the upstream could not serve the profile (an outage, a dropped stream, a quota or billing rejection), a required MCP server was not ready, or Meka's own store or disk refused (a lock another process holds, a full disk). Any other failure, a rejected credential, a request the upstream judged wrong, a profile that cannot read the session's images, gives the item up at once, since every attempt would fail the same way. A retry waits 10 seconds, then twice that per attempt, up to five minutes between attempts, or less when the upstream said it would be back sooner (`Retry-After`, a quota reset); a stated time never makes it wait longer, since an account topped up early is noticed at the next attempt. Each deferral posts `inbox.deferred` on the feed and the webhook with the time of the next attempt and the error, and the item shows `not_before` and `last_error`, the same error as a Problem Detail (`type`, `title`, `status`, `detail`, never the upstream's text), while it waits. Retrying ends at `retry_until`, the item's enqueue plus [`[serve] inbox_retry_ceiling`](../configuration/config-file.md#serveinbox_retry_ceiling), an hour by default: the item is given up on, withdrawn, with `inbox.failed` on the feed and the webhook carrying the reason and the last error, so whoever is waiting is told rather than left with silence, and the item keeps that `failure` and `last_error` for a replayed key to answer; a canceled turn or a client's `DELETE` withdraws an item with no error on it, since none decided it; `"0s"` gives an item up on its first failure. An item a tool round already carried into the conversation is not retried: it is history, and the next turn of any kind delivers it. An item on a session another process holds (a screen open on it, say) is asked about again every ten seconds until the holder lets go, or the holder's own next turn carries it; those waits count toward the ceiling.
+A turn opened on inbox items that fails before anything from the model reached the conversation withdraws its prompt and offers the items again, when waiting can change the answer: the upstream could not serve the profile (an outage, a dropped stream, a quota or billing rejection), a required MCP server was not ready, or Meka's own store or disk refused (a lock another process holds, a full disk). Any other failure, a rejected credential, a request the upstream judged wrong, a profile that cannot read the session's images, gives the item up at once, since every attempt would fail the same way. A retry waits 10 seconds, then twice that per attempt, up to five minutes between attempts, or less when the upstream said it would be back sooner (`Retry-After`, a quota reset); a stated time never makes it wait longer, since an account topped up early is noticed at the next attempt. Each deferral posts `inbox.deferred` on the feed and the webhook with the time of the next attempt and the error, and the item shows `not_before` and `last_error`, the same error as a Problem Detail (`type`, `title`, `status`, `detail`, never the upstream's text), while it waits. Retrying ends at `retry_until`, the item's enqueue plus [`[serve] inbox_retry_ceiling`](../configuration/config-file.md#serveinbox_retry_ceiling), an hour by default: the item is given up on, withdrawn, with `inbox.failed` on the feed and the webhook carrying the reason and the last error, so whoever is waiting is told rather than left with silence, and the item keeps that `failure` and `last_error` for a replayed key to answer; a canceled turn or a client's `DELETE` withdraws an item with no error on it, since none decided it; `"0s"` gives an item up on its first failure. An item a tool round already carried into the conversation is not retried: it is history, and the next turn of any kind delivers it. A session that cannot be brought up for the turn, such as one whose profile left `config.toml`, puts its items off five minutes at a time, each wait counting as an attempt, and says why in the server's log alone. An item on a session another process holds (a screen open on it, say) is that process's: its next turn carries it, or the turn it opens for it when the session is idle, and `meka serve` neither puts the item off nor counts an attempt on it while the holder has the session.
 
-Only a `pending` item can be withdrawn. `DELETE` on one that is already in the conversation answers `409` `inbox-appended`, since only a turn can answer it now; a delivered or withdrawn one is `404`. A `DELETE` that lands in the instant between a turn reading the item and writing it may still be read by the model. Canceling a turn the inbox opened, with `POST /cancel`, withdraws the items it opened on, the way a canceled client turn loses its prompt, and the feed reports each as `inbox.withdrawn`. The endpoint refuses a sub-agent's session exactly as `POST /turns` does: a worker's inbox is its parent's, written with the `agent_steer` tool. No images in this release.
+`DELETE` withdraws only a `pending` item: on one that is already in the conversation it answers `409` `inbox-appended`, since only a turn can answer it now, and a delivered or withdrawn one is `404`. A `DELETE` that lands in the instant between a turn reading the item and writing it may still be read by the model, and the item is then `delivered`; when it takes every item a turn the server was opening had read, that turn opens on nothing and the feed closes it with `turn.canceled`, `reason` `client`, and no webhook. Canceling a turn the inbox opened, with `POST /cancel`, withdraws the items it opened on, the way a canceled client turn loses its prompt, and the feed reports each as `inbox.withdrawn`. The endpoint refuses a sub-agent's session exactly as `POST /turns` does: a worker's inbox is its parent's, written with the `agent_steer` tool. No images in this release.
 
 ### Image attachments
 
@@ -625,7 +632,9 @@ else Meka writes into a user message keeps its own kind, so a client can show it
 and never has to parse a header: a `nudge` (Meka's "keep going", with its `kind`); an `inbox`
 block for a message that reached the model through the inbox, with `body`, the person's words,
 and the `item_id`, `class` and `source` where they were recorded; a `scheduled` block for a
-job's fire, with `job_id` and `prompt`, the job's words; a `background_report` for finished
+schedule's fire, with `schedule_id` and `prompt`, the schedule's words, which sits where the fire
+was read, as an `inbox` block does: in the message a turn opened with, behind a round's tool
+results, or after a reply; a `background_report` for finished
 background work, with `task_ids`; a `harness_note` for what Meka wrote in place of something it
 removed, an image the provider rejected or the request budget could not carry, with `note`, the
 sentence, and `text` as the model read it behind Meka's label; and a `summary` for the message a
@@ -723,8 +732,8 @@ counters omitted; `/tools` returns 409, since a catalog needs a loaded session.
 Every change to the conversation writes a row to its event log, so its position moves on each: a
 message appended, a compaction, a rewind, and the rewrites a turn makes of its context, a repair of a
 malformed request, the redaction of an image that no longer fit the request size budget, a prompt
-taken back to join a message to it or withdrawn because its turn produced nothing (for a recurring
-job, or a turn sent with `options.unanswered_message` set to `withdraw`). Three things make editing
+taken back to join a message to it or withdrawn because its turn produced nothing (for an inbox
+turn, a schedule's fire included, or a turn sent with `options.unanswered_message` set to `withdraw`). Three things make editing
 the conversation safe:
 
 - **`ETag` and `If-Match`.** `GET /history` and `GET /context/messages` answer with the
@@ -860,7 +869,7 @@ Key fields:
 
 ## Streaming response
 
-Every resident session has one event feed. Everything a turn emits goes on it, whoever started the turn: a `POST /turns`, a scheduled fire, a background outcome, an inbox item. `POST /turns` with `stream: true` answers with a view of that feed scoped to the one turn it started, as `text/event-stream`, and closes after the turn's terminal. `GET /v1/sessions/{id}/feed` is the feed itself, across turns; see [The session feed](#the-session-feed). Every event has a monotonic `id`, a named `event` type, and a JSON `data` payload, and every payload carries `turn_id` and `session_id`, so a client holding several feeds can file an event without per-connection state.
+Every resident session has one event feed. Everything a turn emits goes on it, whoever started the turn: a `POST /turns`, a schedule's fire, a background outcome, an inbox item. `POST /turns` with `stream: true` answers with a view of that feed scoped to the one turn it started, as `text/event-stream`, and closes after the turn's terminal. `GET /v1/sessions/{id}/feed` is the feed itself, across turns; see [The session feed](#the-session-feed). Every event has a monotonic `id`, a named `event` type, and a JSON `data` payload, and every payload carries `turn_id` and `session_id`, so a client holding several feeds can file an event without per-connection state.
 
 ### Event types
 
@@ -868,8 +877,8 @@ Every resident session has one event feed. Everything a turn emits goes on it, w
 
 | Event | Payload | When |
 |-------|---------|------|
-| `turn.started` | `turn_id`, `session_id`, `started_at`, `source` (`"client"`, `"inbox"` with `item_ids`, `"schedule"` with `job_id`, `"background"`, `"compaction"` for the checkpoint turn `POST /compact` runs, or `"parent"` with `parent_id` and `tool_call_id` on a sub-agent's feed) | Turn begins |
-| `message.appended` | `role`, `content`, `turn_id`, `session_id` | A user-role message carrying words entered the conversation: the message the turn opened with, whoever opened it, or the one an interrupt appends after a cut answer. `content` is the message's blocks as `GET /history` types them (`turn_context`, `text`, `invocation`, `resource`, `scheduled`, `background_report`, `inbox`, `image` by `hash`) |
+| `turn.started` | `turn_id`, `session_id`, `started_at`, `source` (`"client"`, `"inbox"` with `item_ids`, `"schedule"` with `item_ids` and `schedule_ids` for a turn opened on schedules' fires alone, `"background"`, `"compaction"` for the checkpoint turn `POST /compact` runs, or `"parent"` with `parent_id` and `tool_call_id` on a sub-agent's feed) | Turn begins |
+| `message.appended` | `role`, `content`, `turn_id`, `session_id` | A user-role message carrying words entered the conversation: the message the turn opened with, whoever opened it, the one an interrupt appends after a cut answer, or the one that follows a reply with what arrived while it was written. `content` is the message's blocks as `GET /history` types them (`turn_context`, `text`, `invocation`, `resource`, `scheduled`, `background_report`, `inbox`, `image` by `hash`) |
 | `turn.finished` | `turn_id`, `session_id`, `stop_reason`, `usage`, `position`, optional `refusal_text`, `profile` when a [fallback profile](sessions.md#fallback-profiles) served the turn | Turn completed successfully |
 | `turn.failed` | `turn_id`, `session_id`, `error` (Problem Detail shape), `position`, `message_withdrawn` when the turn began, `profile` when a fallback profile served the turn | Turn failed mid-stream |
 | `turn.canceled` | `turn_id`, `session_id`, `reason` (`"client"` for `POST /cancel`, `"server_shutdown"`, `"abandoned"` when a held turn's request had been gone for the grace with nobody else listening, `"sse_lag"` when the only consumer fell behind and the turn was stopped for it, or `"parent"` on a sub-agent's feed, whose turn stops with its parent's), `position`, `message_withdrawn` when the turn began, `profile` when a fallback profile served the turn | Turn was canceled |
@@ -878,7 +887,7 @@ Every resident session has one event feed. Everything a turn emits goes on it, w
 
 `turn.finished`, `turn.failed`, and `turn.canceled` are **terminal** for the turn: a `POST /turns` stream closes immediately after its own, and the feed carries on to the next turn. `turn.failed` and `turn.canceled` also carry `message_withdrawn` when the turn began, whether it took the message it was sent back out of the conversation; see [Resending a failed turn](#resending-a-failed-turn). All three carry `position`, the conversation's position as the turn ends: what the turn wrote is in the history up to there, so a client that rendered it live reads `GET /history?after=<the last position it held>` to hold it as stored. It is omitted only when the store could not say, and on [a sub-agent's feed](#a-sub-agents-feed); see [Editing the conversation](#editing-the-conversation).
 
-`message.appended` is how a reader that did not open a turn learns what it answers: a scheduled job's fire, a background report, another client's words, an inbox item. It follows the turn's `turn.started` and precedes every delta, tool event and `inbox.delivered` of that turn; the message an interrupt appends follows the `notice` announcing the cut. The feed mirrors the conversation at two grains: a message that enters whole is announced whole by this event, and a block added to a message a round is still building is announced by the event that names it. `task.reported` and `turn.nudged` carry the text Meka wrote; `inbox.delivered`, which also covers an interrupt joined onto an opening nothing had answered, carries the items' ids alone, since the words are the producer's, and a reader that is not the producer takes them from `GET /history`. An `inbox` block in `message.appended` says the item was appended, as its own `appended` state says; `inbox.delivered` is the moment the model read it. `message_withdrawn: true` on a turn's terminal is a fact about the context: the opening stays in the history, as the screen shows it, and a client showing the context drops it. A recurring job's fire, or an inbox turn retried after a failure, appends its opening on every attempt and takes it back out of the context each time it ends with nothing from the model. The event carries the `turn_context` block as the history does, so a reader's replay ring grows with it.
+`message.appended` is how a reader that did not open a turn learns what it answers: a schedule's fire, a background report, another client's words, an inbox item. It follows the turn's `turn.started` and precedes every delta, tool event and `inbox.delivered` of that turn; the message an interrupt appends follows the `notice` announcing the cut. The feed mirrors the conversation at two grains: a message that enters whole is announced whole by this event, and a block added to a message a round is still building is announced by the event that names it. `task.reported` and `turn.nudged` carry the text Meka wrote; `inbox.delivered`, which also covers an interrupt joined onto an opening nothing had answered, carries the items' ids alone, since the words are the producer's, and a reader that is not the producer takes them from `GET /history`. An `inbox` block in `message.appended` says the item was appended, as its own `appended` state says; `inbox.delivered` is the moment the model read it. `message_withdrawn: true` on a turn's terminal is a fact about the context: the opening stays in the history, as the screen shows it, and a client showing the context drops it. An inbox turn retried after a failure, a schedule's fire included, appends its opening on every attempt and takes it back out of the context each time it ends with nothing from the model. The event carries the `turn_context` block as the history does, so a reader's replay ring grows with it.
 
 #### Inbox
 
@@ -887,7 +896,8 @@ Every resident session has one event feed. Everything a turn emits goes on it, w
 | `inbox.delivered` | `item_ids`, `turn_id`, `session_id` | The provider accepted a request carrying these items, so the model has read them |
 | `inbox.deferred` | `item_ids`, `session_id`, `not_before`, `error` (Problem Detail shape) | A turn on these items failed in a way waiting can change; the next attempt runs at `not_before` |
 | `inbox.failed` | `item_id`, `session_id`, `reason`, `error` (Problem Detail shape) when a failed turn decided it | Meka gave up on the item and withdrew it: its retry ceiling passed, or its turn failed in a way no retry would change |
-| `inbox.withdrawn` | `item_id`, `session_id` | A client withdrew the item with `DELETE`, or the turn it opened was canceled; `turn_id` names the turn in flight at the time, if any |
+| `inbox.withdrawn` | `item_id`, `session_id` | A client withdrew the item with `DELETE`, the turn it opened was canceled, or the item is a fire whose schedule was canceled through this server; `turn_id` names the turn in flight at the time, if any |
+| `schedule.fired` | `schedule_id`, `session_id`, `item_id`, `occurrences`, `replaces` when the occurrence joined a waiting fire; `turn_id` when a turn is in flight | A [schedule](./scheduling.md#what-a-fire-is) fired, and its fire waits as the inbox item `item_id`; `replaces` is the id the joined fire had, which now answers `404`. Sent whether or not the session's turn reads it, ahead of any turn opened on it |
 
 `inbox.delivered` arrives inside the turn that read the item, before that turn's terminal: for a `steer` read at a round boundary, after the `tool_call.completed` of that round; for an `interrupt` that cut the answer, after the `notice` announcing the cut. See [The inbox](#the-inbox).
 
@@ -978,7 +988,7 @@ One case ends the stream instead. A `POST /turns` with `stream: true` is run for
 
 ### The session feed
 
-`GET /v1/sessions/{id}/feed` is the session's feed: every event of every turn, across turns, for as long as the connection is held. It is how a client sees the turns nobody asked for over HTTP, a scheduled job firing at three in the morning or a background task reporting back, and it is where a client that submits through the [inbox](#the-inbox) learns what became of its items. Subscribe once, and file events by the `turn_id` they carry. Loading the session is part of opening the feed, so a bridge can subscribe before it has anything to submit, and a reconnect to an evicted session gets its feed back rather than a 404. That loading takes `sessions:w`, the scope that drives a session: a revived session is held in memory and under its cross-process lock for as long as the stream stays open, so a token with `sessions:r` alone attaches to a session this process has loaded and is answered `409` (`/errors/session-not-loaded`) otherwise. Such a reader keeps nothing loaded either: the idle timeout evicts the session past it, which closes its stream, and it reconnects to that same `409` until a writer loads the session again.
+`GET /v1/sessions/{id}/feed` is the session's feed: every event of every turn, across turns, for as long as the connection is held. It is how a client sees the turns nobody asked for over HTTP, a schedule firing at three in the morning or a background task reporting back, and it is where a client that submits through the [inbox](#the-inbox) learns what became of its items. Subscribe once, and file events by the `turn_id` they carry. Loading the session is part of opening the feed, so a bridge can subscribe before it has anything to submit, and a reconnect to an evicted session gets its feed back rather than a 404. That loading takes `sessions:w`, the scope that drives a session: a revived session is held in memory and under its cross-process lock for as long as the stream stays open, so a token with `sessions:r` alone attaches to a session this process has loaded and is answered `409` (`/errors/session-not-loaded`) otherwise. Such a reader keeps nothing loaded either: the idle timeout evicts the session past it, which closes its stream, and it reconnects to that same `409` until a writer loads the session again.
 
 Send the last id you received as a `Last-Event-ID` header (browser `EventSource` does this automatically) or as a `?last_event_id=` query parameter, and the server replays what you missed before following the live feed.
 
@@ -990,7 +1000,7 @@ curl -N -H "Authorization: Bearer $TOKEN" \
      "http://localhost:8080/v1/sessions/$SESSION/feed"
 ```
 
-Ids run across the whole session and the ring spans turns, so an id from an earlier turn is an ordinary position: everything after it replays, the later turns' terminals included. When a turn is in flight as you attach, the feed opens with a `turn.started` carrying `"resumed": true` and the `turn_id` you joined, which is how to tell "my stream resumed" from "a newer turn started while I was away"; that event is synthesized rather than replayed, so it carries no `id:` and no `started_at`, but it names the turn's `source` (with its `item_ids` or `job_id`). The turn's `message.appended` follows it the same way, marked `"resumed": true` and without an `id:`, for a reader that has not had it: one joining, or one resuming from behind it after the ring let it go. A reader the replay hands it to, or one resuming from past it, is not handed it again. So a client joining mid-turn reads the reply under the message it answers; it is the opening as first announced, and what the turn appended since is read from `GET /history`. Everything after it is the real thing. With no turn in flight there is nothing to re-issue, and the most recent turn's terminal is handed over when the ring no longer holds it, so a client that reconnects late still learns the outcome.
+Ids run across the whole session and the ring spans turns, so an id from an earlier turn is an ordinary position: everything after it replays, the later turns' terminals included. When a turn is in flight as you attach, the feed opens with a `turn.started` carrying `"resumed": true` and the `turn_id` you joined, which is how to tell "my stream resumed" from "a newer turn started while I was away"; that event is synthesized rather than replayed, so it carries no `id:` and no `started_at`, but it names the turn's `source` (with its `item_ids`, and its `schedule_ids` for a schedule's turn). The turn's `message.appended` follows it the same way, marked `"resumed": true` and without an `id:`, for a reader that has not had it: one joining, or one resuming from behind it after the ring let it go. A reader the replay hands it to, or one resuming from past it, is not handed it again. So a client joining mid-turn reads the reply under the message it answers; it is the opening as first announced, and what the turn appended since is read from `GET /history`. Everything after it is the real thing. With no turn in flight there is nothing to re-issue, and the most recent turn's terminal is handed over when the ring no longer holds it, so a client that reconnects late still learns the outcome.
 
 **The feed does not end with a turn.** A client that wants one turn's outcome stops reading at that turn's terminal, or holds `POST /turns` with `stream: true`, whose stream closes after its own turn.
 
@@ -1055,7 +1065,7 @@ same limit `turn_in_flight` has.
 
 ## Webhooks
 
-`meka serve` can POST to configured endpoints when something happens that no client is necessarily waiting on: a scheduled job firing overnight, a background task finishing long after the turn that started it.
+`meka serve` can POST to configured endpoints when something happens that no client is necessarily waiting on: a schedule firing overnight, a background task finishing long after the turn that started it.
 
 ```toml
 [[serve.webhooks]]
@@ -1068,7 +1078,9 @@ max_retries = 3                        # after the first attempt, default 3, at 
 
 `events` is required and every name must be recognized: an endpoint whose only subscription is a typo would be silently never called, so an unknown event is a startup error rather than a warning.
 
-`turn.finished` and `turn.failed` cover turns submitted through `POST /turns`. A scheduled job's turn fires `schedule.fired` (which carries its own `status`) instead, so no turn produces two deliveries. A turn the server runs purely to report a background outcome fires neither: the news is the task's, and `task.finished` has already carried it.
+`turn.finished` and `turn.failed` cover turns submitted through `POST /turns`, and the turns the server opens on inbox items, a schedule's fire among them. A turn the server runs purely to report a background outcome fires neither: the news is the task's, and `task.finished` has already carried it.
+
+`schedule.fired` is sent when a schedule fires and its fire is queued in the session's [inbox](#the-inbox), not when a turn answers it: a running turn may read the fire at its next pause, or the session may get a turn for it. It names the item, so what became of the fire is told as for any item, by `inbox.delivered`, `inbox.deferred` and `inbox.failed`, and by the `turn.finished` or `turn.failed` of a turn opened on it. The session's [feed](#the-session-feed) carries it too.
 
 `task.finished` is not a turn event. It fires when a background task reaches a terminal state, whether or not any turn reports it: a canceled task fires it with no turn at all, and its outcome then rides the next round boundary of a running turn or whichever turn the session takes next. Expect it alongside a `turn.finished` when a client's own `POST /turns` is what carries the outcome, and expect it on its own for a task interrupted by a host that died, which no turn ever ran.
 
@@ -1085,13 +1097,15 @@ Every delivery carries `delivery_id`, `event`, `timestamp`, and event-specific i
   "delivery_id": "6c1f...",
   "event": "schedule.fired",
   "timestamp": "2026-02-01T03:00:00Z",
-  "job_id": "9f2c...",
+  "schedule_id": "9f2c...",
   "session_id": "550e8400-e29b-41d4-a716-446655440000",
-  "status": "completed"
+  "item_id": "d200988e...",
+  "occurrences": 3,
+  "replaces": "559c7969..."
 }
 ```
 
-A `schedule.fired` `status` is `completed`, `failed`, `canceled` when someone stopped the turn before it finished, or `not_run` when the job's session could not be opened for it (its profile left `config.toml`, or the session is gone); a `not_run` fire is tried again when its lease expires, so the status repeats once a lease for as long as the cause lasts, and it never counts toward parking the job. A fire the server's own shutdown cuts short posts nothing: it is handed back and runs again.
+A `schedule.fired` `occurrences` is how many of the schedule's occurrences the fire stands for. `replaces` is there only when this occurrence joined the schedule's fire that was still waiting: the item took the new `item_id`, and the id it had, `replaces`, now answers `404`.
 
 **Payloads never carry message content.** A webhook URL is a string in a config file: it can be mistyped, it can outlive whatever owned it, and anything that learns it can reach it. So a delivery tells you *what happened to which session*, and you fetch the conversation with your own bearer token over the API you already authenticate against. A compromised endpoint learns that a session was active, not what was said in it.
 
@@ -1119,9 +1133,9 @@ Omitting `secret` is allowed for loopback receivers and logs a startup warning; 
 
 ### Delivery semantics
 
-Deliveries are notifications, not a durable queue. They are not persisted, not retried across a restart, and outstanding attempts are abandoned when the process exits: a delivery in flight during a `SIGTERM` is lost. That is the trade for never blocking the work that triggered it. Anything you cannot afford to miss should be reconciled by polling (`GET /v1/jobs`, `GET /v1/tasks?session=<id>`), with the webhook as the fast path rather than the only one.
+Deliveries are notifications, not a durable queue. They are not persisted, not retried across a restart, and outstanding attempts are abandoned when the process exits: a delivery in flight during a `SIGTERM` is lost. That is the trade for never blocking the work that triggered it. Anything you cannot afford to miss should be reconciled by polling (`GET /v1/schedules`, `GET /v1/sessions/{id}/inbox`, `GET /v1/tasks?session=<id>`), with the webhook as the fast path rather than the only one.
 
-Delivery is fire-and-forget on a detached task, so a slow or dead receiver never wedges the scheduler behind it. A `5xx` or a transport error is retried with exponential backoff (1s, 2s, 4s, capped at 30s) up to `max_retries`. A `4xx` is not, since retrying cannot fix a request the receiver considers malformed, with two exceptions: `429 Too Many Requests` and `408 Request Timeout` say "not now" rather than "not ever" and are retried like a `5xx`. That matters because several jobs sharing a cron minute deliver as a burst, which is exactly when a receiver rate-limits. `Retry-After` is not honored; the backoff above is used regardless. After the last attempt Meka logs one `warn` and gives up. Turn cancellations are not delivered: the client that canceled already knows.
+Delivery is fire-and-forget on a detached task, so a slow or dead receiver never wedges the scheduler behind it. A `5xx` or a transport error is retried with exponential backoff (1s, 2s, 4s, capped at 30s) up to `max_retries`. A `4xx` is not, since retrying cannot fix a request the receiver considers malformed, with two exceptions: `429 Too Many Requests` and `408 Request Timeout` say "not now" rather than "not ever" and are retried like a `5xx`. That matters because several schedules sharing a cron minute deliver as a burst, which is exactly when a receiver rate-limits. `Retry-After` is not honored; the backoff above is used regardless. After the last attempt Meka logs one `warn` and gives up. Turn cancellations are not delivered: the client that canceled already knows.
 
 ## Permission levels over HTTP
 
@@ -1131,7 +1145,7 @@ Both apply during a turn: the next tool call is checked against the new level an
 
 ### Approvals
 
-With `approvals: true`, a tool call above the session's level parks as an `approval.requested` SSE event whenever someone is there to answer it: the client of a `POST /turns` with `stream: true`, held or detached, or a feed reader that opened `GET /v1/sessions/{id}/feed?attend=true` (which needs `sessions:w`, the scope that answers). Any turn qualifies, an inbox turn, a scheduled fire or a background outcome included, so a UI that submits through the inbox and watches the feed is asked like a streaming client is. With nobody attending, the call is refused without asking and a `notice` says so, unless the session declared [`answers_prompts_on_return`](#capabilities), in which case a prompt in a turn no request holds parks and waits for the client to come back. The stream stays open while waiting. Your client resolves it by POSTing to the responses endpoint:
+With `approvals: true`, a tool call above the session's level parks as an `approval.requested` SSE event whenever someone is there to answer it: the client of a `POST /turns` with `stream: true`, held or detached, or a feed reader that opened `GET /v1/sessions/{id}/feed?attend=true` (which needs `sessions:w`, the scope that answers). Any turn qualifies, an inbox turn, one opened on a schedule's fire or a background outcome included, so a UI that submits through the inbox and watches the feed is asked like a streaming client is. With nobody attending, the call is refused without asking and a `notice` says so, unless the session declared [`answers_prompts_on_return`](#capabilities), in which case a prompt in a turn no request holds parks and waits for the client to come back. The stream stays open while waiting. Your client resolves it by POSTing to the responses endpoint:
 
 ```
 POST /v1/sessions/{id}/responses/{request_id}
@@ -1188,8 +1202,8 @@ Each token carries a set of scopes that control what it can access:
 | `skills:w` | Create, update, delete skills |
 | `memory:r` | Read the memory store |
 | `memory:w` | Create, update, delete memories; add, rename and remove projects |
-| `schedule:r` | List scheduled jobs. `GET /v1/jobs` is server-wide and returns each job's full `prompt`, so this reads instruction text and not just schedules. A gate's `check` is withheld unless the token also holds `sessions:r` |
-| `schedule:w` | Create and cancel scheduled jobs. **A job's `prompt` runs a full turn with tools**, so this is deferred turn execution, not just bookkeeping. A job's optional `gate` runs a shell command or a read-only tool call and additionally requires `sessions:w` (see below) |
+| `schedule:r` | List schedules. `GET /v1/schedules` is server-wide and returns each schedule's full `prompt`, so this reads instruction text and not just timings. A gate's `check` is withheld unless the token also holds `sessions:r` |
+| `schedule:w` | Create and cancel schedules. **A schedule's `prompt` is put to the agent with every tool its session has**, so this is deferred execution, not just bookkeeping. A schedule's optional `gate` runs a shell command or a read-only tool call and additionally requires `sessions:w` (see below) |
 | `mcp:r` | Read MCP server status and advertised tools |
 | `mcp:w` | Reconnect an MCP server |
 | `config:r` | Read the installation: accounts (never a credential), each profile's settings, each MCP server's entry (keys only for `env` and `headers`) |
@@ -1277,7 +1291,7 @@ Idempotency keys are **ignored for a held stream**; such a client reconnects thr
 | `POST /turns` (detached, with a key) | yes | the same `202` and turn record; the turn ran once |
 | `POST /v1/sessions/{id}/inbox` (with a key) | yes | the earlier item is answered, `replayed: true`; the key is on the row, so this holds across a restart |
 | `POST /cancel`, `DELETE /v1/sessions/{id}`, `DELETE /v1/tasks/{task_id}`, `DELETE /v1/sessions/{id}/inbox/{item_id}` | yes | already-done is the same state; a withdrawn item answers **404** on the retry |
-| `DELETE /v1/skills/{name}`, `/v1/memories/{name}`, `/v1/projects/{name}`, `/v1/accounts/{name}`, `/v1/profiles/{name}`, `/v1/mcp/{name}`, `/v1/jobs/{job_id}` | yes, but | the resource is gone, so the retry answers **404**. Expected, not a failure; treat it as success if you are retrying blind |
+| `DELETE /v1/skills/{name}`, `/v1/memories/{name}`, `/v1/projects/{name}`, `/v1/accounts/{name}`, `/v1/profiles/{name}`, `/v1/mcp/{name}`, `/v1/schedules/{schedule_id}` | yes, but | the resource is gone, so the retry answers **404**. Expected, not a failure; treat it as success if you are retrying blind |
 | `PUT /v1/skills/{name}`, `PUT /v1/memories/{name}`, `PUT /v1/instructions`, `PATCH /v1/profiles/{name}` (settings), `PATCH /v1/mcp/{name}`, `POST /v1/accounts/{name}/login` (`api_key`), `POST /v1/mcp/{name}/login` (a secret), `POST /v1/mcp/{name}/logout` | yes | same body writes the same skill file, memory row, instructions, keys or credential; the same secret stored again changes nothing and restarts no server |
 | `POST /v1/accounts/{name}/login` (browser), `POST /v1/mcp/{name}/login` (browser), and their completions | yes, but | a second start replaces the first login, whose id then answers **404**; a completion answers again once completed, and **422** once failed |
 | `POST /v1/projects`, `POST /v1/accounts`, `POST /v1/profiles`, `POST /v1/mcp` | yes, but | the resource exists, so the retry answers **422** naming it; nothing is added twice |
@@ -1286,9 +1300,9 @@ Idempotency keys are **ignored for a held stream**; such a client reconnects thr
 | `POST /rewind` | yes | a retry names a turn the first attempt already took, so it is refused with `422` and takes nothing; under `If-Match` it is a `412` |
 | `POST /fork` | **no** | creates a second copy; `If-Match` does not stop it, since a fork leaves its source as it was |
 | `POST /sessions/import` | **no** | creates a second copy of the tree under new ids |
-| `POST /v1/jobs` | **no** | creates a second job |
+| `POST /v1/schedules` | **no** | creates a second schedule |
 
-The three marked **no** are operations meant to be driven deliberately. If your HTTP stack retries failed POSTs by default, exclude them, or check the outcome first: `GET /v1/jobs?session=<id>` lists the jobs a session has, and `GET /v1/sessions` the sessions an import or a fork made.
+The three marked **no** are operations meant to be driven deliberately. If your HTTP stack retries failed POSTs by default, exclude them, or check the outcome first: `GET /v1/schedules?session=<id>` lists the schedules a session has, and `GET /v1/sessions` the sessions an import or a fork made.
 
 ## Error handling
 
@@ -1312,7 +1326,7 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 >
 > **`provider_response` is readable at `sessions:r`.** Submitting a turn takes `sessions:w`, but the failure also rides the terminal `turn.failed` event, which `GET /v1/sessions/{id}/feed` replays to any reader. Since an upstream rejection can name the *operator's* account with the provider and its rate-limit posture, set `[serve] relay_provider_errors = false` where read-only tokens go to people who may watch a session but are not entitled to the account behind it.
 >
-> A turn that failed or was canceled after it began carries `message_withdrawn`, whether the message it was sent is still in the conversation. It is `true` only for a turn that ended before anything from the model reached the conversation and whose opening was to be withdrawn then: one sent with `options.unanswered_message` set to `withdraw`, or on the feed a recurring job's fire or an inbox turn, whose openings are withdrawn the same way. A turn refused before it began, such as the `503` for a required MCP server, never added the message and carries no such member; see [Resending a failed turn](#resending-a-failed-turn).
+> A turn that failed or was canceled after it began carries `message_withdrawn`, whether the message it was sent is still in the conversation. It is `true` only for a turn that ended before anything from the model reached the conversation and whose opening was to be withdrawn then: one sent with `options.unanswered_message` set to `withdraw`, or on the feed an inbox turn, one opened on a schedule's fire included, whose openings are withdrawn the same way. A turn refused before it began, such as the `503` for a required MCP server, never added the message and carries no such member; see [Resending a failed turn](#resending-a-failed-turn).
 >
 > The `503` a turn gets when a required MCP server is down is not covered by that key and never relays: the server names travel, the connector's reason does not, since it is Meka's own subprocess text and has carried a command line and its path. The endpoints under `/v1/mcp` do relay their reason, since a caller naming one server and asking why it will not connect is asking *for* it.
 >
@@ -1326,7 +1340,7 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 | `/errors/auth-scope` | 403 | Token lacks the required scope |
 | `/errors/session-permission` | 403 | The token is fine; the *session* sits too low. Raise it with `PATCH /v1/sessions/{id}`; a better token will not help |
 | `/errors/session-not-found` | 404 | Unknown session id |
-| `/errors/not-found` | 404 | Unknown skill, memory, project, account, profile, pending login, MCP server, background task, scheduled job, image blob, inbox item, or turn; also a skill or memory store that is disabled, or a server with `[schedule] enabled = false`, since there is nowhere to write |
+| `/errors/not-found` | 404 | Unknown skill, memory, project, account, profile, pending login, MCP server, background task, schedule, image blob, inbox item, or turn; also a skill or memory store that is disabled, or a server with `[schedule] enabled = false`, since there is nowhere to write |
 | `/errors/session-not-loaded` | 409 | The session exists but is not in memory; submit a turn to load it. Do **not** retry `POST /cancel`: there is no turn to cancel |
 | `/errors/session-locked` | 409 | Another Meka process holds the session's lock (e.g. two `meka serve` instances sharing one store); wait or restart the other process |
 | `/errors/turn-in-flight` | 409 | A turn is already running on this session within *this* process; cancel it via `POST /cancel` first |
@@ -1337,7 +1351,7 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 | `/errors/instructions-overridden` | 409 | The standing instructions come from `--instructions`, `MEKA_INSTRUCTIONS`, `MEKA_INSTRUCTIONS_FILE` or the `instructions/` directory, which stand above `instructions.md`, so `PUT /v1/instructions` would change nothing a session sees; `detail` names the source |
 | `/errors/account-in-use` | 409 | A session or sub-agent running on this server may run on the account named for a rename, through its profile or one it falls back to, or another Meka is refreshing the account's credential, which refreshes under its name; delete the sessions or wait for them to be evicted, or retry shortly |
 | `/errors/subagent-not-running` | 409 | The id names a sub-agent this process is not running, so there is no feed to read; its feed exists while its parent runs it, and `last_turn` on its record says how its last run ended |
-| `/errors/session-not-drivable` | 422 | The id names a sub-agent's conversation, which only its parent drives. Reading it is unaffected; the message names the parent and what to do there: `agent_followup` for a turn or a fork, `POST /v1/sessions/{parent}/responses/{request_id}` for an approval, the parent itself for a scheduled job, and the parent's feed for a sub-agent's `attend`. **Do not retry with a corrected payload**: no body addressed at this id is accepted |
+| `/errors/session-not-drivable` | 422 | The id names a sub-agent's conversation, which only its parent drives. Reading it is unaffected; the message names the parent and what to do there: `agent_followup` for a turn or a fork, `POST /v1/sessions/{parent}/responses/{request_id}` for an approval, the parent itself for a schedule, and the parent's feed for a sub-agent's `attend`. **Do not retry with a corrected payload**: no body addressed at this id is accepted |
 | `/errors/request-not-found` | 404 | Unknown or expired `request_id` |
 | `/errors/idempotency` | 409/429 | Key conflict (body mismatch: 409; cache cap: 429) |
 | `/errors/invalid-body` | 400/422 | Request body validation failed (422), or a path/query parameter the router rejected (400). Also a session built or moved onto a profile whose account has no stored credential (create, re-attach, a turn, a compaction, a `PATCH` of the profile), and a turn that ended because its subscription account must sign in again; both name `POST /v1/accounts/{name}/login` in `detail`, and the second carries `provider_response` as the 502s below do |
@@ -1447,7 +1461,7 @@ To also remove the row on eviction:
 delete_on_idle = true
 ```
 
-A session is never evicted while a turn is in flight, while a scheduled fire or a compaction holds its runtime, or while one of its background tasks is still running.
+A session is never evicted while a turn is in flight, while a compaction holds its runtime, or while one of its background tasks is still running.
 
 ### Graceful shutdown
 
@@ -1456,8 +1470,8 @@ A session is never evicted while a turn is in flight, while a scheduled fire or 
 1. Stop accepting new connections.
 2. Cancel all in-flight turns (same mechanism as `POST /cancel`).
 3. Emit `turn.canceled` with `reason: "server_shutdown"` on open SSE streams.
-4. Wait up to `shutdown_drain_timeout` for every turn to finish unwinding, including scheduled
-   fires, background-outcome deliveries, and turns whose client has already disconnected, and for
+4. Wait up to `shutdown_drain_timeout` for every turn to finish unwinding, including inbox
+   turns, background-outcome deliveries, and turns whose client has already disconnected, and for
    every write whose client hung up before it ended.
    Canceling a turn is not the same as waiting for one: what follows the cancellation is the
    commit of the partial reply and of whatever the round already produced.
@@ -1473,7 +1487,7 @@ shutdown_drain_timeout = "30s"
 
 - **Per session:** one turn at a time. A second `POST /turns` returns 409; a message that should not wait for the session to be free goes through the [inbox](#the-inbox), which a running turn reads at its next round boundary.
 - **Across sessions:** fully concurrent. Multiple sessions can run turns in parallel.
-- **Process-wide cap (optional):** set `max_concurrent_turns` to limit total in-flight turns, autonomous ones (inbox, scheduled, background outcomes) included. A client turn past the cap returns 429 with a `Retry-After` header; an autonomous one waits for a free slot.
+- **Process-wide cap (optional):** set `max_concurrent_turns` to limit total in-flight turns, autonomous ones (inbox items, a schedule's fire among them, and background outcomes) included. A client turn past the cap returns 429 with a `Retry-After` header; an autonomous one waits for a free slot.
 
 ## Configuration
 
@@ -1552,7 +1566,7 @@ async def follow(session_id: str):
 
 ### Web UI (TypeScript, streaming)
 
-A UI that renders the whole session reads its [history](#history), subscribes to the feed once and files events by `turn_id`, so it also shows the turns it did not start: a scheduled fire, a background task reporting, a message the user typed while the agent was working and the agent answering it in place. At each terminal it reads the history after the last position it holds, which replaces what it drew live with what was stored. A UI that also keeps a list of sessions holds [the server feed](#the-server-feed) beside it and replaces a row whenever a `session.*` event names it. The feed is read with `fetch` and an SSE parser rather than a native `EventSource`, which cannot send the bearer header; a UI served from another origin also needs [`cors_allowed_origins`](#browser-clients) to name it.
+A UI that renders the whole session reads its [history](#history), subscribes to the feed once and files events by `turn_id`, so it also shows the turns it did not start: a schedule's fire, a background task reporting, a message the user typed while the agent was working and the agent answering it in place. At each terminal it reads the history after the last position it holds, which replaces what it drew live with what was stored. A UI that also keeps a list of sessions holds [the server feed](#the-server-feed) beside it and replaces a row whenever a `session.*` event names it. The feed is read with `fetch` and an SSE parser rather than a native `EventSource`, which cannot send the bearer header; a UI served from another origin also needs [`cors_allowed_origins`](#browser-clients) to name it.
 
 ```typescript
 const headers = { Authorization: `Bearer ${token}` };
@@ -1615,34 +1629,42 @@ curl -sf -X DELETE "$BASE/v1/sessions/$SESSION" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-## Scheduled jobs
+## Schedules
 
-`meka serve` is the durable host for [scheduled wakeups](./scheduling.md). It fires every job in the store, reviving evicted sessions on demand, so jobs keep running whether or not a client is connected and survive a restart of the server.
+`meka serve` is the durable host for [schedules](./scheduling.md). It checks every schedule in the store but those of a session another process holds, reviving evicted sessions on demand, so schedules keep firing whether or not a client is connected and survive a restart of the server.
 
-An agent-initiated turn has no HTTP request to respond to, so its output is persisted to the session like any other turn. Read it back with `GET /v1/sessions/{id}/history`, or follow it on the [session feed](#the-session-feed).
+A fire has no HTTP request to respond to. It is queued in its session's [inbox](#the-inbox), where a running turn reads it at its next pause and an idle session gets a turn for it, and [`schedule.fired`](#payloads) on the session feed and the webhooks names the item. What the agent does with it is persisted to the session like any other turn's work: read it back with `GET /v1/sessions/{id}/history`, or follow it on the [session feed](#the-session-feed).
 
 ```
-GET    /v1/jobs            Every scheduled job, or one session's with ?session=<id>
-POST   /v1/jobs            Plant a job on a session
-DELETE /v1/jobs/{job_id}   Cancel a job by its full id
+GET    /v1/schedules                 Every schedule, or one session's with ?session=<id>
+POST   /v1/schedules                 Plant a schedule on a session
+DELETE /v1/schedules/{schedule_id}   Cancel a schedule by its full id
 ```
 
-`POST /v1/jobs` plants a job on the session its `session_id` names, and answers `201` with the
-job; an id no session has is a `404`. Scheduling must be enabled on the server
-(`[schedule] enabled`), or the request is a `404` `not-found`: there is nowhere for the job to go,
-the same answer a disabled skill or memory store gives. Listing and canceling stay open, so jobs
-left from before the flag was flipped can still be cleared out. `GET /v1/jobs?session=<id>` answers
-an empty list for a session with no jobs, or an id no session has.
+`POST /v1/schedules` plants a schedule on the session its `session_id` names, and answers `201`
+with the schedule; an id no session has is a `404`. Scheduling must be enabled on the server
+(`[schedule] enabled`), or the request is a `404` `not-found`: there is nowhere for the schedule to
+go, the same answer a disabled skill or memory store gives. Listing and canceling stay open, so
+schedules left from before the flag was flipped can still be cleared out.
+`GET /v1/schedules?session=<id>` answers an empty list for a session with no schedules, or an id no
+session has.
+
+A schedule is answered with `id`, `session_id`, `timing` (how it fires, in words: `"every 30m"`,
+`"once at 2026-11-15 14:37 +00:00"`), `prompt`, `gate`, `created_at`, `last_fired_at`,
+`next_fire_at` and `withheld`, each member with nothing to say left out, and a listing as
+`{"schedules": [...]}`. `DELETE` withdraws the schedule's fire that is still waiting in the inbox.
+A one-shot is retired as its fire is queued, so a `DELETE` after that answers `404` and the fire is
+still delivered.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `session_id` | string | *(required)* | The session the job fires in |
-| `prompt` | string | *(required)* | What the agent is asked to do when the job fires; must not be blank |
+| `session_id` | string | *(required)* | The session the schedule fires in |
+| `prompt` | string | *(required)* | What the agent is asked to do when the schedule fires; must not be blank |
 | `at` | string | | One-shot: an RFC 3339 instant, or a duration from now (`"20m"`, `"1h 30m"`) |
 | `every` | string | | Recurring interval (`"30m"`, `"6h"`) |
 | `cron` | string | | 5-field cron pattern, read in `timezone` |
 | `timezone` | string | the host's | IANA time zone a `cron` pattern is read in; refused beside `at` or `every` |
-| `gate` | object | | Guard the job on a probe; see below |
+| `gate` | object | | Guard the schedule on a probe; see below |
 
 Exactly one of `at`, `every` and `cron` is required. A `gate` is `{"check": ..., "when": ...}`:
 `check` is `{"command": "..."}` for a shell command or `{"tool": "...", "arguments": {...}}` for a
@@ -1706,9 +1728,9 @@ Key points:
 | GET | `/v1/sessions/{id}/tools` | `sessions:r` | Tool catalog for this session (409 if not loaded) |
 | GET | `/v1/tasks` | `sessions:r` | Background tasks, newest first; `?session=<id>` keeps one session's, `?status=` one status |
 | DELETE | `/v1/tasks/{task_id}` | `sessions:w` | Cancel a background task by its full id |
-| GET | `/v1/jobs` | `schedule:r` | Scheduled jobs, every session's or one session's with `?session=<id>` |
-| POST | `/v1/jobs` | `schedule:w` (+ `sessions:w` for a `gate`) | Create a scheduled job on the session `session_id` names |
-| DELETE | `/v1/jobs/{job_id}` | `schedule:w` | Cancel a scheduled job by its full id |
+| GET | `/v1/schedules` | `schedule:r` | Schedules, every session's or one session's with `?session=<id>` |
+| POST | `/v1/schedules` | `schedule:w` (+ `sessions:w` for a `gate`) | Create a schedule on the session `session_id` names |
+| DELETE | `/v1/schedules/{schedule_id}` | `schedule:w` | Cancel a schedule by its full id, withdrawing its waiting fire |
 | GET | `/v1/skills/{name}` | `skills:r` | One skill, with its body |
 | PUT | `/v1/skills/{name}` | `skills:w` | Create or update a skill |
 | DELETE | `/v1/skills/{name}` | `skills:w` | Delete a skill |
@@ -1767,19 +1789,19 @@ Descriptions and bodies are returned **exactly as stored**, not as they are rend
 
 These four endpoints are **not** gated by `[memory] enabled`. That switch decides whether an agent keeps memories; a token is the operator, so it reaches a store that already exists exactly as `meka memory list` does in a shell.
 
-A scheduled job's optional `gate` is the sharpest grant on this API, and how sharp depends on what it checks. It requires `sessions:w` in addition to `schedule:w` either way.
+A schedule's optional `gate` is the sharpest grant on this API, and how sharp depends on what it checks. It requires `sessions:w` in addition to `schedule:w` either way.
 
-A **shell** gate (`"check": {"command": "…"}`) runs through `sh -c` as the user running `meka serve`, on a timer, *before* the turn and independently of it, so it needs no working provider and no model to execute. The session must be at `unrestricted`. This is the one grant `workspace` does not carry: the command runs outside the turn, so nothing confines it to the workspace roots, and the API's own 403 says `unrestricted`.
+A **shell** gate (`"check": {"command": "…"}`) runs through `sh -c` as the user running `meka serve`, on a timer, *before* the fire and independently of any turn, so it needs no working provider and no model to execute. The session must be at `unrestricted`. This is the one grant `workspace` does not carry: the command runs outside any turn, so nothing confines it to the workspace roots, and the API's own 403 says `unrestricted`.
 
 A **tool** gate (`"check": {"tool": "…", "arguments": {…}}`) is not held to that bar. It may only name a tool Meka resolves to `read`, and the session need only be at `read`. Both facts are re-checked on every fire, so a tool that resolves higher after a config change stops being a gate.
 
-`shell_execute` is one such tool wherever a sandbox backend is usable, so a `read` session can plant an arbitrary command on a timer through the tool form. That is deliberate and it is not the same grant as the shell form: a gate dispatches at `read`, the level Meka sandboxes, so the command runs read-only-confined rather than as a bare `sh -c`, and where no sandbox is available the tool resolves above `read` and the gate is refused instead. The confinement blocks writes, not the network. See [Scheduled jobs](./scheduling.md) for the longer version.
+`shell_execute` is one such tool wherever a sandbox backend is usable, so a `read` session can plant an arbitrary command on a timer through the tool form. That is deliberate and it is not the same grant as the shell form: a gate dispatches at `read`, the level Meka sandboxes, so the command runs read-only-confined rather than as a bare `sh -c`, and where no sandbox is available the tool resolves above `read` and the gate is refused instead. The confinement blocks writes, not the network. See [Scheduling](./scheduling.md) for the longer version.
 
-No job of any kind can be created on a session at `none`, gated or not: no tool runs there, so the turn could neither act on the job nor cancel it, and `POST /v1/jobs` answers 403 `session-permission` rather than creating a row that can never run. A job whose session drops to `none` afterwards keeps its row and reports itself: every job view carries a `withheld` field, present only when something is holding the job back. With `sessions:r` it is the same sentence the agent is given; a `schedule:r`-only token gets a fixed sentence saying the reason needs `sessions:r`, because the reason can name the session's level, a gate's tool, or the first line of a check's output. It is computed per request from the session's current level, so it tracks a `PATCH /v1/sessions/{id}` without the job being rewritten. A job whose last fire the server could not run (its session could not be opened, or the profile or project it records no longer resolves) carries that cause, and that it is retried every `[schedule].claim_lease`, until a turn is delivered or that occurrence closes without one; only the server process that tried knows it.
+No schedule of any kind can be created on a session at `none`, gated or not: no tool runs there, so the agent could neither act on the schedule nor cancel it, and `POST /v1/schedules` answers 403 `session-permission` rather than creating a row that can never run. A schedule whose session drops to `none` afterwards keeps its row and reports itself: every schedule view carries a `withheld` field, present only when something is holding the schedule back. With `sessions:r` it is the same sentence the agent is given; a `schedule:r`-only token gets a fixed sentence saying the reason needs `sessions:r`, because the reason can name the session's level, a gate's tool, or the first line of a check's output. It is computed per request from the session's current level, so it tracks a `PATCH /v1/sessions/{id}` without the schedule being rewritten. A fire already queued belongs to the inbox, and its item there says when it is next tried.
 
-A `schedule:*`-only token can still plant ordinary prompt-only jobs; it cannot reach a gate at all. Scope a bridge accordingly, and note that `GET /v1/jobs` is server-wide, so `schedule:r` alone lists every session id in the store.
+A `schedule:*`-only token can still plant ordinary prompt-only schedules; it cannot reach a gate at all. Scope a bridge accordingly, and note that `GET /v1/schedules` is server-wide, so `schedule:r` alone lists every session id in the store.
 
-`DELETE /v1/jobs/{job_id}` and `DELETE /v1/tasks/{task_id}` take the full id, which is what a client of this API holds; the 8-character short form `meka schedule cancel` and the `schedule_cancel` / `task_cancel` tools accept is a terminal's ergonomic and matches nothing here. An id matching nothing is a 404, so a typo is never reported as a cancellation. A job that a scheduler sweep retired a moment before the delete is a 404 as well, for the same reason: 204 means this request canceled the job, not merely that it is gone.
+`DELETE /v1/schedules/{schedule_id}` and `DELETE /v1/tasks/{task_id}` take the full id, which is what a client of this API holds; the 8-character short form `meka schedule cancel` and the `schedule_cancel` / `task_cancel` tools accept is a terminal's ergonomic and matches nothing here. An id matching nothing is a 404, so a typo is never reported as a cancellation. A schedule that a scheduler sweep retired a moment before the delete is a 404 as well, for the same reason: 204 means this request canceled the schedule, not merely that it is gone.
 
 `GET /v1/tasks` lists every session's background tasks, newest first, `?session=<id>` keeps one session's (an empty list for a session with none, or an id no session has), and `?status=running` (or `completed`, `failed`, `canceled`, `interrupted`) keeps one status; a status that is none of those is a `422`. `DELETE /v1/tasks/{task_id}` answers `204` for a task it canceled or one already finished, and `404` when no task has the id; a sub-agent's task is canceled like any other. A task that is a backgrounded `agent_spawn` or `agent_followup` carries `subagent_id`, the session it runs, from the moment the call returns, so a dashboard connects the task to the sub-agent's record without parsing the task's label.
 

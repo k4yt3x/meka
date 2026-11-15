@@ -191,18 +191,18 @@ fn inline_overflow(memories: &[MemoryIndexEntry], max_bytes: usize) -> Option<In
     })
 }
 
-/// One job's line in the `[Scheduled]` index. Carries no timestamps: see
+/// One schedule's line in the `[Scheduled]` index. Carries no timestamps: see
 /// [`render_schedule_section`] for why next-fire times are left to `schedule_list`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ScheduledIndexEntry {
     short_id: String,
-    schedule: String,
+    timing: String,
     summary: String,
-    /// Why this job's gate cannot fire right now, if it cannot.
+    /// Why this schedule's gate cannot fire right now, if it cannot.
     ///
     /// Part of the snapshot rather than resolved at render time, like every other field here, so
-    /// the diff announces a job going held and coming back. That is the point: the model is told
-    /// once, when it changes, instead of having to notice an absence.
+    /// the diff announces a schedule going held and coming back. That is the point: the model is
+    /// told once, when it changes, instead of having to notice an absence.
     withheld: Option<String>,
 }
 
@@ -241,7 +241,7 @@ pub(crate) struct WorldSnapshot {
     /// for (someone drops in a procedure, the file has a typo, and they believe it is in force)
     /// stays true end to end until the index says otherwise.
     skipped_skills: Vec<crate::skills::SkippedSkill>,
-    /// Scheduled jobs for this session, soonest first.
+    /// Schedules for this session, soonest first.
     scheduled: Vec<ScheduledIndexEntry>,
     /// Memory name → index entry, in the order [`crate::store::memory::MemoryStore::index`]
     /// produced.
@@ -302,12 +302,12 @@ const TOOL_SEARCH_TOOL: &str = SEARCH_TOOL_NAME;
 const SCHEDULE_INDEX_TOOL: &str = "schedule_list";
 const TASK_INDEX_TOOL: &str = crate::background::TASK_INDEX_TOOL;
 
-/// Longest job prompt shown in the `[Scheduled]` index before it is elided. A prompt can be
+/// Longest schedule prompt shown in the `[Scheduled]` index before it is elided. A prompt can be
 /// paragraphs; the index only has to be recognizable enough to prevent a duplicate.
 const SCHEDULE_SUMMARY_MAX_CHARS: usize = 80;
 
 /// Whether the `[Scheduled]` index has a tool to open it, and therefore whether the caller needs to
-/// go to the database for the jobs at all. Exposed so `Agent::run_turn` can skip that query on
+/// go to the database for the schedules at all. Exposed so `Agent::run_turn` can skip that query on
 /// every turn of an installation that has scheduling switched off.
 pub(crate) fn schedule_index_is_live(catalog: &[ToolCatalogEntry]) -> bool {
     catalog_has(catalog, SCHEDULE_INDEX_TOOL)
@@ -386,14 +386,13 @@ impl WorldSnapshot {
         skills: &crate::skills::SkillIndex,
         memories: &[crate::memory::Memory],
         mcp_server_instructions: &[(String, String)],
-        scheduled: &[crate::schedule::ScheduledJob],
+        scheduled: &[crate::schedule::Schedule],
     ) -> Self {
-        let scheduled: &[crate::schedule::ScheduledJob] =
-            if catalog_has(catalog, SCHEDULE_INDEX_TOOL) {
-                scheduled
-            } else {
-                &[]
-            };
+        let scheduled: &[crate::schedule::Schedule] = if catalog_has(catalog, SCHEDULE_INDEX_TOOL) {
+            scheduled
+        } else {
+            &[]
+        };
         // The whole index, not just the loaded half, for the reason memory takes its whole index:
         // the skips are gated with the entries they belong to, so a model with no `skill_read`
         // hears about neither.
@@ -497,26 +496,26 @@ impl WorldSnapshot {
             project: None,
             scheduled: scheduled
                 .iter()
-                .map(|job| ScheduledIndexEntry {
-                    short_id: job.short_id().to_string(),
-                    schedule: job.schedule.describe(),
-                    summary: elide(&job.prompt, SCHEDULE_SUMMARY_MAX_CHARS),
+                .map(|schedule| ScheduledIndexEntry {
+                    short_id: schedule.short_id().to_string(),
+                    timing: schedule.timing.describe(),
+                    summary: elide(&schedule.prompt, SCHEDULE_SUMMARY_MAX_CHARS),
                     withheld: None,
                 })
                 .collect(),
         }
     }
 
-    /// Say which of the scheduled jobs cannot currently fire, and why.
+    /// Say which of the schedules cannot currently fire, and why.
     ///
     /// Separate from [`Self::new`] rather than another parameter on it because answering needs the
     /// live permission and a tool resolver, which most callers of `new` (every test, and the
-    /// compaction paths) have no business holding. A snapshot built without this reports no job as
-    /// held.
+    /// compaction paths) have no business holding. A snapshot built without this reports no
+    /// schedule as held.
     pub(crate) fn with_gate_authority(
         mut self,
         memory: &crate::schedule::SchedulerMemory,
-        scheduled: &[crate::schedule::ScheduledJob],
+        scheduled: &[crate::schedule::Schedule],
         live: crate::permission::Permission,
         tools: Option<&dyn crate::schedule::GateTools>,
     ) -> Self {
@@ -524,18 +523,19 @@ impl WorldSnapshot {
             // Matched by id rather than zipped: `new` drops the whole list when `schedule_list` is
             // not registered, so the two are not the same length in that case and position means
             // nothing.
-            let Some(job) = scheduled
+            let Some(schedule) = scheduled
                 .iter()
-                .find(|job| job.short_id() == entry.short_id)
+                .find(|schedule| schedule.short_id() == entry.short_id)
             else {
                 continue;
             };
             // Sanitized at the boundary, like every other field on this snapshot. The reason quotes
             // the probe (a shell command the model wrote, or a tool name an MCP server chose)
             // straight into a bulleted block the model reads every turn, so a newline in one would
-            // forge an entry beneath the job it belongs to.
-            entry.withheld = crate::schedule::job_withheld_reason(memory, job, live, tools)
-                .map(|reason| crate::memory::render_description_for_model(&reason));
+            // forge an entry beneath the schedule it belongs to.
+            entry.withheld =
+                crate::schedule::schedule_withheld_reason(memory, schedule, live, tools)
+                    .map(|reason| crate::memory::render_description_for_model(&reason));
         }
         self
     }
@@ -979,8 +979,8 @@ pub(crate) struct SystemPromptInputs<'a> {
     /// `Some` when tools take a `background` parameter, naming the task tools registered beside
     /// it.
     pub(crate) background: Option<BackgroundTools>,
-    /// Whether `schedule_create` is registered, so the rule about when jobs fire reaches only a
-    /// model that can create one.
+    /// Whether `schedule_create` is registered, so the rule about when schedules fire reaches only
+    /// a model that can create one.
     pub(crate) scheduling: bool,
     /// Whether the conversation is compacted once past the ceiling `[Context budget]` names. Off,
     /// a request past the window fails the turn.
@@ -1113,10 +1113,10 @@ pub(crate) fn build_system_prompt(inputs: SystemPromptInputs<'_>) -> String {
     if scheduling {
         prompt.push_str("## Scheduling\n\n");
         prompt.push_str(if one_shot {
-            "Scheduled jobs are saved, but this run does not fire them; a scheduler must be \
+            "Schedules are saved, but this run does not fire them; a scheduler must be \
              running later.\n\n"
         } else {
-            "Scheduled jobs fire only while a scheduler serving this session is running.\n\n"
+            "Schedules fire only while a scheduler serving this session is running.\n\n"
         });
     }
     prompt.push_str(
@@ -1349,8 +1349,9 @@ fn build_environment_context(
     context
 }
 
-/// One inbox item as the model reads it: a header naming when it arrived and, when the client
-/// said, who sent it, then the body as it was submitted.
+/// One inbox item as the model reads it: a message under a header naming when it arrived and,
+/// when the client said, who sent it, then the body as it was submitted; a fire as
+/// [`render_fire`] renders it.
 ///
 /// The header is what tells the model this is not the person it is answering continuing their
 /// thought, and `mid_turn` is what tells it the message landed while it was working, which is the
@@ -1358,6 +1359,12 @@ fn build_environment_context(
 /// verbatim: a producer that relays untrusted text fences it itself, as the bridge does with its
 /// nonce, and Meka adds nothing that could be mistaken for the producer's own framing.
 pub(crate) fn render_inbox_item(item: &crate::store::inbox::InboxItem, mid_turn: bool) -> String {
+    let source = match &item.origin {
+        crate::store::inbox::InboxOrigin::Sent { source } => source,
+        crate::store::inbox::InboxOrigin::Fire(fire) => {
+            return render_fire(fire, &item.body, mid_turn);
+        }
+    };
     let arrived = crate::text::format_timestamp(item.created_at, crate::text::Precision::Minutes);
     let when = if mid_turn {
         format!("{arrived} while you were working")
@@ -1366,11 +1373,55 @@ pub(crate) fn render_inbox_item(item: &crate::store::inbox::InboxItem, mid_turn:
     };
     // The client named the sender, or nobody: then the name is left out rather than guessed, so
     // the model is never told a sender nobody chose.
-    let header = match &item.source {
+    let header = match source {
         Some(source) => format!("[Message from {source}, arrived {when}]"),
         None => format!("[Message arrived {when}]"),
     };
     format!("{header}\n{}", item.body)
+}
+
+/// A schedule's fire as the model reads it: a header naming the schedule and when it fired,
+/// mid-turn that it fired while the model was working, and how late it was when that is worth
+/// saying ([`crate::frontend::FireLateness::of`]); then `prompt`, the schedule's words, and what
+/// its gate printed.
+///
+/// The header is not decoration: without it the model reads a bare instruction as if a human
+/// had just typed it and answers conversationally, into an empty terminal at 03:00, to nobody.
+pub(crate) fn render_fire(
+    fire: &crate::store::inbox::Fire,
+    prompt: &str,
+    mid_turn: bool,
+) -> String {
+    let short_id = fire
+        .schedule_id
+        .get(..crate::text::ID_PREFIX)
+        .unwrap_or(&fire.schedule_id);
+    let fired = crate::text::format_timestamp(fire.fired_at, crate::text::Precision::Minutes);
+    let working = if mid_turn {
+        " while you were working"
+    } else {
+        ""
+    };
+    let mut rendered = format!("[Schedule {short_id} fired {fired}{working}]");
+    if let Some(late) = crate::frontend::FireLateness::of(fire) {
+        rendered.push_str(&format!(
+            "\n[Late by {}; this fire replaces {} missed occurrence(s)]",
+            crate::scheduler::format_late(late.late_by),
+            fire.occurrences
+        ));
+    }
+    rendered.push_str("\n\n");
+    rendered.push_str(prompt);
+    if let Some(output) = &fire.gate_output {
+        // What the gate's command or tool printed, a fetched page as readily as a status word:
+        // sanitized as a background report's output is, and quoted, so no line of it can pass
+        // for this block's header or for a prompt after it.
+        rendered.push_str("\n\n[Gate output]\n");
+        rendered.push_str(&crate::text::quote_lines(&crate::text::sanitize_text(
+            output,
+        )));
+    }
+    rendered
 }
 
 /// The message the turn loop appends when the model stops with checklist items open: the items
@@ -2671,15 +2722,15 @@ mod tests {
         )
     }
 
-    fn sample_job(prompt: &str) -> crate::schedule::ScheduledJob {
+    fn sample_schedule(prompt: &str) -> crate::schedule::Schedule {
         let now = chrono::Utc::now();
-        let schedule = crate::schedule::Schedule::parse_every("1h").expect("parses");
-        let next_fire_at = schedule.next_after(now).expect("has a next fire");
-        crate::schedule::ScheduledJob {
+        let timing = crate::schedule::Timing::parse_every("1h").expect("parses");
+        let next_fire_at = timing.next_after(now).expect("has a next fire");
+        crate::schedule::Schedule {
             attempts: 0,
             id: "7f3a1b2c-0000-0000-0000-000000000000".to_string(),
             session_id: uuid::Uuid::nil(),
-            schedule,
+            timing,
             prompt: prompt.to_string(),
             gate: None,
             created_at: now,
@@ -2688,11 +2739,11 @@ mod tests {
         }
     }
 
-    /// A shell-gated job, which needs `unrestricted` and so can be withheld by lowering the level
-    /// alone, with no tool resolver in play.
-    fn shell_gated_job(prompt: &str) -> crate::schedule::ScheduledJob {
-        let mut job = sample_job(prompt);
-        job.gate = Some(crate::schedule::Gate {
+    /// A shell-gated schedule, which needs `unrestricted` and so can be withheld by lowering the
+    /// level alone, with no tool resolver in play.
+    fn shell_gated_schedule(prompt: &str) -> crate::schedule::Schedule {
+        let mut schedule = sample_schedule(prompt);
+        schedule.gate = Some(crate::schedule::Gate {
             probe: crate::schedule::GateProbe::Shell {
                 command: "gh pr checks".to_string(),
             },
@@ -2700,26 +2751,27 @@ mod tests {
             last_output: None,
             permission: crate::permission::Permission::Unrestricted,
         });
-        job
+        schedule
     }
 
-    /// The model can cancel a job it cannot fire, so it has to be able to tell the two apart. A
-    /// held job and a healthy one that has nothing to report both simply never fire, and `last
-    /// fired` is absent for a brand-new job too, so without this line there is no signal at all.
+    /// The model can cancel a schedule it cannot fire, so it has to be able to tell the two apart.
+    /// A held schedule and a healthy one that has nothing to report both simply never fire, and
+    /// `last fired` is absent for a brand-new schedule too, so without this line there is no signal
+    /// at all.
     #[test]
-    fn scheduled_section_marks_a_job_whose_gate_cannot_fire() {
-        let jobs = vec![shell_gated_job("check the deploy")];
+    fn scheduled_section_marks_a_schedule_whose_gate_cannot_fire() {
+        let schedules = vec![shell_gated_schedule("check the deploy")];
         let rendered = render_world_state(
             &WorldSnapshot::new(
                 &catalog_with(SCHEDULE_INDEX_TOOL),
                 &no_skills(),
                 &[],
                 &[],
-                &jobs,
+                &schedules,
             )
             .with_gate_authority(
                 &crate::schedule::SchedulerMemory::default(),
-                &jobs,
+                &schedules,
                 crate::permission::Permission::Read,
                 None,
             ),
@@ -2729,26 +2781,26 @@ mod tests {
         assert!(rendered.contains("unrestricted"), "{rendered}");
     }
 
-    /// An ungated job on a session at `none` is marked too.
+    /// An ungated schedule on a session at `none` is marked too.
     ///
     /// The marker started as a gate-shaped question, which is exactly the shape that misses this:
     /// an ungated reminder there reads as perfectly healthy on every surface and never fires,
-    /// because the fire door refuses the whole job regardless of any gate. The creation door still
-    /// accepts it, so without this the two disagree in silence.
+    /// because the fire door refuses the whole schedule regardless of any gate. The creation door
+    /// still accepts it, so without this the two disagree in silence.
     #[test]
-    fn scheduled_section_marks_an_ungated_job_on_a_session_at_none() {
-        let jobs = vec![sample_job("ungated reminder")];
+    fn scheduled_section_marks_an_ungated_schedule_on_a_session_at_none() {
+        let schedules = vec![sample_schedule("ungated reminder")];
         let rendered = render_world_state(
             &WorldSnapshot::new(
                 &catalog_with(SCHEDULE_INDEX_TOOL),
                 &no_skills(),
                 &[],
                 &[],
-                &jobs,
+                &schedules,
             )
             .with_gate_authority(
                 &crate::schedule::SchedulerMemory::default(),
-                &jobs,
+                &schedules,
                 crate::permission::Permission::None,
                 None,
             ),
@@ -2762,18 +2814,18 @@ mod tests {
     /// and the section reads exactly as it did before the field existed.
     #[test]
     fn scheduled_section_leaves_a_healthy_gate_unmarked() {
-        let jobs = vec![shell_gated_job("check the deploy")];
+        let schedules = vec![shell_gated_schedule("check the deploy")];
         let rendered = render_world_state(
             &WorldSnapshot::new(
                 &catalog_with(SCHEDULE_INDEX_TOOL),
                 &no_skills(),
                 &[],
                 &[],
-                &jobs,
+                &schedules,
             )
             .with_gate_authority(
                 &crate::schedule::SchedulerMemory::default(),
-                &jobs,
+                &schedules,
                 crate::permission::Permission::Unrestricted,
                 None,
             ),
@@ -2782,23 +2834,25 @@ mod tests {
         assert!(!rendered.contains("NOT FIRING"), "{rendered}");
     }
 
-    /// The index says how many jobs it is not showing, and the number is right.
+    /// The index says how many schedules it is not showing, and the number is right.
     ///
-    /// The cap is the only thing standing between a long job list and the context window, and the
-    /// count beside it is the only signal the model gets that it is looking at a truncated view:
-    /// it can act on jobs it cannot see, so "and 7 more" is the difference between an informed
-    /// `schedule_list` and a wrong conclusion.
+    /// The cap is the only thing standing between a long schedule list and the context window, and
+    /// the count beside it is the only signal the model gets that it is looking at a truncated
+    /// view: it can act on schedules it cannot see, so "and 7 more" is the difference between an
+    /// informed `schedule_list` and a wrong conclusion.
     #[test]
-    fn the_scheduled_index_reports_how_many_jobs_it_truncated() {
+    fn the_scheduled_index_reports_how_many_schedules_it_truncated() {
         let render = |count: usize| {
-            let jobs: Vec<_> = (0..count).map(|_| shell_gated_job("watch it")).collect();
+            let schedules: Vec<_> = (0..count)
+                .map(|_| shell_gated_schedule("watch it"))
+                .collect();
             render_world_state(
                 &WorldSnapshot::new(
                     &catalog_with(SCHEDULE_INDEX_TOOL),
                     &no_skills(),
                     &[],
                     &[],
-                    &jobs,
+                    &schedules,
                 ),
                 None,
             )
@@ -2826,18 +2880,18 @@ mod tests {
         );
     }
 
-    /// The status line says how many jobs it left out, and the number is right.
+    /// The status line says how many schedules it left out, and the number is right.
     ///
-    /// Lowering a session to `none` flips every job at once, so this line is capped, and past the
-    /// cap the count is the only thing carrying the fact that more changed.
+    /// Lowering a session to `none` flips every schedule at once, so this line is capped, and past
+    /// the cap the count is the only thing carrying the fact that more changed.
     #[test]
     fn the_scheduled_status_line_reports_how_many_changes_it_truncated() {
         let diff = |count: usize| {
-            let jobs: Vec<_> = (0..count)
+            let schedules: Vec<_> = (0..count)
                 .map(|index| {
-                    let mut job = shell_gated_job("watch it");
-                    job.id = format!("{index:08x}-0000-0000-0000-000000000000");
-                    job
+                    let mut schedule = shell_gated_schedule("watch it");
+                    schedule.id = format!("{index:08x}-0000-0000-0000-000000000000");
+                    schedule
                 })
                 .collect();
             let snapshot = |held: bool| {
@@ -2846,7 +2900,7 @@ mod tests {
                     &no_skills(),
                     &[],
                     &[],
-                    &jobs,
+                    &schedules,
                 );
                 if held {
                     for entry in snapshot.scheduled.iter_mut() {
@@ -2860,7 +2914,7 @@ mod tests {
 
         let exact = diff(SCHEDULE_STATUS_MAX_ENTRIES);
         assert!(
-            exact.contains("Scheduled job status:") && !exact.contains("and 0 more"),
+            exact.contains("Schedule status:") && !exact.contains("and 0 more"),
             "a list that fits says nothing about a remainder: {exact}"
         );
 
@@ -2876,20 +2930,20 @@ mod tests {
         );
     }
 
-    /// A reason that merely changes is not a job that has just stopped firing.
+    /// A reason that merely changes is not a schedule that has just stopped firing.
     ///
     /// A diff that reports every transition as "can no longer fire" asserts a change of state where
     /// there was only a change of explanation, and invites the model to act on the former.
     #[test]
     fn a_changed_withheld_reason_is_not_reported_as_newly_broken() {
-        let job = shell_gated_job("watch it");
+        let schedule = shell_gated_schedule("watch it");
         let snapshot = |reason: Option<&str>| {
             let mut snapshot = WorldSnapshot::new(
                 &catalog_with(SCHEDULE_INDEX_TOOL),
                 &no_skills(),
                 &[],
                 &[],
-                std::slice::from_ref(&job),
+                std::slice::from_ref(&schedule),
             );
             if let Some(entry) = snapshot.scheduled.first_mut() {
                 entry.withheld = reason.map(str::to_string);
@@ -2921,23 +2975,23 @@ mod tests {
         assert!(recovered.contains("can fire again"), "{recovered}");
     }
 
-    /// Held-ness lives in the snapshot rather than being resolved at render time, so a job going
-    /// held is a world change the model is told about once, at the moment it happens, instead of
-    /// something it has to notice.
+    /// Held-ness lives in the snapshot rather than being resolved at render time, so a schedule
+    /// going held is a world change the model is told about once, at the moment it happens, instead
+    /// of something it has to notice.
     #[test]
-    fn a_job_going_held_is_announced_as_a_gate_change_not_a_new_job() {
-        let jobs = vec![shell_gated_job("check the deploy")];
+    fn a_schedule_going_held_is_announced_as_a_gate_change_not_a_new_schedule() {
+        let schedules = vec![shell_gated_schedule("check the deploy")];
         let build = |level| {
             WorldSnapshot::new(
                 &catalog_with(SCHEDULE_INDEX_TOOL),
                 &no_skills(),
                 &[],
                 &[],
-                &jobs,
+                &schedules,
             )
             .with_gate_authority(
                 &crate::schedule::SchedulerMemory::default(),
-                &jobs,
+                &schedules,
                 level,
                 None,
             )
@@ -2952,28 +3006,28 @@ mod tests {
         let announced = render_world_state(&held, Some(&healthy));
         assert!(announced.contains("can no longer fire"), "{announced}");
         assert!(
-            !announced.contains("Jobs scheduled:"),
-            "the job did not appear, it stopped working: {announced}"
+            !announced.contains("Schedules added:"),
+            "the schedule did not appear, it stopped working: {announced}"
         );
 
         let restored = render_world_state(&healthy, Some(&held));
         assert!(restored.contains("can fire again"), "{restored}");
         assert!(
-            !restored.contains("no longer scheduled"),
+            !restored.contains("Schedules removed:"),
             "it was never canceled: {restored}"
         );
     }
 
     #[test]
-    fn scheduled_section_lists_jobs_when_the_tool_is_registered() {
-        let jobs = vec![sample_job("check the deploy")];
+    fn scheduled_section_lists_schedules_when_the_tool_is_registered() {
+        let schedules = vec![sample_schedule("check the deploy")];
         let rendered = render_world_state(
             &WorldSnapshot::new(
                 &catalog_with(SCHEDULE_INDEX_TOOL),
                 &no_skills(),
                 &[],
                 &[],
-                &jobs,
+                &schedules,
             ),
             None,
         );
@@ -2986,9 +3040,9 @@ mod tests {
     /// it is a menu the model cannot order from.
     #[test]
     fn scheduled_section_is_dropped_without_its_tool() {
-        let jobs = vec![sample_job("check the deploy")];
+        let schedules = vec![sample_schedule("check the deploy")];
         let rendered = render_world_state(
-            &WorldSnapshot::new(&sample_catalog(), &no_skills(), &[], &[], &jobs),
+            &WorldSnapshot::new(&sample_catalog(), &no_skills(), &[], &[], &schedules),
             None,
         );
         assert!(!rendered.contains("[Scheduled]"), "{rendered}");
@@ -3000,8 +3054,8 @@ mod tests {
     #[test]
     fn scheduled_snapshot_ignores_fire_times() {
         let catalog = catalog_with(SCHEDULE_INDEX_TOOL);
-        let mut fired = sample_job("check the deploy");
-        let pristine = sample_job("check the deploy");
+        let mut fired = sample_schedule("check the deploy");
+        let pristine = sample_schedule("check the deploy");
         fired.last_fired_at = Some(chrono::Utc::now());
         fired.next_fire_at = chrono::Utc::now() + chrono::Duration::hours(9);
 
@@ -3020,37 +3074,37 @@ mod tests {
                 &[],
                 std::slice::from_ref(&fired)
             ),
-            "a job that merely fired is not a change the model needs told about"
+            "a schedule that merely fired is not a change the model needs told about"
         );
     }
 
     #[test]
-    fn scheduled_diff_announces_jobs_appearing_and_disappearing() {
+    fn scheduled_diff_announces_schedules_appearing_and_disappearing() {
         let catalog = catalog_with(SCHEDULE_INDEX_TOOL);
-        let jobs = vec![sample_job("check the deploy")];
+        let schedules = vec![sample_schedule("check the deploy")];
         let empty = WorldSnapshot::new(&catalog, &no_skills(), &[], &[], &[]);
-        let populated = WorldSnapshot::new(&catalog, &no_skills(), &[], &[], &jobs);
+        let populated = WorldSnapshot::new(&catalog, &no_skills(), &[], &[], &schedules);
 
         let added = render_world_state(&populated, Some(&empty));
-        assert!(added.contains("Jobs scheduled:"), "{added}");
+        assert!(added.contains("Schedules added:"), "{added}");
         assert!(added.contains("check the deploy"), "{added}");
 
-        // The reverse matters just as much: a job canceled from the CLI never passes through this
-        // agent, and one the model still believes exists is one it will not recreate.
+        // The reverse matters just as much: a schedule canceled from the CLI never passes through
+        // this agent, and one the model still believes exists is one it will not recreate.
         let removed = render_world_state(&empty, Some(&populated));
-        assert!(removed.contains("Jobs no longer scheduled:"), "{removed}");
+        assert!(removed.contains("Schedules removed:"), "{removed}");
     }
 
     #[test]
     fn scheduled_summary_is_elided() {
-        let jobs = vec![sample_job(&"long ".repeat(60))];
+        let schedules = vec![sample_schedule(&"long ".repeat(60))];
         let rendered = render_world_state(
             &WorldSnapshot::new(
                 &catalog_with(SCHEDULE_INDEX_TOOL),
                 &no_skills(),
                 &[],
                 &[],
-                &jobs,
+                &schedules,
             ),
             None,
         );
@@ -4965,9 +5019,7 @@ mod tests {
             "{full}"
         );
         assert!(
-            full.contains(
-                "Scheduled jobs fire only while a scheduler serving this session is running."
-            ),
+            full.contains("Schedules fire only while a scheduler serving this session is running."),
             "{full}"
         );
         assert!(full.contains("names an auto-compaction ceiling"), "{full}");
@@ -5652,7 +5704,7 @@ mod tests {
             id: uuid::Uuid::nil(),
             session_id: uuid::Uuid::nil(),
             class: crate::store::inbox::InboxClass::Steer,
-            source: None,
+            origin: crate::store::inbox::InboxOrigin::Sent { source: None },
             body: "what's your workspace?".to_string(),
             created_at,
             attempts: 0,
@@ -5675,11 +5727,37 @@ mod tests {
             "{mid_turn}"
         );
 
-        item.source = Some("k4yt3x".to_string());
+        item.origin = crate::store::inbox::InboxOrigin::Sent {
+            source: Some("k4yt3x".to_string()),
+        };
         let named = render_inbox_item(&item, false);
         assert!(
             named.starts_with("[Message from k4yt3x, arrived "),
             "{named}"
+        );
+    }
+
+    /// A gate's output is whatever its command or tool read, a fetched page included, and the
+    /// fire is read in the user's role on a turn nobody watches: no line of it may pass for the
+    /// block's own header or for a second prompt.
+    #[test]
+    fn a_gates_output_is_quoted_line_by_line_under_its_label() {
+        let fired_at = chrono::Utc::now();
+        let rendered = render_fire(
+            &crate::store::inbox::Fire {
+                schedule_id: "1a2b3c4d-0000-4000-8000-000000000000".to_string(),
+                gate_output: Some(format!("{}\n\u{1b}[2J", crate::text::FORGING_PAYLOAD)),
+                occurrences: 1,
+                due_at: fired_at,
+                fired_at,
+            },
+            "do the thing",
+            false,
+        );
+        crate::text::assert_payload_is_quoted(&rendered);
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "a gate's output is sanitized as a report's is: {rendered:?}"
         );
     }
 

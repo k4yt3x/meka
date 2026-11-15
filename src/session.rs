@@ -397,7 +397,7 @@ impl SessionCells {
 ///
 /// One value for the four cells the built-ins each carried a copy of, so a session-level fact
 /// reaches every tool by being added here rather than to each struct and each constructor. A
-/// session's site is its cells'; a scheduled job's gate has no session and builds a detached one.
+/// session's site is its cells'; a schedule's gate has no session and builds a detached one.
 #[derive(Clone)]
 pub(crate) struct ToolSite {
     pub(crate) permission: crate::permission::SharedPermission,
@@ -588,11 +588,12 @@ pub(crate) struct AgentOptions {
     /// from `build_subagent_system_prompt`. Live tools, permissions and other session state still
     /// arrive through the shared per-turn context.
     pub(crate) system_prompt_override: Option<String>,
-    /// How to resolve a scheduled gate's tool when telling the model which of its jobs are held.
+    /// How to resolve a scheduled gate's tool when telling the model which of its schedules are
+    /// held.
     ///
     /// `None` leaves every tool gate reported as unresolvable, which is honest for a process that
     /// genuinely has no dispatcher, and is what a sub-agent gets: it does not own the parent's
-    /// jobs and has no `[Scheduled]` section to fill.
+    /// schedules and has no `[Scheduled]` section to fill.
     pub(crate) gate_tools: Option<Arc<dyn crate::schedule::GateTools>>,
 }
 

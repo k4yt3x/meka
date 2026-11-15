@@ -62,9 +62,13 @@ pub(crate) enum UiEvent {
     Item(Item),
     /// The host has finished answering the last thing the UI sent it.
     Done,
-    /// A scheduled job came due or a background task has an outcome to report; the UI hands the
-    /// host a wake when it is idle.
+    /// Something waits in the inbox, a schedule's fire or a message, or a background task has an
+    /// outcome to report; the UI hands the host a wake when it is idle.
     Wake,
+    /// The inbox gave up on these items or took them back, so no turn will read them.
+    InboxWithdrawn {
+        item_ids: Vec<uuid::Uuid>,
+    },
     /// The host loop has ended.
     Leave,
     /// The log changed under the screen (a rewind, a fork): what is shown is to be read again
@@ -148,9 +152,9 @@ pub(crate) enum HostEvent {
         images: Vec<crate::image::ImageSource>,
     },
     Command(super::commands::SlashCommand),
-    /// Something out-of-band wants a turn: a scheduled job came due, or a background task has an
+    /// Something out-of-band wants a turn: an item waits in the inbox, or a background task has an
     /// outcome to report. Carries no payload; the host re-reads both, because between the watcher
-    /// noticing and this arriving the job could have been canceled.
+    /// noticing and this arriving the item could have been withdrawn.
     Wake,
     /// The user moved the permission level of the session whose id cell is `session`, to be
     /// recorded on its row: a scheduled gate is re-checked at fire time against the row, so the

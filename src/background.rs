@@ -372,18 +372,18 @@ pub(crate) fn report_direction(tasks: &[BackgroundTask]) -> String {
 
 /// The retention a carrier prompt deserves once an outcome may be riding on it.
 ///
-/// A recurring job asks for [`crate::conversation::PromptRetention::Withdraw`] because its next
-/// occurrence regenerates the prompt, so a failed copy carries nothing worth keeping. That stops
-/// being true the moment an outcome joins it: the row is stamped delivered when it is claimed and
-/// is never handed out again, so withdrawing the message loses the only copy. Three hosts fold an
-/// outcome into a fired job's prompt, and an interrupt lands one on the prompt of a turn in
+/// A recurring schedule asks for [`crate::conversation::PromptRetention::Withdraw`] because its
+/// next occurrence regenerates the prompt, so a failed copy carries nothing worth keeping. That
+/// stops being true the moment an outcome joins it: the row is stamped delivered when it is claimed
+/// and is never handed out again, so withdrawing the message loses the only copy. Three hosts fold
+/// an outcome into a fired schedule's prompt, and an interrupt lands one on the prompt of a turn in
 /// flight; all four ask this, rather than each remembering.
 pub(crate) fn retention_carrying(
     riding: &[BackgroundTask],
-    job: crate::conversation::PromptRetention,
+    schedule: crate::conversation::PromptRetention,
 ) -> crate::conversation::PromptRetention {
     if riding.is_empty() {
-        job
+        schedule
     } else {
         crate::conversation::PromptRetention::Keep
     }
@@ -423,9 +423,9 @@ const MID_TURN_TRAILER: &str = "\nYou started these earlier and did not wait for
 
 /// Render one or more finished tasks as the user-turn text that delivers them.
 ///
-/// The header is not decoration, for the same reason [`crate::scheduler::Wakeup::render_prompt`]
-/// carries one: without it the model reads a bare result as though a human had just typed it, and
-/// answers conversationally to nobody. It also has to be unambiguous about *who* is speaking,
+/// The header is not decoration, for the same reason [`crate::prompt::render_fire`] carries one:
+/// without it the model reads a bare result as though a human had just typed it, and answers
+/// conversationally to nobody. It also has to be unambiguous about *who* is speaking,
 /// because a backgrounded `agent_spawn` reports in a sub-agent's words, and a sub-agent is
 /// permission-clamped by `resolve_subagent_permission` while its words are not.
 ///
@@ -1019,7 +1019,7 @@ mod tests {
         );
     }
 
-    /// A prompt carrying an outcome is never withdrawn, whatever the job asked for.
+    /// A prompt carrying an outcome is never withdrawn, whatever the schedule asked for.
     ///
     /// The branch only matters when a turn fails, so nothing that drives a successful turn can see
     /// it. Withdrawing a carrier prompt destroys the only copy of the outcome: the row was stamped
@@ -1041,7 +1041,7 @@ mod tests {
         assert_eq!(
             retention_carrying(&[], crate::conversation::PromptRetention::Withdraw),
             crate::conversation::PromptRetention::Withdraw,
-            "and a job carrying only its own prompt keeps the job's answer: the next occurrence \
+            "and a schedule carrying only its own prompt keeps the schedule's answer: the next occurrence \
              regenerates it"
         );
         assert_eq!(

@@ -127,25 +127,25 @@ pub(crate) struct SkillsConfig {
     pub(crate) additional_directories: Option<Vec<String>>,
 }
 
-/// `[schedule]` table: agent-created wakeups ([`crate::schedule`]).
+/// `[schedule]` table: agent-created schedules ([`crate::schedule`]).
 ///
 /// Config-only, like `[skills]` and `[memory]`: whether an agent may schedule its own future turns
 /// is a property of the installation. Turning it off keeps the three `schedule_*` tool schemas out
 /// of every request, stops the `[Scheduled]` section rendering, and leaves the scheduler unstarted,
-/// so existing jobs stay on disk without firing.
+/// so existing schedules stay on disk without firing.
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ScheduleConfig {
     pub(crate) enabled: Option<bool>,
-    /// How often the scheduler looks for due jobs. Accepts humantime strings like `"10s"`, `"1m"`.
-    /// Default `"10s"`. This is the real resolution floor: a job with a shorter interval fires
-    /// once per tick, not once per interval.
+    /// How often the scheduler looks for due schedules. Accepts humantime strings like `"10s"`,
+    /// `"1m"`. Default `"10s"`. This is the real resolution floor: a schedule with a shorter
+    /// interval fires once per tick, not once per interval.
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
     pub(crate) poll_interval: Option<std::time::Duration>,
-    /// How late a *one-shot* job may be and still fire after downtime. Accepts humantime strings
-    /// like `"24h"`. Default `"24h"`.
+    /// How late a *one-shot* schedule may be and still fire after downtime. Accepts humantime
+    /// strings like `"24h"`. Default `"24h"`.
     ///
-    /// Recurring jobs need no equivalent: their occurrences are one period apart, so the most
+    /// Recurring schedules need no equivalent: their occurrences are one period apart, so the most
     /// recent missed one is always less than a period old, and the scheduler coalesces the rest.
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
     pub(crate) missed_grace: Option<std::time::Duration>,
@@ -155,20 +155,16 @@ pub(crate) struct ScheduleConfig {
     pub(crate) gate_timeout: Option<std::time::Duration>,
     /// How long a host's claim on an occurrence is good for. Default `"1h"`.
     ///
-    /// The window in which a crashed host's job is nobody's, so it is the delay before another
-    /// host picks it up. It should comfortably exceed a gate probe plus a model turn: a lease
-    /// that expires while the holder is still working lets a second host take the same
-    /// occurrence, and although the session lock then catches it and defers, that costs the
-    /// occurrence a round trip and re-runs the gate probe. An hour is far longer than any
-    /// realistic turn and still short enough that a machine which rebooted overnight has caught
+    /// The window in which a crashed host's schedule is nobody's, so it is the delay before
+    /// another host picks it up. It should comfortably exceed a gate probe: a lease that expires
+    /// while the holder's probe still runs lets a second host take the same occurrence and run the
+    /// probe again, and the first host's fire is not queued. An hour is far longer than any
+    /// realistic probe and still short enough that a machine which rebooted overnight has caught
     /// up by morning.
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
     pub(crate) claim_lease: Option<std::time::Duration>,
-    /// Ceiling on jobs per session, refused at `schedule_create`. Default 50.
-    pub(crate) max_jobs: Option<usize>,
-    /// How many of one session's jobs may spend a turn in a single sweep. Default 5. Jobs past it
-    /// keep their occurrence and fire on the next sweep.
-    pub(crate) max_consecutive_fires: Option<usize>,
+    /// Ceiling on schedules per session, refused at `schedule_create`. Default 50.
+    pub(crate) max_schedules: Option<usize>,
 }
 
 /// [`ScheduleConfig`] with every default filled in.
@@ -188,24 +184,16 @@ pub(crate) struct ResolvedScheduleConfig {
     pub(crate) gate_timeout: std::time::Duration,
     /// See [`ScheduleConfig::claim_lease`].
     pub(crate) claim_lease: std::time::Duration,
-    pub(crate) max_jobs: usize,
-    pub(crate) max_consecutive_fires: usize,
+    pub(crate) max_schedules: usize,
 }
 
 impl ResolvedScheduleConfig {
-    /// An hour: far longer than any realistic gate plus turn, so a lease cannot expire under a
-    /// host that is still working, and short enough that a machine which rebooted overnight has
-    /// caught up by morning.
+    /// An hour: far longer than any realistic gate probe, so a lease cannot expire under a host
+    /// that is still working, and short enough that a machine which rebooted overnight has caught
+    /// up by morning.
     const DEFAULT_CLAIM_LEASE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
     const DEFAULT_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-    /// Five is well above what a healthy session has due at once, since coalescing means one job
-    /// contributes one fire however long the outage was, so the budget only engages on a real
-    /// backlog. What it buys there is interleaving, not throttling: sweeps do not overlap and the
-    /// next begins as soon as the last ends, so a backlog produces the same number of turns either
-    /// way, but another session's due job is reached after five of this one's rather than after
-    /// all of them.
-    const DEFAULT_MAX_CONSECUTIVE_FIRES: usize = 5;
-    const DEFAULT_MAX_JOBS: usize = 50;
+    const DEFAULT_MAX_SCHEDULES: usize = 50;
     /// A day. Long enough that an overnight outage still delivers this morning's reminder, short
     /// enough that a laptop closed for a week does not wake to a pile of stale ones.
     const DEFAULT_MISSED_GRACE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
@@ -225,10 +213,7 @@ impl ResolvedScheduleConfig {
             missed_grace: raw.missed_grace.unwrap_or(Self::DEFAULT_MISSED_GRACE),
             gate_timeout: raw.gate_timeout.unwrap_or(Self::DEFAULT_GATE_TIMEOUT),
             claim_lease: raw.claim_lease.unwrap_or(Self::DEFAULT_CLAIM_LEASE),
-            max_jobs: raw.max_jobs.unwrap_or(Self::DEFAULT_MAX_JOBS),
-            max_consecutive_fires: raw
-                .max_consecutive_fires
-                .unwrap_or(Self::DEFAULT_MAX_CONSECUTIVE_FIRES),
+            max_schedules: raw.max_schedules.unwrap_or(Self::DEFAULT_MAX_SCHEDULES),
         }
     }
 }
@@ -249,7 +234,7 @@ impl Default for ResolvedScheduleConfig {
 /// capability without changing when a turn ends; this changes the contract of the primary
 /// interaction from "you asked, it answered" into "and something else may interrupt you later",
 /// which is right for an unattended assistant and wrong for someone using the screen as a command
-/// line. A scheduled job also takes an explicit, visible act to create, whereas `background` is
+/// line. A schedule also takes an explicit, visible act to create, whereas `background` is
 /// reachable from any tool call, so an agent will reach for it unprompted.
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -3553,8 +3538,8 @@ impl ResolvedConfig {
                     .to_string(),
             ));
         }
-        // A zero budget fails every gate before it can produce output, so every gated job would
-        // report a broken watcher forever.
+        // A zero budget fails every gate before it can produce output, so every gated schedule
+        // would report a broken watcher forever.
         if self.schedule.gate_timeout.is_zero() {
             return Err(crate::error::MekaError::Config(
                 "`[schedule].gate_timeout = \"0s\"` would time out every gate before it runs; \
@@ -3571,27 +3556,20 @@ impl ResolvedConfig {
         }
         refuse_a_fact_named_twice("status_row", &self.status_row)?;
         refuse_a_fact_named_twice("turn_end_summary", &self.turn_end_summary)?;
-        if self.schedule.max_jobs == 0 {
+        if self.schedule.max_schedules == 0 {
             return Err(crate::error::MekaError::Config(
-                "`[schedule].max_jobs = 0` would refuse every job; set `[schedule] enabled = \
+                "`[schedule].max_schedules = 0` would refuse every schedule; set `[schedule] enabled = \
                  false` to turn scheduling off"
                     .to_string(),
             ));
         }
-        if self.schedule.max_consecutive_fires == 0 {
-            return Err(crate::error::MekaError::Config(
-                "`[schedule].max_consecutive_fires = 0` would hold every due job over forever; set \
-                 `[schedule] enabled = false` to turn scheduling off"
-                    .to_string(),
-            ));
-        }
-        // A lease has to outlast the work it covers, and the probe is the part Meka can check. One
-        // that expires while a host is still working lets a second host take the same occurrence,
-        // which the session lock catches at the cost of a deferral and a re-run gate probe. Checked
-        // against `gate_timeout` rather than against a fixed floor because that is the only bound
-        // on the work Meka knows; the turn after it is unbounded, and a probe stopped at its
-        // timeout takes a moment more to end its processes and hand over what they printed, which
-        // is why the documentation asks for headroom on top rather than this settling the question.
+        // A lease has to outlast the work it covers, which is the gate's probe. One that expires
+        // while a host is still working lets a second host take the same occurrence and run the
+        // probe again, and the first host's fire is not queued. Checked against `gate_timeout`
+        // rather than against a fixed floor because that is the bound on the work; a probe stopped
+        // at its timeout takes a moment more to end its processes and hand over what they printed,
+        // which is why the documentation asks for headroom on top rather than this settling the
+        // question.
         if self.schedule.claim_lease <= self.schedule.gate_timeout {
             return Err(crate::error::MekaError::Config(format!(
                 "`[schedule].claim_lease` ({}) must outlast `[schedule].gate_timeout` ({}); remove \
@@ -4880,8 +4858,7 @@ enabled = true
 poll_interval = "5s"
 missed_grace = "2h"
 gate_timeout = "45s"
-max_jobs = 10
-max_consecutive_fires = 3
+max_schedules = 10
 "#,
         )
         .expect("failed to parse toml");
@@ -4893,8 +4870,7 @@ max_consecutive_fires = 3
         assert_eq!(schedule.poll_interval, std::time::Duration::from_secs(5));
         assert_eq!(schedule.missed_grace, std::time::Duration::from_secs(7200));
         assert_eq!(schedule.gate_timeout, std::time::Duration::from_secs(45));
-        assert_eq!(schedule.max_jobs, 10);
-        assert_eq!(schedule.max_consecutive_fires, 3);
+        assert_eq!(schedule.max_schedules, 10);
     }
 
     #[test]
@@ -4908,10 +4884,7 @@ max_consecutive_fires = 3
         assert!(schedule.enabled, "scheduling is on unless turned off");
         assert!(!schedule.poll_interval.is_zero());
         assert!(!schedule.gate_timeout.is_zero());
-        assert!(schedule.max_jobs > 0);
-        // Pinned to the value rather than to non-zero: both doc pages state 5, and drifting either
-        // way is silent: large disables the interleaving, 1 serializes every session.
-        assert_eq!(schedule.max_consecutive_fires, 5);
+        assert!(schedule.max_schedules > 0);
     }
 
     #[test]
@@ -5052,6 +5025,29 @@ on_exit = \"make build\"
 "
             )
             .is_err()
+        );
+    }
+
+    /// `[schedule]` refuses `max_jobs` by name rather than reading it as the limit, which is
+    /// `max_schedules`.
+    #[test]
+    fn the_retired_max_jobs_key_is_refused() {
+        let error = toml::from_str::<ConfigFile>("[schedule]\nmax_jobs = 10\n")
+            .expect_err("the retired key must not parse");
+        assert!(error.to_string().contains("max_jobs"), "{error}");
+    }
+
+    /// A sweep queues fires and runs no turn, so there is no budget of turns per sweep: the key is
+    /// refused by name and line rather than read and ignored.
+    #[test]
+    fn the_retired_max_consecutive_fires_key_is_refused() {
+        let error =
+            toml::from_str::<ConfigFile>("[schedule]\nenabled = true\nmax_consecutive_fires = 3\n")
+                .expect_err("the retired key must not parse");
+        let said = error.to_string();
+        assert!(
+            said.contains("max_consecutive_fires") && said.contains("line 3"),
+            "{said}"
         );
     }
 
@@ -5857,11 +5853,10 @@ model = "m"
     }
 
     #[test]
-    fn schedule_gate_timeout_and_max_jobs_zero_are_rejected() {
+    fn schedule_gate_timeout_and_max_schedules_zero_are_rejected() {
         for (key, value, needle) in [
             ("gate_timeout", "\"0s\"", "gate_timeout"),
-            ("max_jobs", "0", "max_jobs"),
-            ("max_consecutive_fires", "0", "max_consecutive_fires"),
+            ("max_schedules", "0", "max_schedules"),
         ] {
             let resolved = resolve_with_config(&format!(
                 r#"

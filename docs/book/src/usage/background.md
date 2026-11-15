@@ -20,7 +20,7 @@ This changes the contract of the primary interaction. Without it, you ask and th
 
 That is right for an **assistant** that runs unattended, keeps talking while work proceeds, and reports when it lands. It is usually wrong for the interactive case, someone at a terminal using the screen like a command line, where blocking is what you want and asynchrony is a surprise.
 
-Every other capability block (`[schedule]`, `[skills]`, `[memory]`) defaults on. This one does not, because those add capability without changing when a turn ends.
+Every other capability block (`[schedule]`, `[skills]`, `[memory]`) defaults on. This one does not, because skills and memory add capability without changing when a turn ends, and a schedule, whose fire can keep a turn going past its answer, takes an explicit act to create.
 
 ## How the agent uses it
 
@@ -132,7 +132,7 @@ it does not interrupt to say so. Every other outcome wakes the agent when it lan
 chose it: a build finished, a tool failed, or a host died holding the task. A cancellation is always
 somebody's deliberate act, and that somebody already knows, so it waits and is read at the next
 round boundary of a running turn, or at the top of whichever turn the session takes next (yours, or
-a scheduled job's), as part of that message rather than as one of its own. Canceling several tasks
+one a schedule's fire opened), as part of that message rather than as one of its own. Canceling several tasks
 costs no turns at all.
 
 A task reports to the session it started in, so the screen's `/resume` and `/fork` are refused

@@ -394,6 +394,10 @@ One word per concept, everywhere it is written or read:
   the rows on disk, said only where storage is the point; a row's **position** is its place there.
 - A **turn** is a row of `turns`, the one meaning the HTTP API has; what a person typed is a
   prompt.
+- **schedule** for what `schedule_create` makes, never "job" or "scheduled job" for one. Its
+  **timing** is the `at`, `every` or `cron` that says when; an **occurrence** is one moment it comes
+  due; a **fire** is what a due schedule puts in its session's inbox, and one fire can stand for
+  several occurrences.
 - **recall** for the lines typed on the screen that Up and Ctrl+R bring back, never "history"; one
   is a recall entry.
 - **sub-agent** as the noun; "worker" only when the orchestration role is the point; never
@@ -433,7 +437,7 @@ One word per concept, everywhere it is written or read:
 - **An empty list** says "No <nouns>." on stderr.
 - **One wording per event**, live and on a replay of the log, so a resumed session reads as the live
   one did. The live screen may say more than the log records, news as it happens such as a checklist
-  nudge's counts or how late a scheduled fire ran; the replay leaves that out and says the rest in
+  nudge's counts or how late a schedule's fire ran; the replay leaves that out and says the rest in
   the same words, and a reload lets the live row go for the replay's.
 - **Quoting.** Backticks for keys, commands and code (`` `[permissions].default` ``,
   `` `meka profile use` ``); single quotes for values and names (`'work'`).
@@ -756,6 +760,20 @@ the process without a record: the task row is written before it, and a process t
 spawned by the run. A detachable tool's `execute` is `tools::start_and_run`, so an inline call and
 a background one run the same code. A run reads `ToolContext::live_call_id`, `None` once detached,
 wherever it would address the call it came from, since that call has already returned.
+
+## The inbox is the one queue
+
+What waits for a session to read it is an inbox item: a row of `inbox_items` whose origin is typed
+(`InboxOrigin`: something sent, or a schedule's fire). A producer writes the item and stops. The
+scheduler's sweep runs a due schedule's gate and queues the fire in the transaction that spends
+the occurrence; it runs no turn. Reading is the inbox's: a running turn takes what waits at its
+pauses, and one driver (`host::scheduler::run_inbox_turns`) opens a turn for an idle session on
+every host. What becomes of an item whose turn fails, is stopped or is cut short by the host
+leaving, and of one on a session another process holds, is decided there, once.
+
+A new kind of thing to deliver is a new origin, never a second queue, a delivery loop or a turn
+runner of its own. A background task's outcome is the one exception: its task row is the record,
+and `deliver_ready_outcomes` reports it.
 
 ## Layering
 

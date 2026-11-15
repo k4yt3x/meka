@@ -385,6 +385,29 @@ pub(crate) struct FireLateness {
     pub(crate) coalesced: u32,
 }
 
+impl FireLateness {
+    /// The lateness of `fire` when it is worth saying, to the model and on the screen alike: it
+    /// ran more than a minute after it was due, or it stands for more than one occurrence. A
+    /// tick's worth of delay is normal, and saying so every time would train the model to ignore
+    /// the line that matters after an outage.
+    pub(crate) fn of(fire: &crate::store::inbox::Fire) -> Option<Self> {
+        let late_by = fire.fired_at - fire.due_at;
+        (late_by > chrono::Duration::minutes(1) || fire.occurrences > 1).then_some(Self {
+            late_by,
+            coalesced: fire.occurrences.saturating_sub(1),
+        })
+    }
+}
+
+/// A fire with lateness worth saying, named by where its block is: two fires of one schedule can
+/// be read together, when a rewind has put an older one back beside the one waiting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LateFire {
+    /// The place of the fire's block among the blocks the announcing event carries, from 0.
+    pub(crate) block: usize,
+    pub(crate) lateness: FireLateness,
+}
+
 /// One-way UI event emitted by the agent loop.
 #[derive(Debug, Clone)]
 pub(crate) enum FrontendEvent {
@@ -420,13 +443,19 @@ pub(crate) enum FrontendEvent {
     /// request, or behind the prompt an interrupt cut the answer to. An item that rides a message
     /// appended whole, a turn's opening or one an interrupt appends, is announced with it
     /// ([`Self::MessageAppended`]), and every item is reported read by [`Self::InboxDelivered`].
+    /// `late` is how late each fire among the blocks was, as on [`Self::MessageAppended`].
     InboxAppended {
         blocks: Vec<crate::conversation::ContentBlock>,
+        late: Vec<LateFire>,
     },
     /// Inbox items the model has now been shown: the provider accepted a request carrying their
     /// text. Emitted at that request rather than when the text was appended, so whoever enqueued
     /// an item learns when it was read and not merely written down.
     InboxDelivered { item_ids: Vec<Uuid> },
+    /// An inbox item a tool call took back before any turn read it: the waiting fire of a schedule
+    /// the model canceled. A host's own withdrawals (a stopped turn, a give-up) are the host's to
+    /// say.
+    InboxWithdrawn { item_id: Uuid },
     /// A message Meka wrote into the turn in the user's role: the nudge after a reply with no
     /// visible text or with checklist items open. The conversation holds it, so a client that
     /// mirrors the conversation from the feed needs it, and the blocking turn's messages carry it
@@ -448,12 +477,13 @@ pub(crate) enum FrontendEvent {
     /// opens with, whoever opened it, or the one an interrupt appends after a cut answer. Emitted
     /// where the message is appended, so every door's opening is announced once and the turn it
     /// belongs to is the one running. `message` is what the conversation holds, for a frontend
-    /// that mirrors it; `outcomes` are the rows behind any report block and `late` how late a
-    /// fire's block was, for a frontend that says what happened as a stage direction instead.
+    /// that mirrors it; `outcomes` are the rows behind any report block and `late` how late each
+    /// fire among its blocks was, those with lateness worth saying, for a frontend that says what
+    /// happened as a stage direction instead.
     MessageAppended {
         message: crate::conversation::Message,
         outcomes: Vec<crate::store::background::BackgroundTask>,
-        late: Option<FireLateness>,
+        late: Vec<LateFire>,
     },
     /// A streamed chunk of assistant text. Multiple deltas concatenate into one logical text run;
     /// any non-text event closes the run.

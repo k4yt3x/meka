@@ -652,7 +652,182 @@ const MIGRATIONS: &[Migration] = &[
         name: "failures_keep_their_refusal_typed",
         step: Step::Rust(failures_keep_their_refusal_typed),
     },
+    // 0.95 calls what a session schedules a schedule, and the table and its indexes take the
+    // word, as a `scheduled` block's field naming its schedule does. A store that already has the
+    // new name keeps it, so a replay is a no-op; `classify_by_shape` classifies such a store past
+    // this step, since the frozen steps before it name the old table.
+    Migration {
+        name: SCHEDULES_TAKE_THEIR_NAME,
+        step: Step::Rust(schedules_take_their_name),
+    },
+    // 0.95 puts a schedule's fire in its session's inbox, and an item says whose fire it is and
+    // what the fire is: the schedule, the gate's output, how many occurrences it stands for, when
+    // the first was due and when the last fired. Nothing to convert: every item written before is
+    // a message somebody sent, which names no schedule.
+    Migration {
+        name: "inbox_items_name_their_schedule",
+        step: Step::Rust(inbox_items_name_their_schedule),
+    },
 ];
+
+/// `inbox_items.schedule_id`, `gate_output`, `occurrences`, `due_at` and `fired_at`, nullable, and
+/// the index a schedule's waiting fire is found by. Each column is guarded on the column set for
+/// the reason the module docs give, and the index is created only where it is absent.
+fn inbox_items_name_their_schedule(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    for (column, kind) in [
+        ("schedule_id", "TEXT"),
+        ("gate_output", "TEXT"),
+        ("occurrences", "INTEGER"),
+        ("due_at", "TEXT"),
+        ("fired_at", "TEXT"),
+    ] {
+        if !table_has_column(transaction, "inbox_items", column)? {
+            transaction.execute_batch(&format!(
+                "ALTER TABLE inbox_items ADD COLUMN {column} {kind}"
+            ))?;
+        }
+    }
+    transaction.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_inbox_items_schedule_id ON inbox_items(schedule_id) \
+         WHERE schedule_id IS NOT NULL",
+    )
+}
+
+/// See the ledger entry. Safe to replay: the table is renamed only while it has the old name and
+/// not the new, an index is dropped only by its old name and created only where it is absent, and
+/// a block is converted only while it names its schedule by the old field.
+fn schedules_take_their_name(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    let tables: Vec<String> = transaction
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' \
+             AND name IN ('scheduled_jobs', 'schedules')",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if tables.iter().any(|name| name == "scheduled_jobs")
+        && !tables.iter().any(|name| name == "schedules")
+    {
+        transaction.execute_batch("ALTER TABLE scheduled_jobs RENAME TO schedules")?;
+    }
+    transaction.execute_batch(
+        "DROP INDEX IF EXISTS idx_scheduled_jobs_next_fire_at;
+         CREATE INDEX IF NOT EXISTS idx_schedules_next_fire_at ON schedules(next_fire_at);
+         DROP INDEX IF EXISTS idx_scheduled_jobs_session_id;
+         CREATE INDEX IF NOT EXISTS idx_schedules_session_id ON schedules(session_id);",
+    )?;
+    let encode = |value: &serde_json::Value| {
+        serde_json::to_string(value)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+    };
+    let (old, _) = SCHEDULE_ID_FIELDS_0_95;
+    // Every kind a block is stored under: a message's blocks as the row's content, and the
+    // messages a repair, a compaction's boundary and a failed compaction carry inside theirs.
+    let rows: Vec<(i64, String)> = transaction
+        .prepare(
+            "SELECT id, content FROM messages \
+             WHERE kind IN ('user_blocks', 'tool_results', 'assistant', 'repair', \
+             'compact_boundary', 'compaction_failed') AND instr(content, ?1) > 0",
+        )?
+        .query_map([format!("\"{old}\"")], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, content) in rows {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        let changed = match value.as_array_mut() {
+            Some(blocks) => name_schedule_ids_in_blocks_0_95(blocks),
+            None => name_schedule_ids_0_95(&mut value),
+        };
+        if changed {
+            transaction.execute(
+                "UPDATE messages SET content = ?1 WHERE id = ?2",
+                rusqlite::params![encode(&value)?, id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The field a `scheduled` block named its schedule by before 0.95, and the one it names it by
+/// from [`schedules_take_their_name`].
+const SCHEDULE_ID_FIELDS_0_95: (&str, &str) = ("job_id", "schedule_id");
+
+/// A `scheduled` block names its schedule by the new field of [`SCHEDULE_ID_FIELDS_0_95`] where it
+/// named it by the old. Reports whether it changed.
+fn name_schedule_id_0_95(block: &mut serde_json::Value) -> bool {
+    let (old, new) = SCHEDULE_ID_FIELDS_0_95;
+    let Some(block) = block.as_object_mut() else {
+        return false;
+    };
+    if block.get("type").and_then(serde_json::Value::as_str) != Some("scheduled")
+        || block.contains_key(new)
+    {
+        return false;
+    }
+    let Some(id) = block.remove(old) else {
+        return false;
+    };
+    block.insert(new.to_string(), id);
+    true
+}
+
+/// [`name_schedule_id_0_95`] over each of `blocks`. Reports whether any changed.
+fn name_schedule_ids_in_blocks_0_95(blocks: &mut [serde_json::Value]) -> bool {
+    let mut changed = false;
+    for block in blocks {
+        changed |= name_schedule_id_0_95(block);
+    }
+    changed
+}
+
+/// [`name_schedule_id_0_95`] over the blocks of every message `value` holds, wherever it sits: a
+/// repair's messages, a boundary's summary and the rounds its record keeps, a failed compaction's,
+/// an archive's events. A message's blocks are not descended into, since a call's arguments are
+/// the model's data. Reports whether anything changed.
+fn name_schedule_ids_0_95(value: &mut serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            if object.contains_key("role")
+                && let Some(blocks) = object
+                    .get_mut("content")
+                    .and_then(serde_json::Value::as_array_mut)
+            {
+                return name_schedule_ids_in_blocks_0_95(blocks);
+            }
+            let mut changed = false;
+            for child in object.values_mut() {
+                changed |= name_schedule_ids_0_95(child);
+            }
+            changed
+        }
+        serde_json::Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= name_schedule_ids_0_95(item);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+/// The blocks [`schedules_take_their_name`] converts, in every session of an archive written
+/// before it.
+fn name_schedule_ids_in_archive_0_95(document: &mut serde_json::Value) {
+    let Some(sessions) = document
+        .get_mut("sessions")
+        .and_then(|sessions| sessions.as_array_mut())
+    else {
+        return;
+    };
+    for session in sessions {
+        if let Some(events) = session.get_mut("events") {
+            name_schedule_ids_0_95(events);
+        }
+    }
+}
 
 /// `turns.refusal`, nullable: the refusal a turn that failed on one ended on, as JSON, in place of
 /// `detail`. A turn's `detail` and a failed compaction's `error` holding
@@ -1543,6 +1718,10 @@ const NAMES_FOLLOW_THE_VOCABULARY: &str = "names_follow_the_vocabulary";
 /// The step after which a store's recall entries are in `recall_entries`, named once because
 /// [`classify_by_shape`] classifies such a store at the version this entry leaves it.
 const RECALL_ENTRIES_TAKE_THEIR_NAME: &str = "recall_entries_take_their_name";
+
+/// The step after which a store's schedules are in `schedules`, named once because
+/// [`classify_by_shape`] classifies such a store at the version this entry leaves it.
+const SCHEDULES_TAKE_THEIR_NAME: &str = "schedules_take_their_name";
 
 /// The columns a copy a compaction kept says where it was said in, `said_turn_id` and `said_at`,
 /// the index the turn sweep finds the turns they name by, and every copy written before them, which
@@ -2595,7 +2774,7 @@ const HEAD_TABLES: &[&str] = &[
     "messages",
     "projects",
     "recall_entries",
-    "scheduled_jobs",
+    "schedules",
     "scratchpad_entries",
     "sessions",
     "turns",
@@ -2603,7 +2782,7 @@ const HEAD_TABLES: &[&str] = &[
 
 /// The shape of the schema at head, as [`schema_fingerprint`] computes it. Pinned by
 /// `the_head_schema_fingerprint_is_pinned`, so a new migration updates this alongside the ledger.
-const HEAD_SCHEMA_FINGERPRINT: u64 = 6_436_781_571_352_451_012;
+const HEAD_SCHEMA_FINGERPRINT: u64 = 7_471_482_584_958_421_530;
 
 /// A digest of every table's columns, independent of how the table came to have them.
 ///
@@ -2940,8 +3119,11 @@ fn classify_by_shape(connection: &rusqlite::Connection) -> Result<u32> {
     if table_columns(connection, "sessions")?.is_empty() {
         return Ok(0);
     }
+    // A store holding `schedules` has run the step that renamed `scheduled_jobs` to it, so it is
+    // past 0.42 and the two refusals below, which read the old table, are not its to answer.
+    let schedules = !table_columns(connection, "schedules")?.is_empty();
     let columns = table_columns(connection, "scheduled_jobs")?;
-    if columns.is_empty() {
+    if !schedules && columns.is_empty() {
         return Err(MekaError::Database(format!(
             "{} has tables but no `scheduled_jobs`, so it predates 0.42 and this Meka cannot bring \
              it forward. Nothing has been changed. Run the 0.42 release against it once, then this \
@@ -2949,7 +3131,7 @@ fn classify_by_shape(connection: &rusqlite::Connection) -> Result<u32> {
             store_name(connection)
         )));
     }
-    if !columns.iter().any(|column| column == "gate_permission") {
+    if !schedules && !columns.iter().any(|column| column == "gate_permission") {
         return Err(MekaError::Database(format!(
             "{} is in the 0.41 shape, which this Meka cannot bring forward. Nothing has been \
              changed. Run `migrate-0.41-to-0.42.py`, attached to the 0.42 release, once; every \
@@ -2990,6 +3172,12 @@ fn classify_by_shape(connection: &rusqlite::Connection) -> Result<u32> {
             store_name(connection),
             missing.join(", ")
         )));
+    }
+    // Every frozen step that names `scheduled_jobs` comes before the step that renamed it, and
+    // none may replay over a store holding `schedules`. Asked ahead of the earlier renames'
+    // floors, since a store past this one is past theirs too.
+    if schedules {
+        return version_after(SCHEDULES_TAKE_THEIR_NAME);
     }
     // A store holding `recall_entries` has run the step that renamed `prompt_history` to it, and
     // `prompt_history_is_in_the_ledger`, frozen, would make the old table again beside it.
@@ -3070,7 +3258,8 @@ const BASELINE_OBJECTS: &[&[&str]] = &[
     // Renamed by `credentials_belong_to_accounts`, which left the old name as a view until
     // `names_follow_the_vocabulary` dropped it; see both steps for why.
     &["provider_credentials", "account_credentials"],
-    &["scheduled_jobs"],
+    // Renamed by `schedules_take_their_name`.
+    &["scheduled_jobs", "schedules"],
     &["sessions"],
     // Renamed by `names_follow_the_vocabulary`.
     &["tool_outputs", "scratchpad_entries"],
@@ -5270,6 +5459,9 @@ const ARCHIVE_FORMAT_0_93: u64 = 27;
 /// The archive `format_version` 0.94 wrote, and 0.95's development builds before their turns
 /// carried a refusal, which recorded a login that must be redone in the shell's sentence.
 const ARCHIVE_FORMAT_0_94: u64 = 28;
+/// The archive `format_version` 0.95's development builds wrote, whose `scheduled` blocks name
+/// their schedule `job_id`.
+const ARCHIVE_FORMAT_0_95_DEVELOPMENT: u64 = 29;
 
 /// How the text Meka wrote into a user message on another's behalf began before 0.76 typed it,
 /// as 0.76's own renderers wrote it: the header above an inbox item with a named source and
@@ -5861,7 +6053,8 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
         | Some(ARCHIVE_FORMAT_0_92_DEVELOPMENT_2)
         | Some(ARCHIVE_FORMAT_0_92)
         | Some(ARCHIVE_FORMAT_0_93)
-        | Some(ARCHIVE_FORMAT_0_94) => {}
+        | Some(ARCHIVE_FORMAT_0_94)
+        | Some(ARCHIVE_FORMAT_0_95_DEVELOPMENT) => {}
         _ => return false,
     }
     require_fields_0_65(document);
@@ -5921,6 +6114,9 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
     }
     if from <= ARCHIVE_FORMAT_0_94 {
         type_spent_logins_in_archive_0_95(document);
+    }
+    if from <= ARCHIVE_FORMAT_0_95_DEVELOPMENT {
+        name_schedule_ids_in_archive_0_95(document);
     }
     document["format_version"] = current.into();
     true
@@ -7062,7 +7258,7 @@ mod tests {
     fn gate_of(connection: &rusqlite::Connection, id: &str) -> (Option<String>, Option<String>) {
         connection
             .query_row(
-                "SELECT gate_kind, gate_spec_json FROM scheduled_jobs WHERE id = ?1",
+                "SELECT gate_kind, gate_spec_json FROM schedules WHERE id = ?1",
                 [id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -7536,6 +7732,8 @@ mod tests {
                 "failures_keep_their_refusal_typed",
                 10595463980612986822_u64,
             ),
+            ("schedules_take_their_name", 3536161058682433172_u64),
+            ("inbox_items_name_their_schedule", 5363837774328468658_u64),
         ];
         /// Every column-zero item of `production` that a step can name, by a call, as a value or
         /// as a constant it reads, whatever its visibility, with its text: an item the digest
@@ -8233,7 +8431,7 @@ mod tests {
         let mut connection = rusqlite::Connection::open(&path).expect("reopen");
         let gates = |connection: &rusqlite::Connection| -> Vec<(String, String)> {
             let mut statement = connection
-                .prepare("SELECT id, gate_spec_json FROM scheduled_jobs ORDER BY id")
+                .prepare("SELECT id, gate_spec_json FROM schedules ORDER BY id")
                 .expect("prepare");
             statement
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -9083,7 +9281,7 @@ mod tests {
         fn job_spec(connection: &rusqlite::Connection, id: &str) -> (String, Option<String>) {
             connection
                 .query_row(
-                    "SELECT gate_spec_json, claim_expires_at FROM scheduled_jobs WHERE id = ?1",
+                    "SELECT gate_spec_json, claim_expires_at FROM schedules WHERE id = ?1",
                     [id],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
@@ -9130,7 +9328,7 @@ mod tests {
         );
         apply(&mut connection, first, &Context::default()).expect("migrated");
 
-        let scheduled = table_columns(&connection, "scheduled_jobs").expect("columns");
+        let scheduled = table_columns(&connection, "schedules").expect("columns");
         let memories = table_columns(&connection, "memories").expect("columns");
         for (table, gone, renamed) in [
             (&scheduled, "gate_spec", "gate_spec_json"),
@@ -9180,8 +9378,8 @@ mod tests {
         let names = indexes(&connection);
         for renamed in [
             "idx_sessions_parent_session_id",
-            "idx_scheduled_jobs_next_fire_at",
-            "idx_scheduled_jobs_session_id",
+            "idx_schedules_next_fire_at",
+            "idx_schedules_session_id",
             "idx_memories_priority_created_at",
         ] {
             assert!(names.iter().any(|n| n == renamed), "{renamed} should exist");
@@ -9682,7 +9880,7 @@ mod tests {
         apply(&mut connection, planned, &Context::adopting(Some("p"))).expect("migrated");
 
         let columns: Vec<String> = connection
-            .prepare("SELECT name FROM pragma_table_info('scheduled_jobs')")
+            .prepare("SELECT name FROM pragma_table_info('schedules')")
             .expect("prepare")
             .query_map([], |row| row.get(0))
             .expect("query")
@@ -9694,7 +9892,7 @@ mod tests {
         );
 
         let rows: Vec<(String, String, String)> = connection
-            .prepare("SELECT id, spec, next_fire_at FROM scheduled_jobs ORDER BY id")
+            .prepare("SELECT id, spec, next_fire_at FROM schedules ORDER BY id")
             .expect("prepare")
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .expect("query")
@@ -9745,7 +9943,7 @@ mod tests {
             .expect("the replay must not fail");
 
         let surviving: i64 = connection
-            .query_row("SELECT COUNT(*) FROM scheduled_jobs", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM schedules", [], |row| row.get(0))
             .expect("query");
         assert_eq!(surviving, 1, "and the job is still there");
     }
@@ -9861,7 +10059,7 @@ mod tests {
         let plan = plan(&connection).expect("classified");
         apply(&mut connection, plan, &Context::default()).expect("converted");
 
-        let columns = table_columns(&connection, "scheduled_jobs").expect("columns");
+        let columns = table_columns(&connection, "schedules").expect("columns");
         for gone in ["gate_command", "gate_fire"] {
             assert!(
                 !columns.iter().any(|c| c == gone),
@@ -10156,7 +10354,7 @@ mod tests {
         let plan = plan(&connection).expect("classified");
         apply(&mut connection, plan, &Context::default()).expect("the lease columns still arrive");
 
-        let columns = table_columns(&connection, "scheduled_jobs").expect("columns");
+        let columns = table_columns(&connection, "schedules").expect("columns");
         for present in ["claimed_by", "claim_expires_at", "attempts"] {
             assert!(
                 columns.iter().any(|c| c == present),
@@ -10683,11 +10881,12 @@ mod tests {
         let mut connection = connection_for_test();
         create_for_test(&mut connection).expect("a store at head");
         let before = fingerprint(&connection);
-        // The shape a store had between the two renames, which the later floor would otherwise
+        // The shape a store had before the later renames, which their floors would otherwise
         // answer for.
         connection
             .execute_batch(
-                "ALTER TABLE recall_entries RENAME TO prompt_history; PRAGMA user_version = 0;",
+                "ALTER TABLE recall_entries RENAME TO prompt_history; \
+                 ALTER TABLE schedules RENAME TO scheduled_jobs; PRAGMA user_version = 0;",
             )
             .expect("lose the version");
 
@@ -10722,8 +10921,12 @@ mod tests {
             )
             .expect("an entry");
         let before = fingerprint(&connection);
+        // The shape a store had between the two renames, which the later floor would otherwise
+        // answer for.
         connection
-            .execute_batch("PRAGMA user_version = 0;")
+            .execute_batch(
+                "ALTER TABLE schedules RENAME TO scheduled_jobs; PRAGMA user_version = 0;",
+            )
             .expect("lose the version");
 
         let replayed = plan(&connection).expect("classified by shape");
@@ -10770,6 +10973,163 @@ mod tests {
             )
             .expect("count");
         assert_eq!(old, 0);
+    }
+
+    /// A store holding `schedules` that lost its version is classified past the step that named
+    /// the table so, since the frozen steps before it name `scheduled_jobs`; the replay keeps the
+    /// schedules and leaves the head's shape.
+    #[test]
+    fn a_store_with_schedules_is_classified_past_their_rename() {
+        let mut connection = connection_for_test();
+        create_for_test(&mut connection).expect("a store at head");
+        plant_session(&connection, "s");
+        connection
+            .execute(
+                "INSERT INTO schedules (id, session_id, kind, spec, prompt, created_at, \
+                 next_fire_at) VALUES ('j', 's', 'every', '1h', 'kept', 'now', 'later')",
+                [],
+            )
+            .expect("a schedule");
+        let before = fingerprint(&connection);
+        connection
+            .execute_batch("PRAGMA user_version = 0;")
+            .expect("lose the version");
+
+        let replayed = plan(&connection).expect("classified by shape");
+        assert_eq!(
+            replayed.from,
+            version_after(SCHEDULES_TAKE_THEIR_NAME).expect("the step is in the ledger"),
+        );
+        apply(&mut connection, replayed, &Context::adopting(None)).expect("the replay");
+        assert_eq!(before, fingerprint(&connection));
+        let kept: String = connection
+            .query_row("SELECT prompt FROM schedules", [], |row| row.get(0))
+            .expect("the schedule stays");
+        assert_eq!(kept, "kept");
+    }
+
+    /// The rename carries the schedules over and gives the table's indexes its name, a `scheduled`
+    /// block names its schedule `schedule_id` in each kind of row that stores one, a block that
+    /// already does and a call's arguments are left as they are, and a replay is a no-op.
+    #[test]
+    fn schedules_take_their_name_with_their_rows_indexes_and_blocks() {
+        let mut connection = connection_for_test();
+        create_for_test(&mut connection).expect("a store at head");
+        connection
+            .execute_batch(
+                "ALTER TABLE schedules RENAME TO scheduled_jobs; \
+                 DROP INDEX idx_schedules_next_fire_at; \
+                 DROP INDEX idx_schedules_session_id; \
+                 CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_next_fire_at \
+                     ON scheduled_jobs(next_fire_at); \
+                 CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_session_id \
+                     ON scheduled_jobs(session_id);",
+            )
+            .expect("the old shape");
+        plant_session(&connection, "s");
+        connection
+            .execute(
+                "INSERT INTO scheduled_jobs (id, session_id, kind, spec, prompt, created_at, \
+                 next_fire_at) VALUES ('j', 's', 'every', '1h', 'watch it', 'now', 'later')",
+                [],
+            )
+            .expect("a schedule");
+        let text = "[Scheduled job j fired now]\n\nwatch it";
+        let old = serde_json::json!({"type": "scheduled", "job_id": "j", "prompt": "watch it", "text": text});
+        let new = serde_json::json!({"type": "scheduled", "schedule_id": "j", "prompt": "watch it", "text": text});
+        let message =
+            |block: &serde_json::Value| serde_json::json!({"role": "user", "content": [block]});
+        let rows = |block: &serde_json::Value| {
+            vec![
+                ("user_blocks", serde_json::json!([block])),
+                (
+                    "repair",
+                    serde_json::json!({"Repair": {"replaced_count": 1, "messages": [message(block)]}}),
+                ),
+                (
+                    "compact_boundary",
+                    serde_json::json!({"CompactBoundary": {
+                        "summary": {"role": "user", "content": [{"type": "summary", "text": "s"}]},
+                        "checkpoint": [message(block)],
+                    }}),
+                ),
+                (
+                    "compaction_failed",
+                    serde_json::json!({"CompactionFailed": {
+                        "trigger": "manual", "memories_written": [], "checkpoint": [message(block)],
+                    }}),
+                ),
+            ]
+        };
+        let arguments = serde_json::json!([{"type": "tool_use", "id": "t1", "name": "memory_write", "input": {"role": "user", "content": [old]}}]);
+        for (kind, content) in rows(&old) {
+            plant_message_of_kind(&connection, "s", kind, &content.to_string());
+        }
+        plant_message_of_kind(
+            &connection,
+            "s",
+            "user_blocks",
+            &serde_json::json!([new]).to_string(),
+        );
+        plant_message_of_kind(&connection, "s", "assistant", &arguments.to_string());
+
+        let transaction = connection.transaction().expect("transaction");
+        schedules_take_their_name(&transaction).expect("the step");
+        transaction.commit().expect("commit");
+        let converted = stored_messages(&connection);
+        let read: Vec<(String, serde_json::Value)> = converted
+            .iter()
+            .map(|(kind, content)| {
+                (
+                    kind.clone(),
+                    serde_json::from_str(content).expect("a stored event"),
+                )
+            })
+            .collect();
+        let mut expected: Vec<(String, serde_json::Value)> = rows(&new)
+            .into_iter()
+            .map(|(kind, content)| (kind.to_string(), content))
+            .collect();
+        expected.push(("user_blocks".to_string(), serde_json::json!([new])));
+        expected.push(("assistant".to_string(), arguments));
+        assert_eq!(read, expected);
+        let prompt: String = connection
+            .query_row("SELECT prompt FROM schedules WHERE id = 'j'", [], |row| {
+                row.get(0)
+            })
+            .expect("the schedule moved");
+        assert_eq!(prompt, "watch it");
+        let objects = |connection: &rusqlite::Connection| -> Vec<String> {
+            connection
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' \
+                     AND (name LIKE '%scheduled_jobs%' OR name LIKE '%schedules%') ORDER BY name",
+                )
+                .expect("prepare")
+                .query_map([], |row| row.get(0))
+                .expect("query")
+                .collect::<rusqlite::Result<_>>()
+                .expect("rows")
+        };
+        assert_eq!(objects(&connection), [
+            "idx_schedules_next_fire_at",
+            "idx_schedules_session_id",
+            "schedules"
+        ]);
+
+        let transaction = connection.transaction().expect("transaction");
+        schedules_take_their_name(&transaction).expect("a replay");
+        transaction.commit().expect("commit");
+        assert_eq!(
+            stored_messages(&connection),
+            converted,
+            "a replay is a no-op"
+        );
+        assert_eq!(objects(&connection), [
+            "idx_schedules_next_fire_at",
+            "idx_schedules_session_id",
+            "schedules"
+        ]);
     }
 
     /// A call answered in the background records the task its answer named, by the whole id and
@@ -11586,6 +11946,71 @@ mod tests {
         assert_eq!(recorded(&connection), expected);
     }
 
+    /// The step gives every item the columns a fire is told by and the index a schedule's waiting
+    /// fire is found by; an item written before names no schedule, and a replay changes nothing.
+    #[test]
+    fn inbox_items_take_the_columns_a_fire_is_told_by_and_replay_as_a_no_op() {
+        let mut connection = store_as_0_42_left_it();
+        stopped_before(&mut connection, "inbox_items_name_their_schedule");
+        connection
+            .execute_batch(
+                "INSERT INTO sessions (id, created_at, updated_at) VALUES ('s', 'then', 'then');
+                 INSERT INTO inbox_items (id, session_id, class, source, body, created_at) \
+                 VALUES ('sent', 's', 'steer', 'api', 'hi', 'then');",
+            )
+            .expect("an item written before");
+        let shape = |connection: &rusqlite::Connection| {
+            let columns: Vec<(String, String)> = connection
+                .prepare(
+                    "SELECT name, type FROM pragma_table_info('inbox_items') \
+                     WHERE name IN ('schedule_id', 'gate_output', 'occurrences', 'due_at', \
+                     'fired_at') ORDER BY name",
+                )
+                .expect("prepare")
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("query")
+                .collect::<rusqlite::Result<_>>()
+                .expect("columns");
+            let indexed: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'index' \
+                     AND name = 'idx_inbox_items_schedule_id'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("the index");
+            let named: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM inbox_items WHERE schedule_id IS NULL \
+                     AND gate_output IS NULL AND occurrences IS NULL AND due_at IS NULL \
+                     AND fired_at IS NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("the item");
+            (columns, indexed, named)
+        };
+        let expected = (
+            [
+                ("due_at", "TEXT"),
+                ("fired_at", "TEXT"),
+                ("gate_output", "TEXT"),
+                ("occurrences", "INTEGER"),
+                ("schedule_id", "TEXT"),
+            ]
+            .map(|(name, kind)| (name.to_string(), kind.to_string()))
+            .to_vec(),
+            1,
+            1,
+        );
+        let transaction = connection.transaction().expect("transaction");
+        inbox_items_name_their_schedule(&transaction).expect("the step");
+        assert_eq!(shape(&transaction), expected);
+        inbox_items_name_their_schedule(&transaction).expect("a replay");
+        transaction.commit().expect("commit");
+        assert_eq!(shape(&connection), expected);
+    }
+
     /// An archive from before 0.89 has each copy a compaction kept, a copy of a copy included,
     /// say the turn and the time of the event its chain starts from.
     #[test]
@@ -11975,7 +12400,7 @@ mod tests {
             converted[3].1[1],
             serde_json::json!({
                 "type": "scheduled",
-                "job_id": "1a2b3c4d-0000-4000-8000-000000000000",
+                "schedule_id": "1a2b3c4d-0000-4000-8000-000000000000",
                 "prompt": "check the news",
                 "text": fire,
             })
@@ -13381,6 +13806,155 @@ mod tests {
         assert_eq!(document, converted, "a replay changes nothing");
     }
 
+    /// A format 29 archive names a fire's schedule `job_id`, the one way it differs from 30: the
+    /// import door reads it with `schedule_id`, in an appended message and in a repair's alike,
+    /// and a replay changes nothing.
+    #[tokio::test]
+    async fn a_format_29_archive_names_a_fire_s_schedule_by_schedule_id() {
+        use crate::{
+            conversation::{ContentBlock, Event, Message, Role},
+            store::export::{
+                SESSION_EXPORT_FORMAT_VERSION, build_session_export, parse_session_export,
+            },
+        };
+        fn as_format_29(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(object) => {
+                    if let Some(id) = object.remove("schedule_id") {
+                        object.insert("job_id".to_string(), id);
+                    }
+                    object.values_mut().for_each(as_format_29);
+                }
+                serde_json::Value::Array(items) => items.iter_mut().for_each(as_format_29),
+                _ => {}
+            }
+        }
+        let store = crate::store::Store::for_test().await;
+        let session = store
+            .create_session(None, "p".to_string())
+            .await
+            .expect("a session");
+        let fire = ContentBlock::Scheduled {
+            schedule_id: "1a2b3c4d-0000-4000-8000-000000000000".to_string(),
+            prompt: "check the news".to_string(),
+            text: "[Schedule 1a2b3c4d fired now]\n\ncheck the news".to_string(),
+        };
+        let message = Message {
+            role: Role::User,
+            content: vec![fire.clone()],
+            provider_fields: None,
+        };
+        for event in [Event::Append(message.clone()), Event::Repair {
+            replaced_count: 1,
+            messages: vec![message],
+        }] {
+            store
+                .save_event(session, &event, None)
+                .await
+                .expect("an event");
+        }
+        let export = build_session_export(&store, session)
+            .await
+            .expect("an export");
+        let mut document = serde_json::to_value(&export).expect("json");
+        document["format_version"] = 29.into();
+        as_format_29(&mut document);
+        assert!(document.to_string().contains("\"job_id\""), "{document}");
+
+        let read = parse_session_export(document.to_string().as_bytes())
+            .expect("a format 29 archive reads");
+        assert_eq!(read.format_version, SESSION_EXPORT_FORMAT_VERSION);
+        let blocks: Vec<&ContentBlock> = read.sessions[0]
+            .events
+            .iter()
+            .flat_map(|exported| match &exported.event {
+                Event::Append(message) => message.content.iter().collect::<Vec<_>>(),
+                Event::Repair { messages, .. } => messages
+                    .iter()
+                    .flat_map(|message| message.content.iter())
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert_eq!(blocks, [&fire, &fire]);
+
+        let current = u64::from(SESSION_EXPORT_FORMAT_VERSION);
+        assert!(bring_archive_forward(&mut document, current));
+        let once = document.clone();
+        document["format_version"] = 29.into();
+        assert!(bring_archive_forward(&mut document, current));
+        assert_eq!(document, once, "a replay changes nothing");
+    }
+
+    /// A fire an archive from before 0.76 carried as text is typed by the 0.76 conversion and then
+    /// names its schedule `schedule_id`, as a block of a later archive does, and the archive reads.
+    #[test]
+    fn a_fire_typed_from_an_old_archive_s_text_names_its_schedule_by_schedule_id() {
+        let fire = "[Scheduled job 1a2b3c4d fired 2026-10-15 14:02 +00:00]\n\ncheck the news";
+        let mut document = serde_json::json!({
+            "format_version": 10,
+            "meka_version": "0.76.0",
+            "exported_at": "now",
+            "root_session_id": "11111111-1111-4111-8111-111111111111",
+            "blobs": [],
+            "sessions": [{
+                "id": "11111111-1111-4111-8111-111111111111",
+                "parent_id": null,
+                "created_at": "2020-01-01T00:00:00Z",
+                "updated_at": "2020-01-01T00:00:00Z",
+                "working_directory": "/w",
+                "permission": "read",
+                "capabilities_json": null,
+                "approvals": false,
+                "additional_workspace_directories": [],
+                "subagent_spec_json": null,
+                "profile": "work",
+                "stats": {
+                    "turns": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "redactions": 0,
+                    "redacted_images": 0,
+                    "redacted_bytes": 0,
+                    "turn_position": {"prompt_index": 0, "turn_index": 0},
+                },
+                "turns": [],
+                "events": [{
+                    "at": "2020-01-01T00:00:00Z",
+                    "turn_id": null,
+                    "event": {"Append": {"role": "user", "content": [
+                        {"type": "text", "text": fire},
+                    ]}},
+                }],
+                "scratchpad_entries": {},
+            }],
+        });
+        let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
+        assert!(bring_archive_forward(&mut document, current));
+        assert_eq!(
+            document["sessions"][0]["events"][0]["event"]["Append"]["content"],
+            serde_json::json!([{
+                "type": "scheduled",
+                "schedule_id": "1a2b3c4d",
+                "prompt": "check the news",
+                "text": fire,
+            }])
+        );
+        let export = crate::store::export::parse_session_export(document.to_string().as_bytes())
+            .expect("a converted archive reads");
+        assert!(matches!(
+            &export.sessions[0].events[0].event,
+            crate::conversation::Event::Append(message)
+                if matches!(
+                    &message.content[0],
+                    crate::conversation::ContentBlock::Scheduled { schedule_id, .. }
+                        if schedule_id == "1a2b3c4d"
+                )
+        ));
+    }
+
     /// A format 19 archive's turns record no level, so each takes the one its opening event told
     /// the model, else its session's, and a replay over the converted archive changes nothing. A
     /// copy a compaction kept under a turn, and a message of results, are not its opening.
@@ -13711,7 +14285,8 @@ mod tests {
         // The shape the step converts from: the five columns gone and the version one short.
         connection
             .execute_batch(
-                "ALTER TABLE memories DROP COLUMN load;
+                "ALTER TABLE schedules RENAME TO scheduled_jobs;
+                 ALTER TABLE memories DROP COLUMN load;
                  ALTER TABLE memories DROP COLUMN reference_list;
                  ALTER TABLE memories DROP COLUMN source;
                  ALTER TABLE memories DROP COLUMN verified_at;
@@ -14090,7 +14665,8 @@ mod tests {
         apply(&mut connection, to_head, &Context::default()).expect("apply");
         connection
             .execute_batch(
-                "ALTER TABLE sessions DROP COLUMN project;
+                "ALTER TABLE schedules RENAME TO scheduled_jobs;
+                 ALTER TABLE sessions DROP COLUMN project;
                  DROP TABLE projects;
                  CREATE TABLE memories_old (
                      id INTEGER PRIMARY KEY,

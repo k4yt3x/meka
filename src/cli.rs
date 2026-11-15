@@ -74,7 +74,7 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: InstructionsAction,
     },
-    /// Inspect and cancel scheduled jobs
+    /// Inspect and cancel schedules
     Schedule {
         #[command(subcommand)]
         action: ScheduleAction,
@@ -671,28 +671,29 @@ pub(crate) enum SkillAction {
     },
 }
 
-/// Inspect and cancel the wakeups the agent scheduled for itself through the `schedule_*` tools.
-/// Read-and-cancel only: creating a job needs a session to attach it to, which is the agent's job.
+/// Inspect and cancel the schedules the agent created for itself through the `schedule_*` tools.
+/// Read-and-cancel only: creating a schedule needs a session to attach it to, which is the agent's
+/// job.
 #[derive(clap::Subcommand, Debug)]
 pub(crate) enum ScheduleAction {
-    /// List scheduled jobs
+    /// List schedules
     List {
-        /// Only one session's jobs
+        /// Only one session's schedules
         #[arg(long)]
         session: Option<String>,
         #[arg(long, default_value = "plain", help = output_format_help())]
         format: OutputFormat,
     },
-    /// Show a job
+    /// Show a schedule
     Show {
-        /// Job id or unique prefix
+        /// Schedule id or unique prefix
         id: String,
         #[arg(long, default_value = "plain", help = output_format_help())]
         format: OutputFormat,
     },
-    /// Cancel a job
+    /// Cancel a schedule
     Cancel {
-        /// Job id or unique prefix
+        /// Schedule id or unique prefix
         id: String,
     },
 }
