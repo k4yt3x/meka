@@ -2533,6 +2533,549 @@ fn resume_switches_the_running_screen_to_the_pick() {
     );
 }
 
+/// What a one-shot run seeding a session is answered with.
+const SEEDED: &str = r#"[
+ [{"type":"text","text":"Seeded."},
+  {"type":"message_end","stop_reason":"end_turn"}]
+]"#;
+
+/// Seed a session with a one-shot run in `directory`, under [`SEEDED`], and return its id.
+fn seed_session(install: &Install, directory: &std::path::Path, prompt: &str) -> String {
+    install.write_script(SEEDED);
+    let status = install
+        .meka(&["--oneshot", "-p", prompt])
+        .current_dir(directory)
+        .status()
+        .expect("a scripted run");
+    assert!(status.success(), "seeding '{prompt}'");
+    rusqlite::Connection::open(install.database())
+        .expect("open the store")
+        .query_row(
+            "SELECT id FROM sessions ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the seeded session")
+}
+
+/// `/resume` opens the session it moves to as a launch opens one, so the session runs under the
+/// standing instructions its own directory gives it, and the one moved back to under its own.
+#[test]
+fn resume_runs_the_session_under_its_own_directory_s_instructions() {
+    let install = screen_install("read", "", "\n[instructions]\nfiles = [\"RULES.md\"]\n");
+    let work = install.work_dir();
+    for (name, rule) in [("a", "ALPHA RULE"), ("b", "BETA RULE")] {
+        std::fs::create_dir_all(work.join(name)).expect("a project directory");
+        std::fs::write(
+            work.join(name).join("RULES.md"),
+            format!("{rule}: answer.\n"),
+        )
+        .expect("its rules");
+    }
+    let alpha = seed_session(&install, &work.join("a"), "seed alpha");
+    let beta = seed_session(&install, &work.join("b"), "seed beta");
+    install.write_script(
+        r#"[
+ [{"type":"expect_system_prompt","contains":"ALPHA RULE"},
+  {"type":"text","text":"Answered under alpha."},
+  {"type":"message_end","stop_reason":"end_turn"}],
+ [{"type":"expect_system_prompt","contains":"BETA RULE"},
+  {"type":"text","text":"Answered under beta."},
+  {"type":"message_end","stop_reason":"end_turn"}],
+ [{"type":"expect_system_prompt","contains":"ALPHA RULE"},
+  {"type":"text","text":"Answered under alpha again."},
+  {"type":"message_end","stop_reason":"end_turn"}]
+]"#,
+    );
+    let run = drive_run_with(
+        &install,
+        &["-r", &alpha],
+        &[
+            "first",
+            &format!("/resume {beta}"),
+            "second",
+            &format!("/resume {alpha}"),
+            "third",
+            "/exit",
+        ],
+        false,
+    );
+    let connection = rusqlite::Connection::open(install.database()).expect("open the store");
+    let said_in = |session: &str, words: &str| -> bool {
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND content LIKE ?2",
+                rusqlite::params![session, format!("%{words}%")],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count")
+            > 0
+    };
+    assert!(
+        said_in(&beta, "Answered under beta."),
+        "the resumed session ran under its own directory's file: {:#?}",
+        run.screens
+    );
+    assert!(
+        said_in(&alpha, "Answered under alpha again."),
+        "and the session moved back to under its own: {:#?}",
+        run.screens
+    );
+    assert_eq!(run.exit, Some(0), "{:#?}", run.screens);
+}
+
+/// A switch is refused while the session on screen still runs a background task, by `/resume`
+/// and by `/fork`: the screen stays on its session, no copy is made, and the task's report, with
+/// what its command printed, lands in the session it was started in.
+#[test]
+fn a_switch_is_refused_while_a_background_task_runs() {
+    let install = screen_install(
+        "unrestricted",
+        "",
+        "\n[background]\nenabled = true\n\n[schedule]\npoll_interval = \"200ms\"\n",
+    );
+    let other = seed_session(&install, &install.work_dir(), "the other session");
+    // The command ends once the screen's own `!touch` says both refusals are on the record.
+    install.write_script(
+        r#"[
+ [{"type":"tool_use_start","id":"t1","name":"shell_execute"},
+  {"type":"tool_use_end","input":{"command":"until [ -e released ]; do sleep 0.1; done; echo FINISHED_IN_PLACE","background":true,"timeout_ms":600000}},
+  {"type":"message_end","stop_reason":"tool_use"}],
+ [{"type":"text","text":"Started it."},
+  {"type":"message_end","stop_reason":"end_turn"}],
+ [{"type":"text","text":"Noted the report."},
+  {"type":"message_end","stop_reason":"end_turn"}]
+]"#,
+    );
+    let run = drive_run_with(
+        &install,
+        &[],
+        &[
+            "start it",
+            &format!("/resume {other}"),
+            "\x1b",
+            "/fork",
+            "\x1b",
+            "!touch released",
+            &format!("{AWAITED}Noted the report.{AWAITED}/exit"),
+        ],
+        false,
+    );
+    for (screen, door) in [(&run.screens[2], "/resume"), (&run.screens[4], "/fork")] {
+        assert!(
+            screen.iter().any(|row| row.contains(
+                "1 background task(s) still running; stop them with `/task cancel --all`"
+            )),
+            "{door} is refused while the task runs: {screen:#?}"
+        );
+    }
+    let rows = final_screen(&run.screens);
+    assert!(
+        rows.iter().any(|row| row == "▎ start it")
+            && !rows.iter().any(|row| row.contains("Forked")),
+        "the screen stayed on its session: {rows:#?}"
+    );
+    let connection = rusqlite::Connection::open(install.database()).expect("open the store");
+    let sessions: i64 = connection
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .expect("count the sessions");
+    assert_eq!(sessions, 2, "no copy was made: {rows:#?}");
+    let (session, status, outcome, delivered): (String, String, String, Option<String>) =
+        connection
+            .query_row(
+                "SELECT session_id, status, outcome, delivered_at FROM background_tasks",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("the task's row");
+    assert_ne!(session, other, "the task is the session's on screen");
+    assert_eq!(status, "completed", "{outcome}");
+    assert!(outcome.contains("FINISHED_IN_PLACE"), "{outcome}");
+    assert!(delivered.is_some(), "the report was delivered: {rows:#?}");
+    let reported: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND content LIKE \
+             '%FINISHED_IN_PLACE%'",
+            [&session],
+            |row| row.get(0),
+        )
+        .expect("count");
+    assert!(
+        reported > 0,
+        "the session read what the command printed: {rows:#?}"
+    );
+    assert_eq!(run.exit, Some(0), "{rows:#?}");
+}
+
+/// After `/resume`, the second Ctrl+C sent from outside stops the background tasks of the session
+/// the screen moved to: the listener asks which tasks are the screen's at each press. The screen
+/// opens on a session with no row yet, which `/resume` lets go of as it is.
+#[test]
+fn the_second_interrupt_from_outside_stops_the_resumed_session_s_tasks() {
+    const MARKER: &str = "sleep 300.4142";
+    let install = screen_install("unrestricted", "", "\n[background]\nenabled = true\n");
+    let other = seed_session(&install, &install.work_dir(), "the other session");
+    install.write_script(format!(
+        r#"[
+ [{{"type":"tool_use_start","id":"t1","name":"shell_execute"}},
+  {{"type":"tool_use_end","input":{{"command":"{MARKER}","background":true,"timeout_ms":600000}}}},
+  {{"type":"message_end","stop_reason":"tool_use"}}],
+ [{{"type":"text","text":"Started it."}},
+  {{"type":"message_end","stop_reason":"end_turn"}}]
+]"#
+    ));
+    let mut master: RawFd = -1;
+    let size = libc::winsize {
+        ws_row: ROWS,
+        ws_col: COLUMNS,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let prepared = PreparedExec::meka(&install, &[]);
+    // SAFETY: as in `drive_run`.
+    let pid = unsafe {
+        libc::forkpty(
+            &mut master,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &size as *const libc::winsize as *mut libc::winsize,
+        )
+    };
+    assert!(pid >= 0, "forkpty failed");
+    if pid == 0 {
+        // SAFETY: the child of a threaded process, so only what `PreparedExec::exec` promises.
+        unsafe { prepared.exec() }
+    }
+    keep_master_here(master);
+    // The key is the ladder's first press, which the screen answers with a hint and no stop.
+    let (.., rows) = pump(
+        master,
+        &[&format!("/resume {other}"), "start it", "\x03"],
+        false,
+        COLUMNS,
+    );
+    // The task's run starts the command, after the call that asked for it has returned, so the
+    // command is waited for rather than expected the moment the screen settles.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while processes_running(MARKER).is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !processes_running(MARKER).is_empty(),
+        "the command runs in the resumed session: {rows:#?}"
+    );
+    let connection = rusqlite::Connection::open(install.database()).expect("open the store");
+    let status = || -> String {
+        connection
+            .query_row("SELECT status FROM background_tasks", [], |row| row.get(0))
+            .expect("the task's row")
+    };
+    // SAFETY: `pid` is the child forked above, signaled and reaped here and nowhere else, and
+    // `master` is open until the close below.
+    let (stopped, exit) = unsafe {
+        libc::kill(pid, libc::SIGINT);
+        let mut written = [0u8; 65536];
+        // The terminal is read while waiting, as in the termination test: a terminal holding
+        // output nobody reads can hold the process.
+        let mut read_for = |until: &mut dyn FnMut() -> bool| -> bool {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline {
+                if until() {
+                    return true;
+                }
+                let mut poll = libc::pollfd {
+                    fd: master,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                if libc::poll(&mut poll, 1, 50) > 0 && poll.revents & libc::POLLIN != 0 {
+                    libc::read(master, written.as_mut_ptr().cast(), written.len());
+                }
+            }
+            false
+        };
+        let stopped = read_for(&mut || status() == "canceled");
+        write_all(master, b"/exit\r");
+        let mut status = 0;
+        let exited = read_for(&mut || libc::waitpid(pid, &mut status, libc::WNOHANG) == pid);
+        libc::close(master);
+        if !exited {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, &mut status, 0);
+        }
+        (
+            stopped,
+            exited.then(|| {
+                if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else {
+                    -1
+                }
+            }),
+        )
+    };
+    let survivors = processes_running(MARKER);
+    for survivor in &survivors {
+        // SAFETY: a pid this test's own command line marks, found just above.
+        unsafe {
+            libc::kill(*survivor, libc::SIGKILL);
+        }
+    }
+    assert!(stopped, "the second press stopped the task: {}", status());
+    assert!(survivors.is_empty(), "the command died with its task");
+    assert_eq!(exit, Some(0), "{rows:#?}");
+}
+
+/// After `/resume`, what the screen records lands on the row of the session it moved to, and the
+/// status row reads that session's cells: `/cd` resolves against the resumed session's directory,
+/// the row of the session left keeps its own.
+#[test]
+fn a_change_after_resume_lands_on_the_resumed_session() {
+    let install = screen_install("read", "", "");
+    let work = install.work_dir();
+    std::fs::create_dir_all(work.join("b").join("deeper")).expect("a directory to move to");
+    let other = seed_session(&install, &work.join("b"), "the other session");
+    let run = drive_run_with(
+        &install,
+        &[],
+        &["hello", &format!("/resume {other}"), "/cd deeper", "/exit"],
+        false,
+    );
+    let rows = final_screen(&run.screens);
+    assert!(
+        rows.iter().any(|row| row.contains("work/b/deeper")),
+        "the status row shows the resumed session's directory: {rows:#?}"
+    );
+    let connection = rusqlite::Connection::open(install.database()).expect("open the store");
+    let directory = |session: &str| -> String {
+        connection
+            .query_row(
+                "SELECT working_directory FROM sessions WHERE id = ?1",
+                [session],
+                |row| row.get(0),
+            )
+            .expect("the session's directory")
+    };
+    assert!(
+        directory(&other).ends_with("b/deeper"),
+        "the move is on the resumed session's row: {}",
+        directory(&other)
+    );
+    let left: String = connection
+        .query_row(
+            "SELECT working_directory FROM sessions WHERE id != ?1",
+            [&other],
+            |row| row.get(0),
+        )
+        .expect("the session left");
+    assert!(
+        left.ends_with("work"),
+        "the session left keeps its own: {left}"
+    );
+    assert_eq!(run.exit, Some(0), "{rows:#?}");
+}
+
+/// `/resume` shows the checklist the session it moves to was left with, as `meka -r` does, when the
+/// log drew the list last further back than the first page the screen reads of it.
+#[test]
+fn resume_shows_the_checklist_the_session_was_left_with_past_its_first_page() {
+    let install = screen_install("read", "fold_steps = false", "");
+    let mut rounds = vec![
+        serde_json::json!([
+            {"type": "tool_use_start", "id": "c1", "name": "checklist_add"},
+            {"type": "tool_use_end", "input": {"items": ["ask Sam"]}},
+            {"type": "message_end", "stop_reason": "tool_use"},
+        ]),
+        serde_json::json!([
+            {"type": "tool_use_start", "id": "c2", "name": "checklist_edit"},
+            {"type": "tool_use_end", "input": {"id": 1, "status": "deferred", "reason": "waiting on Sam"}},
+            {"type": "message_end", "stop_reason": "tool_use"},
+        ]),
+    ];
+    // Two rows of the log each, enough to push the list's rows past the first page.
+    for call in 0..120 {
+        rounds.push(serde_json::json!([
+            {"type": "tool_use_start", "id": format!("s{call}"), "name": "schedule_list"},
+            {"type": "tool_use_end", "input": {}},
+            {"type": "message_end", "stop_reason": "tool_use"},
+        ]));
+    }
+    rounds.push(serde_json::json!([
+        {"type": "text", "text": "Planned."},
+        {"type": "message_end", "stop_reason": "end_turn"},
+    ]));
+    install.write_script(serde_json::Value::Array(rounds));
+    let status = install
+        .meka(&["--oneshot", "-p", "plan it"])
+        .current_dir(install.work_dir())
+        .status()
+        .expect("a scripted run");
+    assert!(status.success(), "seeding the planned session");
+    let planned: String = rusqlite::Connection::open(install.database())
+        .expect("open the store")
+        .query_row("SELECT id FROM sessions", [], |row| row.get(0))
+        .expect("the planned session");
+    let run = drive_run_with(
+        &install,
+        &[],
+        &[&format!("/resume {planned}"), "/exit"],
+        false,
+    );
+    let rows = final_screen(&run.screens);
+    assert!(
+        rows.iter().any(|row| row == "  Planned."),
+        "the screen is on the planned session: {rows:#?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("» ask Sam (waiting on Sam)")),
+        "and shows the list it was left with: {rows:#?}"
+    );
+    assert_eq!(run.exit, Some(0), "{rows:#?}");
+}
+
+/// What opening a session warns of is on the screen after `/resume` moves to it, as it is after
+/// `meka -r`. Whether the warning is drawn before or after the switch lets the old transcript go
+/// is a matter of a frame; the transcript's own test holds both orders.
+#[test]
+fn resume_keeps_what_opening_the_session_warned_of() {
+    let install = screen_install("read", "", "");
+    let gone = install.work_dir().join("gone");
+    std::fs::create_dir_all(&gone).expect("a directory to record");
+    let other = seed_session(&install, &gone, "the other session");
+    std::fs::remove_dir_all(&gone).expect("the directory goes");
+    let run = drive_run_with(
+        &install,
+        &[],
+        &[&format!("/resume {other}"), "/exit"],
+        false,
+    );
+    let rows = final_screen(&run.screens);
+    // The warning wraps, so it is read across the rows it was drawn on.
+    let drawn = rows
+        .iter()
+        .flat_map(|row| row.split_whitespace())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        rows.iter().any(|row| row == "  Seeded."),
+        "the screen is on the resumed session: {rows:#?}"
+    );
+    assert!(
+        drawn.contains("which no longer exists; opening in"),
+        "the warning the opening raised is shown: {rows:#?}"
+    );
+    assert_eq!(run.exit, Some(0), "{rows:#?}");
+}
+
+/// A switch asked for right behind `/task cancel --all` is made: a task that has been told to
+/// stop is no longer one the switch waits for, even while its command, which ignores the polite
+/// signal, is still being ended.
+#[test]
+fn a_switch_right_after_the_tasks_were_canceled_is_made() {
+    const MARKER: &str = "sleep 300.5772";
+    let install = screen_install("unrestricted", "", "\n[background]\nenabled = true\n");
+    let other = seed_session(&install, &install.work_dir(), "the other session");
+    install.write_script(format!(
+        r#"[
+ [{{"type":"tool_use_start","id":"t1","name":"shell_execute"}},
+  {{"type":"tool_use_end","input":{{"command":"trap '' TERM; {MARKER}","background":true,"timeout_ms":600000}}}},
+  {{"type":"message_end","stop_reason":"tool_use"}}],
+ [{{"type":"text","text":"Started it."}},
+  {{"type":"message_end","stop_reason":"end_turn"}}]
+]"#
+    ));
+    // One write: the cancel, Enter, and the switch, so the switch is asked for while the task
+    // is still on its way out.
+    let run = drive_run_with(
+        &install,
+        &[],
+        &[
+            "start it",
+            &format!("/task cancel --all\r/resume {other}"),
+            "/exit",
+        ],
+        false,
+    );
+    let survivors = processes_running(MARKER);
+    for survivor in &survivors {
+        // SAFETY: a pid this test's own command line marks, found just above.
+        unsafe {
+            libc::kill(*survivor, libc::SIGKILL);
+        }
+    }
+    let rows = final_screen(&run.screens);
+    assert!(
+        rows.iter().any(|row| row == "  Seeded."),
+        "the screen moved to the other session: {rows:#?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("still running")),
+        "and was not told to stop what it had just stopped: {rows:#?}"
+    );
+    let status: String = rusqlite::Connection::open(install.database())
+        .expect("open the store")
+        .query_row("SELECT status FROM background_tasks", [], |row| row.get(0))
+        .expect("the task's row");
+    assert_eq!(status, "canceled", "{rows:#?}");
+    assert!(survivors.is_empty(), "the command was ended: {survivors:?}");
+    assert_eq!(run.exit, Some(0), "{rows:#?}");
+}
+
+/// Words sent right behind a `/resume`, before the host has ended the switch, open a turn on the
+/// session the switch ends on: they are not left as a steer for the session let go.
+#[test]
+fn words_sent_during_a_switch_run_on_the_session_moved_to() {
+    let install = screen_install("read", "", "");
+    let other = seed_session(&install, &install.work_dir(), "the other session");
+    install.write_script(
+        r#"[
+ [{"type":"text","text":"First."},
+  {"type":"message_end","stop_reason":"end_turn"}],
+ [{"type":"text","text":"Said there."},
+  {"type":"message_end","stop_reason":"end_turn"}]
+]"#,
+    );
+    // One write: the command, Enter, and the words, with the driver's Enter after them, so the
+    // words reach the screen while the host is still opening the session.
+    let run = drive_run_with(
+        &install,
+        &[],
+        &[
+            "hello",
+            &format!("/resume {other}\rsay it there"),
+            &format!("{AWAITED}Said there.{AWAITED}/exit"),
+        ],
+        false,
+    );
+    let rows = final_screen(&run.screens);
+    let connection = rusqlite::Connection::open(install.database()).expect("open the store");
+    let said_in = |words: &str| -> Vec<String> {
+        let mut statement = connection
+            .prepare("SELECT DISTINCT session_id FROM messages WHERE content LIKE ?1")
+            .expect("prepare");
+        statement
+            .query_map([format!("%{words}%")], |row| row.get(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows")
+    };
+    assert_eq!(
+        said_in("say it there"),
+        vec![other.clone()],
+        "the words opened a turn on the session moved to: {rows:#?}"
+    );
+    assert_eq!(said_in("Said there."), vec![other], "{rows:#?}");
+    let left_waiting: i64 = connection
+        .query_row("SELECT COUNT(*) FROM inbox_items", [], |row| row.get(0))
+        .expect("count the inbox");
+    assert_eq!(
+        left_waiting, 0,
+        "nothing was left for the session let go: {rows:#?}"
+    );
+    assert_eq!(run.exit, Some(0), "{rows:#?}");
+}
+
 /// A command the host answers is refused while a turn runs, in a panel naming the command, and
 /// does not run once the turn ends either: a `/compact` that ran after the turn it was typed
 /// during would act on a conversation the user had not seen yet.

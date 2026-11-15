@@ -813,8 +813,12 @@ fn finish_command(
     }
 
     if budget.is_exhausted() {
-        return led_by_reason(drained, &output_cut_note())
-            .with_metadata(command_exit_metadata(status));
+        let cut = output_cut_note();
+        return led_by_reason(drained, &cut).with_metadata(command_exit_metadata(
+            status,
+            Some(&cut),
+            closing_words("", drained.stopped_early),
+        ));
     }
 
     // No output-length truncation here: the agent layer's `persist_oversized_results`
@@ -825,7 +829,11 @@ fn finish_command(
     if drained.stopped_early {
         append_drain_stopped_note(&mut output);
     }
-    output.with_metadata(command_exit_metadata(status))
+    output.with_metadata(command_exit_metadata(
+        status,
+        None,
+        closing_words(&exit_words(exit_code), drained.stopped_early),
+    ))
 }
 
 /// What a command's drains keep: every byte of both streams, within `budget`, relayed to the
@@ -853,7 +861,10 @@ fn wait_failed(error: std::io::Error) -> MekaError {
 /// everything it printed up to the kill. A frontend rendering a terminal shows "terminated" rather
 /// than an exit code.
 fn killed_command_output(drained: &DrainedOutput, reason: &str) -> ToolOutput {
-    led_by_reason(drained, reason).with_metadata(killed_exit_metadata())
+    led_by_reason(drained, reason).with_metadata(killed_exit_metadata(
+        reason,
+        closing_words("", drained.stopped_early),
+    ))
 }
 
 /// A failed result that states `reason` first and carries what the command printed after it.
@@ -1049,8 +1060,14 @@ impl From<crate::process::Drained> for DrainedOutput {
 
 /// Structured exit status for frontends that render a terminal. `ExitStatus::code()` is `None`
 /// exactly when a signal ended the process, so the two are read as alternatives rather than both
-/// being guessed from the same number.
-fn command_exit_metadata(status: &std::process::ExitStatus) -> crate::frontend::ToolOutputMetadata {
+/// being guessed from the same number. `reason` is what the result's text opens with when Meka cut
+/// the output of a command that then exited on its own, and `closing` what it adds after the
+/// output.
+fn command_exit_metadata(
+    status: &std::process::ExitStatus,
+    reason: Option<&str>,
+    closing: Option<String>,
+) -> crate::frontend::ToolOutputMetadata {
     #[cfg(unix)]
     let signal = {
         use std::os::unix::process::ExitStatusExt;
@@ -1061,6 +1078,8 @@ fn command_exit_metadata(status: &std::process::ExitStatus) -> crate::frontend::
     crate::frontend::ToolOutputMetadata::CommandExit {
         exit_code: status.code(),
         signal,
+        reason: reason.map(str::to_string),
+        closing,
     }
 }
 
@@ -1086,14 +1105,20 @@ fn signal_name(number: i32) -> String {
 /// down without its status being reaped, so there is nothing to read it from. On Unix the kill
 /// really is a signal (to the tree, by [`crate::process::run`]); Windows has no signals, and
 /// claiming one there would put a name in the client's terminal that never existed on that
-/// platform.
-fn killed_exit_metadata() -> crate::frontend::ToolOutputMetadata {
+/// platform. `reason` is why Meka killed it, as the result's text opens, and `closing` what the
+/// text adds after the output.
+fn killed_exit_metadata(
+    reason: &str,
+    closing: Option<String>,
+) -> crate::frontend::ToolOutputMetadata {
     crate::frontend::ToolOutputMetadata::CommandExit {
         exit_code: None,
         #[cfg(unix)]
         signal: Some("SIGKILL".to_string()),
         #[cfg(not(unix))]
         signal: None,
+        reason: Some(reason.to_string()),
+        closing,
     }
 }
 
@@ -1118,12 +1143,30 @@ pub(crate) fn exit_line(exit_code: i32) -> String {
     format!("Exit code: {exit_code}")
 }
 
+/// What a result's text says of the exit after the command's output: the exit line on a line of
+/// its own for a code other than 0, nothing for 0.
+fn exit_words(exit_code: i32) -> String {
+    if exit_code == 0 {
+        String::new()
+    } else {
+        format!("\n{}", exit_line(exit_code))
+    }
+}
+
+/// What a result's text adds after the command's own output, as the text carries it: `exit`
+/// (see [`exit_words`]), then the note that the output's pipe was left open. `None` when it adds
+/// nothing.
+fn closing_words(exit: &str, drain_stopped_early: bool) -> Option<String> {
+    let mut closing = exit.to_string();
+    if drain_stopped_early {
+        closing.push_str(&drain_stopped_note());
+    }
+    (!closing.is_empty()).then_some(closing)
+}
+
 fn assemble_command_output(stdout: &str, stderr: &str, exit_code: i32) -> ToolOutput {
     let mut result_text = join_streams(stdout, stderr);
-    if exit_code != 0 {
-        result_text.push('\n');
-        result_text.push_str(&exit_line(exit_code));
-    }
+    result_text.push_str(&exit_words(exit_code));
 
     ToolOutput::text(
         if result_text.is_empty() {
@@ -1247,14 +1290,18 @@ async fn abort_after_timeout<T: 'static>(
 /// Tell the model that the drains were stopped with a pipe still open, so output printed after
 /// that point by whatever held it is not in the result.
 fn append_drain_stopped_note(output: &mut ToolOutput) {
-    let note = format!(
+    if let Some(crate::conversation::ToolResultContent::Text { text }) = output.content.last_mut() {
+        text.push_str(&drain_stopped_note());
+    }
+}
+
+/// The note [`append_drain_stopped_note`] ends a result's text with, on a line of its own.
+fn drain_stopped_note() -> String {
+    format!(
         "\n(a background process kept the output pipe open for {} seconds past the command's \
          exit; anything it printed after that is not included)",
         DRAIN_TIMEOUT.as_secs()
-    );
-    if let Some(crate::conversation::ToolResultContent::Text { text }) = output.content.last_mut() {
-        text.push_str(&note);
-    }
+    )
 }
 
 #[cfg(test)]
@@ -1427,8 +1474,9 @@ mod tests {
             "unknown signals stay unambiguous"
         );
 
-        let crate::frontend::ToolOutputMetadata::CommandExit { exit_code, signal } =
-            killed_exit_metadata()
+        let crate::frontend::ToolOutputMetadata::CommandExit {
+            exit_code, signal, ..
+        } = killed_exit_metadata("stopped", None)
         else {
             panic!("a kill must report a command exit");
         };
@@ -1440,6 +1488,42 @@ mod tests {
             signal.as_deref(),
             Some(signal_name(libc::SIGKILL).as_str()),
             "the timeout path must name the signal the same way the reaped-status path does",
+        );
+    }
+
+    /// A command a signal ended has no exit code for a frontend to state beside it, and its text
+    /// still ends on the line that gives it one: the closing words carry that line, so a frontend
+    /// showing the output it streamed can end as the text does.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_a_signal_ended_carries_the_line_its_text_ends_on() {
+        let tool = tool_for_test(shared_permission_for_test(), false);
+        let result = tool
+            .execute(
+                serde_json::json!({"command": "echo before; kill -KILL $$"}),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
+            )
+            .await
+            .expect("tool runs");
+        assert!(result.is_error, "a command a signal ended failed");
+        let text = result.text_content();
+        let Some(crate::frontend::ToolOutputMetadata::CommandExit {
+            exit_code,
+            signal,
+            reason,
+            closing,
+        }) = result.frontend_metadata
+        else {
+            panic!("expected CommandExit metadata");
+        };
+        assert_eq!(exit_code, None, "a signal leaves no exit code");
+        assert_eq!(signal.as_deref(), Some("SIGKILL"));
+        assert_eq!(reason, None, "Meka did not end it");
+        let closing = closing.expect("the text ends on an exit line");
+        assert_eq!(closing, format!("\n{}", exit_line(-1)));
+        assert!(
+            text.starts_with("before\n") && text.ends_with(&closing),
+            "{text}"
         );
     }
 
@@ -1457,8 +1541,13 @@ mod tests {
             .await
             .expect("tool runs");
         assert!(result.is_error, "a non-zero exit is a failed call");
-        let Some(crate::frontend::ToolOutputMetadata::CommandExit { exit_code, signal }) =
-            result.frontend_metadata
+        let text = result.text_content();
+        let Some(crate::frontend::ToolOutputMetadata::CommandExit {
+            exit_code,
+            signal,
+            reason,
+            closing,
+        }) = result.frontend_metadata
         else {
             panic!(
                 "expected CommandExit metadata; got {:?}",
@@ -1467,6 +1556,16 @@ mod tests {
         };
         assert_eq!(exit_code, Some(42));
         assert_eq!(signal, None, "a clean exit carries no signal");
+        assert_eq!(
+            reason, None,
+            "Meka ended nothing, so there is no reason to give"
+        );
+        let closing = closing.expect("the text ends on the exit line");
+        assert_eq!(closing, format!("\n{}", exit_line(42)));
+        assert!(
+            text.ends_with(&closing),
+            "the closing words are the text's own: {text}"
+        );
     }
 
     /// A read can end partway through a multi-byte character. Relaying the raw bytes would show
@@ -1735,13 +1834,22 @@ mod tests {
             !text.contains("NEVER-REACHED"),
             "the command was stopped rather than run to its end"
         );
-        let Some(crate::frontend::ToolOutputMetadata::CommandExit { exit_code, signal }) =
-            result.frontend_metadata
+        let Some(crate::frontend::ToolOutputMetadata::CommandExit {
+            exit_code,
+            signal,
+            reason,
+            ..
+        }) = result.frontend_metadata
         else {
             panic!("expected CommandExit metadata");
         };
         assert_eq!(exit_code, None, "a killed command has no exit code");
         assert_eq!(signal.as_deref(), Some("SIGKILL"));
+        assert_eq!(
+            reason,
+            Some(output_bound_reason()),
+            "a frontend showing the output it streamed is told why the command ended"
+        );
     }
 
     /// A child exits once its last write fits in the pipe, so it can finish within a pipe's worth
@@ -1767,13 +1875,22 @@ mod tests {
             text.starts_with(&format!("{}\nprinted before the cut\n", output_cut_note())),
             "the cut leads and the output follows: {text}"
         );
-        let Some(crate::frontend::ToolOutputMetadata::CommandExit { exit_code, signal }) =
-            result.frontend_metadata
+        let Some(crate::frontend::ToolOutputMetadata::CommandExit {
+            exit_code,
+            signal,
+            reason,
+            ..
+        }) = result.frontend_metadata
         else {
             panic!("expected CommandExit metadata");
         };
         assert_eq!(exit_code, Some(0), "the real exit status is still reported");
         assert_eq!(signal, None);
+        assert_eq!(
+            reason,
+            Some(output_cut_note()),
+            "and the cut is said beside it"
+        );
     }
 
     /// End to end, a command whose output ends within a pipe's worth past the bound may exit
@@ -1879,6 +1996,20 @@ mod tests {
         assert!(
             text.contains("kept the output pipe open"),
             "and the result says the drain stopped early: {text}"
+        );
+        let Some(crate::frontend::ToolOutputMetadata::CommandExit {
+            closing: Some(closing),
+            ..
+        }) = result.frontend_metadata
+        else {
+            panic!(
+                "the note is carried beside the exit: {:?}",
+                result.frontend_metadata
+            );
+        };
+        assert!(
+            closing.contains("kept the output pipe open") && text.ends_with(&closing),
+            "a frontend showing what it streamed is handed the note the text ends on: {closing}"
         );
     }
 

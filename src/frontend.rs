@@ -556,6 +556,9 @@ pub(crate) enum FrontendEvent {
         /// output per tool, e.g. wrapping `shell_execute` output in a console code block.
         name: String,
         is_error: bool,
+        /// What the call's result holds once its round has settled it, as the conversation records
+        /// it: an output its call saved to an entry is the reference to that entry, and one too
+        /// large to keep inline the large output naming the entry that holds it whole.
         content: Vec<crate::conversation::ToolResultContent>,
         /// Tool-specific structured side-channel. The file, memory and skill tools that change an
         /// entry populate [`ToolOutputMetadata::Diff`] so a frontend can draw the change. `None`
@@ -675,9 +678,16 @@ pub(crate) enum ToolOutputMetadata {
     /// for the model, but a frontend rendering a terminal needs it as a number, and parsing it back
     /// out of the prose would be a guess. `exit_code == None` with a `signal` means the process was
     /// killed; both `None` means it never got far enough to have either (timeout, spawn failure).
+    /// `reason` and `closing` are what the result's text says around the command's own output,
+    /// which a frontend showing the output it streamed, rather than the result's text, has nowhere
+    /// else to read: `reason` why Meka ended the command or cut its output, when it did, which
+    /// the text opens with; `closing` what the text adds after the output, the line for an exit
+    /// other than 0 and the note that the output's pipe was left open, as the text carries them.
     CommandExit {
         exit_code: Option<i32>,
         signal: Option<String>,
+        reason: Option<String>,
+        closing: Option<String>,
     },
     /// The call went to the background: the task it runs as, and the sub-agent the task drives
     /// when it runs one. A screen draws the call from these rather than from the answer's words.

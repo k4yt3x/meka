@@ -319,7 +319,11 @@ pub(crate) async fn run_oneshot(
     let signaled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     install_interrupt_handler(
         cancel.clone(),
-        &agent,
+        agent.store(),
+        {
+            let tasks = agent.background_tasks();
+            move || tasks.clone()
+        },
         // The note is said in the screen's voice; here it is a log line, and reads as one.
         |note: &str| tracing::warn!("{line}", line = crate::text::as_log_line(note)),
         || {

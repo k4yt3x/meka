@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -36,7 +36,6 @@ use crate::{
     config::PromptPadding,
     frontend::{ElicitationKind, ElicitationPrompt, ElicitationResponse},
     host::terminal::{Escalation, INTERRUPT_RELAY, escalation_for},
-    permission::SharedPermission,
     render::tui::{self as draw, TEXT_EDGE, gray},
     store::inbox::InboxClass,
     streams::capture,
@@ -133,23 +132,20 @@ pub(crate) struct ScreenLaunch {
     /// `tracing` lines, routed here by the relay so none lands on the terminal.
     pub(crate) logs: crate::relay::ScreenLogs,
     pub(crate) transcript: Transcript,
-    pub(crate) shared_permission: SharedPermission,
     pub(crate) sandbox_state: crate::sandbox::SandboxState,
-    pub(crate) cwd: crate::workspace::SharedCwd,
     /// Where Meka was started, which is what a bare `/cd` returns to.
     pub(crate) launch_cwd: PathBuf,
     /// What the status row shows, in order.
     pub(crate) status_row: Vec<crate::config::StatusFact>,
-    /// The context gauge's two cells: tokens used and the window, when the status row shows it.
-    pub(crate) context: Option<(Arc<AtomicU64>, Arc<AtomicU64>)>,
     pub(crate) recall: Option<crate::store::recall::RecallStore>,
     pub(crate) completer: Completer,
     pub(crate) skill_roots: Vec<PathBuf>,
-    pub(crate) current_profile: Arc<std::sync::RwLock<String>>,
     pub(crate) configured_profiles: Vec<crate::config::ProfileSummary>,
     pub(crate) schedule: crate::config::ResolvedScheduleConfig,
     pub(crate) store: crate::store::Store,
-    pub(crate) agent: Arc<crate::agent::Agent>,
+    /// The session on screen, whose cells the status row, the pickers and the commands the screen
+    /// answers read and move.
+    pub(crate) agent: super::SharedAgent,
     /// The sub-agents running in this process, for the status row.
     pub(crate) running_subagents: crate::session::RunningSubagents,
     pub(crate) cancel: crate::host::CancelCell,
@@ -426,6 +422,9 @@ struct Screen {
     log_ring: std::collections::VecDeque<crate::relay::LogLine>,
     /// Whether the host is answering something the screen sent it, and since when.
     busy: Option<Instant>,
+    /// The host is answering a `/resume` that names a session: until it is done, the session on
+    /// screen may be the one being let go, so a prompt sent now waits for the answer.
+    switching: bool,
     /// What the agent is doing, as the stream last said; the working row's word.
     activity: view::Activity,
     /// A compaction is running: the word while the stream says nothing more specific, since the
@@ -511,6 +510,7 @@ impl Screen {
             shell: None,
             next_shell_run: 0,
             followups: std::collections::VecDeque::new(),
+            switching: false,
             invoked_with: Vec::new(),
             hint: None,
             question_opened: None,
@@ -545,7 +545,7 @@ impl Screen {
         if self.history_loading || !self.launch.transcript.has_more_above() {
             return;
         }
-        let Some(session_id) = self.launch.agent.session_id() else {
+        let Some(session_id) = self.launch.agent.get().session_id() else {
             return;
         };
         let before = match self.launch.transcript.window_floor() {
@@ -606,7 +606,7 @@ impl Screen {
             return;
         }
         let (Some(session_id), Some(ceiling), Some(through)) = (
-            self.launch.agent.session_id(),
+            self.launch.agent.get().session_id(),
             self.launch.transcript.window_ceiling(),
             self.launch.transcript.log_end(),
         ) else {
@@ -667,6 +667,8 @@ impl Screen {
         // Before a followup is handed over, which is sent for the next turn.
         self.launch.transcript.settle_unopened_prompts();
         self.busy = None;
+        self.switching = false;
+        self.launch.transcript.settle_switch();
         self.activity = view::Activity::Working;
         self.compacting = false;
         if self.wake_pending {
@@ -686,7 +688,7 @@ impl Screen {
 
     /// The log changed under the screen: read its end again and show the last page.
     fn reload(&mut self) {
-        let Some(session_id) = self.launch.agent.session_id() else {
+        let Some(session_id) = self.launch.agent.get().session_id() else {
             self.launch.transcript.reset(None);
             self.viewport.scroll_to_bottom();
             return;
@@ -777,7 +779,8 @@ impl Screen {
         if self.composer.text().starts_with("/skill") {
             self.refresh_skill_names();
         }
-        self.composer.suggest(&self.launch.completer);
+        self.composer
+            .suggest(&self.launch.completer, &self.launch.agent.get().cells().cwd);
     }
 
     /// What a command has to say back in Meka's voice that is not a fact of the session: a
@@ -851,7 +854,7 @@ impl Screen {
                 return;
             }
         };
-        let current = self.launch.agent.session_id();
+        let current = self.launch.agent.get().session_id();
         let now = chrono::Utc::now();
         let offered: Vec<(&crate::store::SessionSummary, String, String, String)> = sessions
             .iter()
@@ -980,23 +983,26 @@ impl Screen {
     }
 
     fn context_gauge(&self) -> Option<String> {
-        let (tokens, window) = self.launch.context.as_ref()?;
-        super::view::context_gauge_text(
-            tokens.load(std::sync::atomic::Ordering::Relaxed),
-            window.load(std::sync::atomic::Ordering::Relaxed),
-        )
+        let (tokens, window) = self.launch.agent.get().context_usage();
+        super::view::context_gauge_text(tokens, window)
+    }
+
+    /// The name of the profile the session on screen names, whether or not a fallback serves in
+    /// its place.
+    fn profile_name(&self) -> String {
+        self.launch.agent.get().cells().profile.named().profile
     }
 
     /// The profile the session runs on, by name, for the status row.
     fn profile_fact(&self) -> Option<String> {
-        let name = crate::sync::read(&self.launch.current_profile).clone();
+        let name = self.profile_name();
         (!name.is_empty()).then_some(name)
     }
 
     /// The model the session's profile runs, for the status row; `None` for a profile whose
     /// model the config leaves to the backend.
     fn model_fact(&self) -> Option<String> {
-        let name = crate::sync::read(&self.launch.current_profile).clone();
+        let name = self.profile_name();
         self.launch
             .configured_profiles
             .iter()
@@ -1447,22 +1453,30 @@ impl Screen {
     }
 
     fn set_permission(&mut self, level: crate::permission::Permission) {
-        match self.launch.shared_permission.try_set(level) {
+        let agent = self.launch.agent.get();
+        match agent.cells().permission.try_set(level) {
             Ok(()) => {
                 self.push(Item::note(format!("Permission level set to: {level}")));
-                self.send_host(HostEvent::PermissionChanged(level));
+                self.send_host(HostEvent::PermissionChanged {
+                    session: agent.cells().session_id.clone(),
+                    level,
+                });
             }
             Err(error) => self.reply(error.to_string()),
         }
     }
 
     fn set_approvals(&mut self, approvals: bool) {
-        self.launch.shared_permission.set_approvals(approvals);
+        let agent = self.launch.agent.get();
+        agent.cells().permission.set_approvals(approvals);
         self.push(Item::note(format!(
             "Approvals set to: {}",
             if approvals { "on" } else { "off" }
         )));
-        self.send_host(HostEvent::ApprovalsChanged(approvals));
+        self.send_host(HostEvent::ApprovalsChanged {
+            session: agent.cells().session_id.clone(),
+            approvals,
+        });
     }
 
     fn decide(&mut self, request: ApprovalRequest, decision: ApprovalDecision) {
@@ -1700,7 +1714,8 @@ impl Screen {
             Action::PasteImage => self.attach_clipboard_image(),
             Action::Complete => {
                 self.refresh_skill_names();
-                self.composer.complete(&self.launch.completer);
+                self.composer
+                    .complete(&self.launch.completer, &self.launch.agent.get().cells().cwd);
             }
             Action::PickPrevious => match self.overlay.as_mut() {
                 Some(Overlay::Panel { panel, .. }) => panel.pick_previous(),
@@ -1822,12 +1837,16 @@ impl Screen {
     }
 
     fn cycle_permission(&mut self) {
-        let level = self.launch.shared_permission.cycle();
+        let agent = self.launch.agent.get();
+        let level = agent.cells().permission.cycle();
         tracing::debug!("permission cycled to {level}");
         // Recorded on the row, not just in this process's cell: a scheduled gate is re-checked at
         // fire time against the row, so a `meka serve` sharing the data directory would keep
         // firing a gate the user has just withdrawn here.
-        self.send_host(HostEvent::PermissionChanged(level));
+        self.send_host(HostEvent::PermissionChanged {
+            session: agent.cells().session_id.clone(),
+            level,
+        });
         // Re-said at the moment the user enters the read level, so a misconfigured sandbox
         // surfaces now instead of at the first `shell_execute` failure.
         if level == crate::permission::Permission::Read {
@@ -1863,12 +1882,11 @@ impl Screen {
                 }
             }
             Escalation::CancelBackgroundTasks => {
-                let stopped = self
-                    .launch
-                    .agent
+                let agent = self.launch.agent.get();
+                let stopped = agent
                     .background_tasks()
                     .stop_all(
-                        &self.launch.agent.store().background_store(),
+                        &agent.store().background_store(),
                         crate::store::background::TaskStatus::Canceled,
                     )
                     .await;
@@ -2070,16 +2088,29 @@ impl Screen {
                 Answerer::Host if self.is_busy() => {
                     self.reply(SlashCommand::busy_refusal(&line));
                 }
-                Answerer::Host => self.ask_host(HostEvent::Command(command)),
+                Answerer::Host => {
+                    self.switching = matches!(command, SlashCommand::Resume(Some(_)));
+                    if self.switching {
+                        // What opening the session says may be drawn before the switch.
+                        self.launch.transcript.expect_switch();
+                    }
+                    self.ask_host(HostEvent::Command(command));
+                }
             },
             None => self.reply(unknown_command_message(&line)),
         }
     }
 
     /// Enter while a turn runs: a steer or an interrupt goes to the inbox, where the loop reads
-    /// it; a followup waits here for the turn to end.
+    /// it; a followup waits here for the turn to end. During a switch to another session nothing
+    /// runs to steer, and the inbox the words would go to may be the session's being let go, so
+    /// they wait here too and open a turn on the session the switch ends on.
     async fn send_while_busy(&mut self, text: String) {
-        let class = self.launch.send_class;
+        let class = if self.switching {
+            InboxClass::Followup
+        } else {
+            self.launch.send_class
+        };
         if class == InboxClass::Followup {
             let id = self.launch.transcript.push(Item::Prompt {
                 text: text.clone(),
@@ -2091,7 +2122,7 @@ impl Screen {
             self.followups.push_back((id, text));
             return;
         }
-        let Some(session_id) = self.launch.agent.session_id() else {
+        let Some(session_id) = self.launch.agent.get().session_id() else {
             self.reply("No active session yet");
             return;
         };
@@ -2147,7 +2178,7 @@ impl Screen {
     /// The commands the screen answers itself: what it holds the answer to, and the lists the
     /// store answers, which are reachable mid-turn because the host is not needed for them.
     async fn answer_locally(&mut self, command: SlashCommand) {
-        let session_id = self.launch.agent.session_id();
+        let session_id = self.launch.agent.get().session_id();
         match command {
             SlashCommand::Exit => self.leave(),
             SlashCommand::Log => self.open_log_panel(),
@@ -2163,7 +2194,7 @@ impl Screen {
             }
             SlashCommand::Resume(None) => self.open_session_picker(None).await,
             SlashCommand::Profile(None) => {
-                let current = crate::sync::read(&self.launch.current_profile).clone();
+                let current = self.profile_name();
                 let names: Vec<String> = self
                     .launch
                     .configured_profiles
@@ -2191,7 +2222,7 @@ impl Screen {
                 );
             }
             SlashCommand::Project(super::commands::ProjectVerb::Picker) => {
-                let current = self.launch.agent.project();
+                let current = self.launch.agent.get().project();
                 // The first row leaves the project: a row rather than a name, since no project is
                 // named by nothing. Read from the store now, so a project added since the screen
                 // opened is offered.
@@ -2224,9 +2255,10 @@ impl Screen {
                 );
             }
             SlashCommand::Permission(None) => {
-                let current = self.launch.shared_permission.get();
+                let permission = self.launch.agent.get().cells().permission.clone();
+                let current = permission.get();
                 let levels: Vec<crate::permission::Permission> =
-                    self.launch.shared_permission.enabled().iter().collect();
+                    permission.enabled().iter().collect();
                 let choices = levels
                     .iter()
                     .map(|level| Choice {
@@ -2252,7 +2284,7 @@ impl Screen {
             }
             SlashCommand::Approvals(argument) => match argument.as_deref().map(str::trim) {
                 None | Some("") => {
-                    let picked = if self.launch.shared_permission.approvals() {
+                    let picked = if self.launch.agent.get().cells().permission.approvals() {
                         0
                     } else {
                         1
@@ -2280,8 +2312,9 @@ impl Screen {
                 )),
             },
             SlashCommand::Cd(argument) => {
+                let agent = self.launch.agent.get();
                 match handle_cd(
-                    &self.launch.cwd,
+                    &agent.cells().cwd,
                     &self.launch.launch_cwd,
                     argument.as_deref().unwrap_or(""),
                 ) {
@@ -2290,7 +2323,10 @@ impl Screen {
                             "Working directory set to: {}",
                             shorten_path_with_tilde(&moved)
                         )));
-                        self.send_host(HostEvent::CwdChanged(moved));
+                        self.send_host(HostEvent::CwdChanged {
+                            session: agent.cells().session_id.clone(),
+                            path: moved,
+                        });
                     }
                     Err(message) => self.reply(message),
                 }
@@ -2318,9 +2354,9 @@ impl Screen {
                 }
             }
             SlashCommand::MemoryList => {
-                let store = Arc::clone(self.launch.agent.memories());
+                let store = Arc::clone(self.launch.agent.get().memories());
                 let view = crate::store::memory::MemoryView::for_session(
-                    self.launch.agent.project().as_deref(),
+                    self.launch.agent.get().project().as_deref(),
                 );
                 match store.index(&view).await {
                     Ok(index) if index.is_empty() => self.reply("No memories"),
@@ -2341,9 +2377,9 @@ impl Screen {
                 }
             }
             SlashCommand::MemoryShow { name } => {
-                let store = Arc::clone(self.launch.agent.memories());
+                let store = Arc::clone(self.launch.agent.get().memories());
                 let view = crate::store::memory::MemoryView::for_session(
-                    self.launch.agent.project().as_deref(),
+                    self.launch.agent.get().project().as_deref(),
                 );
                 let (outcome, printed) =
                     capture(crate::cli::memory::run_show(&store, &name, &view)).await;
@@ -2478,7 +2514,12 @@ impl Screen {
                         }
                         Ok(canceled) => {
                             for task_id in &canceled {
-                                self.launch.agent.background_tasks().cancel(task_id).await;
+                                self.launch
+                                    .agent
+                                    .get()
+                                    .background_tasks()
+                                    .cancel(task_id)
+                                    .await;
                             }
                             self.push(Item::note(format!(
                                 "Canceling {}",
@@ -2533,7 +2574,7 @@ impl Screen {
             delivered: true,
             ran_under: super::model::RanUnder::Shell,
         });
-        let child = match spawn_shell_command(command, &self.launch.cwd.get()) {
+        let child = match spawn_shell_command(command, &self.launch.agent.get().cells().cwd.get()) {
             Ok(child) => child,
             Err(error) => {
                 self.reply(format!("Failed to execute command: {error}"));
@@ -2809,10 +2850,10 @@ impl Screen {
     /// longer than a frame to read, to encode and to draw; its chip, `label` until the read says
     /// better, holds its place, marked as being read, until the read answers.
     fn attach_image(&mut self, origin: ImageOrigin, label: String) {
-        if !self.launch.agent.cells().profile.current().vision {
+        if !self.launch.agent.get().cells().profile.current().vision {
             self.reply(format!(
                 "The profile '{}' does not accept images",
-                crate::sync::read(&self.launch.current_profile)
+                self.profile_name()
             ));
             return;
         }
@@ -2938,7 +2979,7 @@ impl Screen {
             return;
         }
         self.work_polled = Some(Instant::now());
-        let tasks = match self.launch.agent.session_id() {
+        let tasks = match self.launch.agent.get().session_id() {
             Some(session_id) => match self
                 .launch
                 .store
@@ -3149,11 +3190,12 @@ impl Screen {
                     height: status_height,
                     ..bottom_area
                 };
+                let agent = self.launch.agent.get();
                 let facts = StatusFacts {
                     shown: &self.launch.status_row,
-                    permission: self.launch.shared_permission.get(),
-                    path: Some(shorten_path_with_tilde(&self.launch.cwd.get())),
-                    project: self.launch.agent.project(),
+                    permission: agent.cells().permission.get(),
+                    path: Some(shorten_path_with_tilde(&agent.cells().cwd.get())),
+                    project: agent.project(),
                     profile: self.profile_fact(),
                     model: self.model_fact(),
                     context: self.context_gauge(),
@@ -3633,7 +3675,7 @@ fn draw_screen(screen: &mut Screen, terminal: &mut DefaultTerminal) {
     // would be the cleared screen while the layout ran.
     screen
         .viewport
-        .set_working_directory(screen.launch.cwd.get());
+        .set_working_directory(screen.launch.agent.get().cells().cwd.get());
     match terminal.size() {
         Ok(size) => screen
             .viewport

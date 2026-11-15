@@ -29,8 +29,12 @@ pub(super) fn spawn(state: Arc<super::ServerState>) -> tokio::task::JoinHandle<(
 
     // Re-asked every sweep, so a session opened or closed since the last tick is accounted for
     // without the scheduler holding a stale snapshot. The map is keyed by the session's uuid in
-    // string form (every insertion site derives the key from `session_uuid.to_string()`), so this
-    // needs no lock on any session's runtime.
+    // string form (every insertion site derives the key from `session_uuid.to_string()`), so
+    // finding the session needs no lock on any session's runtime.
+    //
+    // A session mid-turn is held over until a sweep finds it free, as `meka serve` holds one:
+    // offered now, the job's gate would run and its fire then defer behind the turn, on every
+    // sweep for as long as the turn lasts.
     let sessions = state.sessions.clone();
     let scope = SchedulerScope::Jobs(Arc::new(move |job: &crate::schedule::ScheduledJob| {
         // `try_read` rather than `read`: the map is briefly write-locked on every `session/new` and
@@ -38,7 +42,10 @@ pub(super) fn spawn(state: Arc<super::ServerState>) -> tokio::task::JoinHandle<(
         // a tick. The job stays due either way.
         sessions
             .try_read()
-            .map(|open| open.contains_key(&job.session_id.to_string()))
+            .map(|open| {
+                open.get(&job.session_id.to_string())
+                    .is_some_and(|entry| !entry.is_busy())
+            })
             .unwrap_or(false)
     }));
 

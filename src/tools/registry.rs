@@ -19,6 +19,12 @@ impl ToolRegistry {
         .expect("fixture tool name must be unique");
         self.mark_deferred(name);
     }
+
+    /// An empty registry under `tool_scope`, as a sub-agent's starts.
+    #[cfg(unix)]
+    pub(crate) fn scoped_for_test(tool_scope: ToolScope) -> Self {
+        Self::new_with_filter_and_scope(BuiltinToolFilter::default(), tool_scope)
+    }
 }
 use crate::provider::DeferredToolDelivery;
 pub(crate) use crate::provider::{LOAD_TOOL_NAME, SEARCH_TOOL_NAME, is_discovery_tool};
@@ -506,10 +512,10 @@ pub(crate) fn warn_on_stale_subagent_config(scope: &ToolScope, configured_server
     }
 }
 pub(super) type ToolSet = Arc<std::sync::RwLock<Registered>>;
-/// Tool registry. Backed by an `Arc<RwLock<Vec<Arc<dyn Tool>>>>` so MCP notification handlers can
-/// swap a server's tools in place on `tools/list_changed`. Individual registrations only hold the
-/// write lock briefly; dispatch clones the matching `Arc<dyn Tool>` out of the lock before awaiting
-/// `execute`, so no lock is held across `.await`.
+/// Tool registry. Backed by a [`ToolSet`] so MCP notification handlers can replace a server's
+/// tools on `tools/list_changed`. Individual registrations only hold the write lock briefly;
+/// dispatch clones the matching `Arc<dyn Tool>` out of the lock before awaiting `execute`, so no
+/// lock is held across `.await`.
 #[derive(Clone)]
 pub(crate) struct ToolRegistry {
     pub(super) tools: ToolSet,
@@ -554,11 +560,16 @@ pub(crate) struct ToolRegistry {
     /// Where this registry's `context_replace` lands, armed by a checkpoint turn for its duration.
     pub(super) checkpoint: context::CheckpointSlot,
 }
-/// The registered tools in registration order, each with the definition it answered when it was
-/// registered, indexed by name.
+/// The registered tools in the order a request carries them, each with the definition it answered
+/// when it was registered, indexed by name.
 ///
 /// The order is kept because the provider sees it: a stable tools array is what a cache prefix
-/// is. The index is what makes a lookup by name one hash rather than a walk, and the stored
+/// is. Tools that are not a server's ([`server_of_tool`] answers `None`) come first, in the order
+/// they were registered; a server's tools follow, sorted by name, wherever and whenever they were
+/// registered. The array is then a function of what is registered: a listing that changes nothing
+/// changes no request, and two registries holding the same tools carry the same array.
+///
+/// The index is what makes a lookup by name one hash rather than a walk, and the stored
 /// definition is what makes handing one out a clone rather than a rebuild: a built-in constructs
 /// its schema from `json!` on every `definition()` call, and a registry of a few hundred MCP tools
 /// would answer a name lookup by constructing all of them. The estimate beside each is the
@@ -588,21 +599,31 @@ impl Registered {
             .and_then(|&index| self.entries.get(index))
     }
 
-    /// Append `tool`, which the caller has checked is not registered under its name.
-    pub(super) fn push(&mut self, tool: Arc<dyn Tool>) {
+    /// Put `tool`, which the caller has checked is not registered under its name, in its place in
+    /// the order.
+    pub(super) fn insert(&mut self, tool: Arc<dyn Tool>) {
         let definition = tool.definition();
         let schema_tokens = crate::tokens::estimate_text(&definition.name)
             .saturating_add(crate::tokens::estimate_text(&definition.description))
             .saturating_add(crate::tokens::estimate_text(
                 &definition.parameters.to_string(),
             ));
-        self.by_name
-            .insert(definition.name.clone(), self.entries.len());
-        self.entries.push(RegisteredTool {
+        let is_server_tool = server_of_tool(&definition.name).is_some();
+        let index = self.entries.partition_point(|entry| {
+            let name = entry.definition.name.as_str();
+            server_of_tool(name).is_none() || (is_server_tool && name < definition.name.as_str())
+        });
+        self.by_name.insert(definition.name.clone(), index);
+        self.entries.insert(index, RegisteredTool {
             tool,
             definition,
             schema_tokens,
         });
+        for (position, entry) in self.entries.iter().enumerate().skip(index + 1) {
+            if let Some(slot) = self.by_name.get_mut(&entry.definition.name) {
+                *slot = position;
+            }
+        }
     }
 
     /// Drop every tool `keep` refuses, keeping the order of the rest.
@@ -639,10 +660,10 @@ pub(crate) struct ActiveTools {
 /// The registry's tools as one request carries them; see [`ToolRegistry::carried`].
 struct Carried<'a> {
     delivery: DeferredToolDelivery,
-    /// Every carried tool that is not deferred, in registration order, the two discovery tools
+    /// Every carried tool that is not deferred, in the registry's order, the two discovery tools
     /// among them whether or not they ride.
     active: Vec<&'a RegisteredTool>,
-    /// Every carried deferred tool, in registration order.
+    /// Every carried deferred tool, in the registry's order.
     deferred: Vec<&'a RegisteredTool>,
     /// Whether the two discovery tools ride as functions: only while something is deferred for
     /// them to find, and never on a wire whose own search item does both jobs.
@@ -728,8 +749,8 @@ impl ToolRegistry {
     }
 
     /// What this registry refuses to register. Read by the MCP installation paths so they can skip
-    /// a withheld server's discovery round trip and its resource/prompt meta-tools, rather than
-    /// each caller threading its own copy of the lists.
+    /// a withheld server's listing and its resource/prompt meta-tools, rather than each caller
+    /// threading its own copy of the lists.
     pub(crate) fn tool_scope(&self) -> &ToolScope {
         &self.tool_scope
     }
@@ -807,16 +828,22 @@ impl ToolRegistry {
                 message: format!("tool name '{name}' is already registered"),
             });
         }
-        tools.push(tool);
+        tools.insert(tool);
         drop(tools);
         Ok(())
     }
 
-    /// Replace every tool whose name starts with `mcp__<server_name>__` with the supplied set. Used
-    /// by `MekaClientHandler::on_tool_list_changed` to hot-swap a server's tools without restarting
-    /// the agent. Deferred markers for removed tool names are cleared so the registry's deferred
-    /// set doesn't grow unbounded.
-    pub(crate) fn replace_server_tools(&self, server_name: &str, new_tools: Vec<Arc<dyn Tool>>) {
+    /// Replace every tool whose name starts with `mcp__<server_name>__`, and every deferred mark of
+    /// such a name, with `new_tools` and the marks `deferred` names: one listing, applied in one
+    /// step under both locks, so no request is built from the new tools without their marks. The
+    /// tools take their places in [`Registered`]'s order, so a listing that changes nothing changes
+    /// no request.
+    pub(crate) fn replace_server_tools(
+        &self,
+        server_name: &str,
+        new_tools: Vec<Arc<dyn Tool>>,
+        deferred: &[String],
+    ) {
         // Filter here rather than only at the call sites: a `tools/list_changed` notification
         // arriving mid-run goes through this same path, so a denied server would otherwise walk its
         // tools back in the moment it re-advertised them.
@@ -829,24 +856,23 @@ impl ToolRegistry {
                 .collect()
         };
         let prefix = format!("mcp__{server_name}__");
+        // In the order `active_tools` and `tool_catalog` take them, so neither side can hold one
+        // while it waits for the other.
+        let mut marks = crate::sync::write(&self.deferred);
         let mut tools = crate::sync::write(&self.tools);
-        let removed: Vec<String> = tools
-            .names()
-            .filter(|name| name.starts_with(&prefix))
-            .map(str::to_string)
-            .collect();
         tools.retain(|definition| !definition.name.starts_with(&prefix));
         for tool in new_tools {
-            tools.push(tool);
+            tools.insert(tool);
         }
+        marks.retain(|name| !name.starts_with(&prefix));
+        marks.extend(
+            deferred
+                .iter()
+                .filter(|name| self.tool_scope.admits_tool(name))
+                .cloned(),
+        );
         drop(tools);
-
-        if !removed.is_empty() {
-            let mut deferred = crate::sync::write(&self.deferred);
-            for name in &removed {
-                deferred.remove(name);
-            }
-        }
+        drop(marks);
     }
 
     /// Register just `tool_load`, for tests that exercise its unfindable-name path against a real
@@ -982,29 +1008,26 @@ impl ToolRegistry {
     /// Claude provider's cache layout). `loaded` must be in load order (see
     /// [`crate::tools::load_tool::extract_loaded_tool_names_from_events`]).
     ///
-    /// Emits always-active tools first in registration order, then loaded-deferred tools in the
+    /// Emits always-active tools first in [`Registered`]'s order, then loaded-deferred tools in the
     /// order they were loaded. Both halves grow only at the tail as a session proceeds, which is
     /// what keeps this array a stable cache prefix: `tool_load` only ever appends to the
     /// conversation, so the second half only ever gains entries.
     ///
-    /// Filtering the registration-ordered list in place would *not* be append-only. With tools
-    /// registered `[a, b]`, loading `b` then `a` yields `[b]` and then `[a, b]`, inserting `a`
-    /// ahead of `b`. The array precedes every message, so that edit re-caches the whole
-    /// conversation.
+    /// Filtering the registry's list in place would *not* be append-only. With tools registered
+    /// `[a, b]`, loading `b` then `a` yields `[b]` and then `[a, b]`, inserting `a` ahead of `b`.
+    /// The array precedes every message, so that edit re-caches the whole conversation.
     ///
-    /// The one thing that does disturb the first half is [`Self::replace_server_tools`], which
-    /// removes an MCP server's tools and re-appends the new set at the tail. That genuinely
-    /// rewrites part of the array and cannot be avoided when a server withdraws a tool, but it is
-    /// confined here: the system prompt ahead of the array is unaffected, so the blast radius is
-    /// the array rather than the whole conversation.
+    /// The one thing that does disturb the first half is [`Self::replace_server_tools`], when an
+    /// MCP server's listing adds or withdraws a tool: the tool joins or leaves its place by name,
+    /// which rewrites the array from there on. A listing that changes nothing leaves it as it was.
     #[cfg(test)]
     pub(crate) fn definitions_active_with_loaded(&self, loaded: &[String]) -> Vec<ToolDefinition> {
         self.active_tools(loaded).definitions
     }
 
     /// The tools a request carries, by the wire's delivery. Every tool that is not deferred, in
-    /// registration order; then, on a wire that appends, the deferred ones `loaded` names in the
-    /// order they were loaded, so a replay of the same conversation builds the same array. On a
+    /// [`Registered`]'s order; then, on a wire that appends, the deferred ones `loaded` names in
+    /// the order they were loaded, so a replay of the same conversation builds the same array. On a
     /// wire that declares, every deferred tool rides separately as a deferred definition whatever
     /// `loaded` holds, and `loaded` only prices the gauge. With what their schemas cost.
     ///
@@ -2368,6 +2391,189 @@ mod tests {
         ]);
     }
 
+    /// A registry holding only compaction's plumbing, on a wire that declares its deferred tools,
+    /// so a request carries every eager tool in its tools array and every deferred one beside it.
+    fn declaring_registry() -> ToolRegistry {
+        let registry = ToolRegistry::new();
+        registry.publish_profile(&crate::provider::PublishedProfile::detached(
+            &crate::provider::ResolvedProfile {
+                provider: Arc::new(
+                    crate::provider::mock::MockProvider::from_rounds(Vec::new())
+                        .delivering(crate::provider::DeferredToolDelivery::Referenced),
+                ),
+                profile: "test".to_string(),
+                context_window: 1_000,
+                vision: true,
+                max_output_tokens: None,
+            },
+        ));
+        registry
+    }
+
+    /// Apply `server`'s listing, its `eager` and `deferred` tools named bare, in that order.
+    fn list_server(registry: &ToolRegistry, server: &str, eager: &[&str], deferred: &[&str]) {
+        let namespaced = |tool: &&str| format!("mcp__{server}__{tool}");
+        let tools = eager
+            .iter()
+            .chain(deferred)
+            .map(|tool| {
+                Arc::new(StubTool {
+                    name: namespaced(tool),
+                }) as Arc<dyn Tool>
+            })
+            .collect();
+        let deferred: Vec<String> = deferred.iter().map(namespaced).collect();
+        registry.replace_server_tools(server, tools, &deferred);
+    }
+
+    /// The names a request carries, in its order: the tools array, then the deferred declarations.
+    fn carried_names(registry: &ToolRegistry) -> (Vec<String>, Vec<String>) {
+        let carried = registry.active_tools(&[]);
+        let names = |definitions: Vec<ToolDefinition>| {
+            definitions
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect()
+        };
+        (
+            names(carried.definitions),
+            names(carried.deferred_definitions),
+        )
+    }
+
+    /// The arrays a request carries do not depend on which server answered first, nor on the
+    /// order a server lists its own tools in.
+    #[test]
+    fn two_servers_listed_in_either_order_carry_the_same_tools_arrays() {
+        let alpha_first = declaring_registry();
+        list_server(&alpha_first, "alpha", &["search", "fetch"], &["write"]);
+        list_server(&alpha_first, "beta", &["query"], &["delete", "create"]);
+        let beta_first = declaring_registry();
+        list_server(&beta_first, "beta", &["query"], &["delete", "create"]);
+        list_server(&beta_first, "alpha", &["search", "fetch"], &["write"]);
+
+        let expected = (
+            vec![
+                "context_replace".to_string(),
+                "mcp__alpha__fetch".to_string(),
+                "mcp__alpha__search".to_string(),
+                "mcp__beta__query".to_string(),
+            ],
+            vec![
+                "mcp__alpha__write".to_string(),
+                "mcp__beta__create".to_string(),
+                "mcp__beta__delete".to_string(),
+            ],
+        );
+        assert_eq!(carried_names(&alpha_first), expected);
+        assert_eq!(carried_names(&beta_first), expected);
+    }
+
+    /// A reconnect, a change notice or a policy reload that lists a server's tools as they were
+    /// leaves every request as it was, whichever server it is and whoever registered after it.
+    #[test]
+    fn listing_a_server_s_unchanged_tools_again_leaves_the_tools_arrays_as_they_were() {
+        let registry = declaring_registry();
+        list_server(&registry, "alpha", &["search"], &["write"]);
+        list_server(&registry, "beta", &["query"], &["delete"]);
+        let before = carried_names(&registry);
+        list_server(&registry, "alpha", &["search"], &["write"]);
+        assert_eq!(carried_names(&registry), before);
+
+        list_server(&registry, "gamma", &["read"], &["send"]);
+        let before = carried_names(&registry);
+        list_server(&registry, "alpha", &["search"], &["write"]);
+        list_server(&registry, "beta", &["query"], &["delete"]);
+        assert_eq!(carried_names(&registry), before);
+    }
+
+    /// A listing that adds a tool puts it in its place by name, and one that drops a tool leaves
+    /// the rest in their order: no other tool moves either way.
+    #[test]
+    fn a_listing_that_adds_or_drops_a_tool_moves_no_other() {
+        let registry = declaring_registry();
+        list_server(&registry, "alpha", &["b", "d"], &[]);
+        list_server(&registry, "beta", &["x"], &[]);
+
+        list_server(&registry, "alpha", &["b", "c", "d"], &[]);
+        assert_eq!(carried_names(&registry).0, [
+            "context_replace",
+            "mcp__alpha__b",
+            "mcp__alpha__c",
+            "mcp__alpha__d",
+            "mcp__beta__x",
+        ]);
+
+        list_server(&registry, "alpha", &["d", "b"], &[]);
+        assert_eq!(carried_names(&registry).0, [
+            "context_replace",
+            "mcp__alpha__b",
+            "mcp__alpha__d",
+            "mcp__beta__x",
+        ]);
+    }
+
+    /// Tools that are not a server's come first, in the order they were registered, even one
+    /// registered after a server's tools arrived.
+    #[test]
+    fn a_tool_that_is_not_a_server_s_precedes_every_server_s_in_registration_order() {
+        let registry = declaring_registry();
+        registry
+            .register(Arc::new(StubTool {
+                name: "zeta_local".to_string(),
+            }))
+            .expect("register");
+        list_server(&registry, "alpha", &["search"], &[]);
+        registry
+            .register(Arc::new(StubTool {
+                name: "alpha_local".to_string(),
+            }))
+            .expect("register");
+
+        assert_eq!(carried_names(&registry).0, [
+            "context_replace",
+            "zeta_local",
+            "alpha_local",
+            "mcp__alpha__search",
+        ]);
+    }
+
+    /// A listing replaces a server's deferred marks with its tools: each name it defers is
+    /// deferred and no other of that server is, a tool it turns eager loses its mark, and a tool
+    /// it drops leaves no mark behind.
+    #[test]
+    fn a_listing_replaces_a_server_s_deferred_marks_with_its_tools() {
+        let registry = declaring_registry();
+        list_server(&registry, "alpha", &["search"], &["write", "delete"]);
+        assert_eq!(
+            carried_names(&registry),
+            (
+                vec![
+                    "context_replace".to_string(),
+                    "mcp__alpha__search".to_string()
+                ],
+                vec![
+                    "mcp__alpha__delete".to_string(),
+                    "mcp__alpha__write".to_string()
+                ],
+            )
+        );
+
+        list_server(&registry, "alpha", &["search", "write"], &[]);
+        assert_eq!(
+            carried_names(&registry),
+            (
+                vec![
+                    "context_replace".to_string(),
+                    "mcp__alpha__search".to_string(),
+                    "mcp__alpha__write".to_string()
+                ],
+                Vec::new(),
+            )
+        );
+        assert!(!registry.is_deferred("mcp__alpha__delete"));
+    }
+
     /// The active tool set is byte-identical at every permission level, which is what lets the
     /// Claude prompt-cache prefix survive a mid-session Shift+Tab. This is the property
     /// `Permission::allows` is shaped around: `Workspace` and `Unrestricted` are deliberately equal
@@ -3332,8 +3538,8 @@ mod tests {
         );
     }
 
-    /// A denied server's tools never reach the registry even when handed to it directly, which is
-    /// the path a mid-run `tools/list_changed` takes.
+    /// A denied server's tools, and their deferred marks, never reach the registry even when
+    /// handed to it directly, which is the path a mid-run `tools/list_changed` takes.
     #[tokio::test]
     async fn subagent_denied_server_tools_are_dropped_on_replace() {
         let registry = subagent_registry(
@@ -3341,14 +3547,24 @@ mod tests {
             crate::config::MemoryAccess::Write,
         )
         .await;
-        registry.replace_server_tools("blocked", vec![Arc::new(StubTool {
-            name: "mcp__blocked__send".to_string(),
-        })]);
-        registry.replace_server_tools("allowed", vec![Arc::new(StubTool {
-            name: "mcp__allowed__send".to_string(),
-        })]);
+        registry.replace_server_tools(
+            "blocked",
+            vec![Arc::new(StubTool {
+                name: "mcp__blocked__send".to_string(),
+            })],
+            &["mcp__blocked__send".to_string()],
+        );
+        registry.replace_server_tools(
+            "allowed",
+            vec![Arc::new(StubTool {
+                name: "mcp__allowed__send".to_string(),
+            })],
+            &["mcp__allowed__send".to_string()],
+        );
         assert!(registry.get("mcp__blocked__send").is_none());
+        assert!(!registry.is_deferred("mcp__blocked__send"));
         assert!(registry.get("mcp__allowed__send").is_some());
+        assert!(registry.is_deferred("mcp__allowed__send"));
     }
 
     /// The refresh door asks the same predicate as registration: a server outside the allow-list,
@@ -3368,17 +3584,25 @@ mod tests {
             crate::config::MemoryAccess::Write,
         )
         .await;
-        registry.replace_server_tools("other", vec![Arc::new(StubTool {
-            name: "mcp__other__send".to_string(),
-        })]);
-        registry.replace_server_tools("allowed", vec![
-            Arc::new(StubTool {
-                name: "mcp__allowed__send".to_string(),
-            }),
-            Arc::new(StubTool {
-                name: "mcp__allowed__delete".to_string(),
-            }),
-        ]);
+        registry.replace_server_tools(
+            "other",
+            vec![Arc::new(StubTool {
+                name: "mcp__other__send".to_string(),
+            })],
+            &[],
+        );
+        registry.replace_server_tools(
+            "allowed",
+            vec![
+                Arc::new(StubTool {
+                    name: "mcp__allowed__send".to_string(),
+                }),
+                Arc::new(StubTool {
+                    name: "mcp__allowed__delete".to_string(),
+                }),
+            ],
+            &[],
+        );
         assert!(registry.get("mcp__other__send").is_none());
         assert!(registry.get("mcp__allowed__send").is_some());
         assert!(

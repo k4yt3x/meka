@@ -171,7 +171,9 @@ and all of its output. The row drops its summary once the arguments are under it
 and wrapped whole. Nothing in an expanded block is cut.
 
 A resumed session draws every call as it was drawn live: the diff, the code a command exited with
-and the checklist are recorded with each result.
+and the checklist are recorded with each result. A command whose output was too large to keep
+inline is the exception: live, its row keeps the end of what it streamed; resumed, it shows the
+opening the result keeps.
 
 - **Click** a block to toggle it. A block lights up under the mouse, which is the hint that it
   opens.
@@ -315,10 +317,12 @@ PgDn and the wheel scroll it, its footer says how many rows are above and below,
 works at any time, a turn running or not: the
 listings and pickers (`/skill`, `/memory`, `/schedule`, `/task`, `/session`, `/help`, `/log`), the
 settings (`/permission`, `/approvals`, `/cd`), `/task cancel` and `/schedule cancel`, and `/exit`.
-A command that needs the agent's turn to be over (`/compact`, `/rewind`, `/fork`, `/export`,
+A command that needs the agent's turn to be over (`/compact`, `/rewind`, `/resume <id>`, `/fork`, `/export`,
 `/title`, `/status`, `/usage`, every `/mcp` verb and prompt, `/skill <name>`,
 `/profile <name>`, `/project open <name>` and `/project close`) is refused while a turn runs, in a panel naming it: stop the turn with Esc
-first, or wait for it to end. What a command *does* (set a level, change directory,
+first, or wait for it to end. `/resume` and `/fork` are refused as well while the session
+still runs a background task or a sub-agent, which reports to the session it started in; the panel
+says how to stop them. What a command *does* (set a level, change directory,
 cancel a job) is one dimmed `•` row on the transcript. What a command has to *say back* instead, a
 refusal, a failure or an empty list, is a panel as well, closed with Esc, and leaves no row.
 `/log` opens the last few hundred log lines at every level, newest last, whatever `-v` lets onto
@@ -525,7 +529,7 @@ says so; the conversation itself stays in the store, and `meka -c` reopens it.
 Press **Esc** or **Ctrl+C** while the agent is running to interrupt it. The two keys count on one
 ladder, and presses escalate:
 
-1. The first press cancels the current turn: the request in flight is dropped and any shell command the turn spawned is killed. Background tasks keep running, because a keystroke aimed at the answer on screen should not lose a twenty-minute build.
+1. The first press cancels the current turn: the request in flight is dropped and any shell command the turn spawned is killed. A compaction the turn was running stops with it, its summary request included; a `/compact` you asked for still gets its summary. Background tasks keep running, because a keystroke aimed at the answer on screen should not lose a twenty-minute build.
 2. A second press during the same turn stops every running background task, records each as canceled, and says how many it stopped.
 3. A third press leaves, the way `/exit` does: what was canceled is given its moment to unwind, the background tasks are stopped, and the exit status is 130.
 

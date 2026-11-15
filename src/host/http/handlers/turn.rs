@@ -36,14 +36,14 @@ use uuid::Uuid;
 
 use crate::{
     agent::TurnOutcome,
-    frontend::{FrontendEvent, NoticeView},
+    frontend::NoticeView,
     host::{
         TurnGuard,
         http::{
             errors::{ErrorKind, ProblemDetail},
             feed::Opener,
             handlers::sessions::turn_in_flight_conflict,
-            http_frontend::Recorder,
+            http_frontend::TurnFacts,
             idempotency::{LookupOutcome, hash_body},
             reattach::ensure_session_loaded,
             scope,
@@ -930,17 +930,17 @@ async fn run_json_turn(
             .run_turn(&mut conversation, input, cancellation.clone())
             .await;
 
-        let recorder = entry.frontend.drain();
+        let facts = entry.frontend.drain();
         entry.touch();
         // The same terminal a streaming turn records, for the same readers.
         let (event_type, data) = terminal_event_parts(
             Ok(outcome.as_ref()),
             cancellation.reason().unwrap_or(CancelReason::Client),
-            usage_from(&recorder),
+            usage_from(&facts),
             turn_id,
             session_id,
             state.config.relay_provider_errors,
-            message_withdrawn(&recorder),
+            message_withdrawn(&facts),
             position_for_terminal(&state.shared.store, session_id).await,
             served_by_for_terminal(&state.shared.store, session_id, turn_id).await,
         );
@@ -964,7 +964,7 @@ async fn run_json_turn(
                     turn_id,
                     opened,
                     turn_outcome,
-                    &recorder,
+                    &facts,
                 )
                 .await
                 .map(Json)
@@ -981,7 +981,7 @@ async fn run_json_turn(
                 // The turn's terminal, recorded above, logged the failure.
                 let problem =
                     ProblemDetail::for_logged_error(error, state.config.relay_provider_errors);
-                Err(match message_withdrawn(&recorder) {
+                Err(match message_withdrawn(&facts) {
                     Some(withdrawn) => problem.with("message_withdrawn", withdrawn),
                     None => problem,
                 })
@@ -1111,7 +1111,7 @@ async fn run_streaming_turn(
             .run_turn(&mut conversation, input, cancel_for_task.clone())
             .await;
         entry_for_task.touch();
-        let recorder = entry_for_task.frontend.drain();
+        let facts = entry_for_task.frontend.drain();
         // Computed and recorded *here*, in the task, rather than in the response stream below.
         // In the case re-attach exists for, the client's connection has already dropped and axum
         // has discarded that stream, so a terminal event computed there would be computed for
@@ -1119,11 +1119,11 @@ async fn run_streaming_turn(
         let (event_type, data) = terminal_event_parts(
             Ok(outcome.as_ref()),
             cancel_for_task.reason().unwrap_or(CancelReason::Client),
-            usage_from(&recorder),
+            usage_from(&facts),
             turn_id,
             session_id,
             relay_for_task,
-            message_withdrawn(&recorder),
+            message_withdrawn(&facts),
             position_for_terminal(&store_for_task, session_id).await,
             served_by_for_terminal(&store_for_task, session_id, turn_id).await,
         );
@@ -1526,45 +1526,30 @@ fn finished_parts(
     (crate::host::http::sse::SseEventType::TurnFinished, data)
 }
 
-/// The turn's usage, from the events it recorded. The default when the turn never reported any
-/// (mock provider tests, refused turns, a server-shutdown cancel before the agent emitted
-/// anything).
-pub(crate) fn usage_from(recorder: &Recorder) -> UsageView {
-    recorder
-        .iter()
-        .rev()
-        .find_map(|event| {
-            if let FrontendEvent::TokenUsage(usage) = event {
-                Some(UsageView {
-                    input_tokens: usage.input_tokens,
-                    output_tokens: usage.output_tokens,
-                    cache_creation_input_tokens: usage.cache_creation_input_tokens,
-                    cache_read_input_tokens: usage.cache_read_input_tokens,
-                })
-            } else {
-                None
-            }
+/// The turn's usage, the last it reported. The default when the turn never reported any (mock
+/// provider tests, refused turns, a server-shutdown cancel before the agent emitted anything).
+pub(crate) fn usage_from(facts: &TurnFacts) -> UsageView {
+    facts
+        .usage
+        .as_ref()
+        .map(|usage| UsageView {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
         })
         .unwrap_or_default()
 }
 
-/// Whether the turn took its message back, from the events it recorded. `None` for a turn refused
+/// Whether the turn took its message back, from the facts it left. `None` for a turn refused
 /// before it began, which never added the message and so has nothing to say about it.
 ///
-/// Read from the recorder rather than kept as a flag on the frontend, because the recorder is
-/// drained before the turn and again after it, so it holds exactly this turn's events. A flag
-/// cleared on `TurnStarted` would answer for the previous turn when this one was refused ahead of
-/// that event, as the required-MCP gate refuses; here that refusal reads as no `TurnStarted` at
-/// all.
-pub(crate) fn message_withdrawn(recorder: &Recorder) -> Option<bool> {
-    recorder
-        .iter()
-        .any(|event| matches!(event, FrontendEvent::TurnStarted { .. }))
-        .then(|| {
-            recorder
-                .iter()
-                .any(|event| matches!(event, FrontendEvent::PromptWithdrawn))
-        })
+/// Read from the drained facts rather than kept as a flag on the frontend, because the facts are
+/// drained before the turn and again after it, so they hold exactly this turn's. A flag cleared on
+/// `TurnStarted` would answer for the previous turn when this one was refused ahead of that event,
+/// as the required-MCP gate refuses; here that refusal reads as no `TurnStarted` at all.
+pub(crate) fn message_withdrawn(facts: &TurnFacts) -> Option<bool> {
+    facts.started.then_some(facts.prompt_withdrawn)
 }
 
 /// What a held turn answers with once it has ended: its record and what it wrote, read back from
@@ -1575,7 +1560,7 @@ async fn turn_response(
     turn_id: Uuid,
     opened: Option<crate::store::turns::TurnRecord>,
     outcome: &TurnOutcome,
-    recorder: &Recorder,
+    facts: &TurnFacts,
 ) -> Result<TurnResponse, ProblemDetail> {
     let row = store
         .turn_store()
@@ -1586,13 +1571,7 @@ async fn turn_response(
         })?;
     // The row is best-effort, so a turn whose row could not be written, or closed, answers from
     // what its run said: the opening the feed recorded and the ending the turn emitted.
-    let ended = recorder.iter().rev().find_map(|event| match event {
-        FrontendEvent::TurnEnded {
-            turn_id: ended,
-            ending,
-        } if *ended == turn_id => Some(ending),
-        _ => None,
-    });
+    let ended = facts.endings.get(&turn_id);
     let record = match (row, opened, ended) {
         (Some(row), _, Some(ending)) if row.ended_at.is_none() => {
             row.ended(ending, chrono::Utc::now().to_rfc3339())
@@ -1617,7 +1596,7 @@ async fn turn_response(
         .into_iter()
         .map(crate::host::http::handlers::messages::history_item)
         .collect();
-    let (refusal_text, notices) = reply_parts(outcome, recorder);
+    let (refusal_text, notices) = reply_parts(outcome, facts);
     Ok(TurnResponse {
         record: crate::view::TurnView::new(&record, crate::host::http::errors::api_wording),
         refusal_text,
@@ -1627,14 +1606,13 @@ async fn turn_response(
 }
 
 /// The refusal's words, on a refusal that gave any, and the notices Meka said during the turn.
-fn reply_parts(outcome: &TurnOutcome, recorder: &Recorder) -> (Option<String>, Vec<NoticeView>) {
+fn reply_parts(outcome: &TurnOutcome, facts: &TurnFacts) -> (Option<String>, Vec<NoticeView>) {
     let refusal_text = outcome.refusal_text.clone();
-    let notices = recorder
+    let notices = facts
+        .notices
         .iter()
-        .filter_map(|event| match event {
-            FrontendEvent::Notice(notice) => Some(NoticeView::from(notice.clone())),
-            _ => None,
-        })
+        .cloned()
+        .map(NoticeView::from)
         .collect();
     (refusal_text, notices)
 }
@@ -2239,22 +2217,24 @@ mod tests {
     /// reply and said only on a refusal.
     #[test]
     fn a_reply_carries_its_notices_and_only_a_refusal_its_words() {
-        let recorder: Recorder = vec![
-            FrontendEvent::AssistantTextDelta("I cannot help with that.".into()),
-            FrontendEvent::Notice(Notice::warn("auto-denied tool")),
-        ];
+        let frontend = crate::host::http::http_frontend::HttpFrontend::new();
+        frontend.push_event(FrontendEvent::AssistantTextDelta(
+            "I cannot help with that.".into(),
+        ));
+        frontend.push_event(FrontendEvent::Notice(Notice::warn("auto-denied tool")));
+        let facts = frontend.drain();
         let refused = TurnOutcome {
             stop_reason: crate::conversation::StopReason::Refusal,
             refusal_text: Some("policy violation".into()),
         };
-        let (refusal, notices) = reply_parts(&refused, &recorder);
+        let (refusal, notices) = reply_parts(&refused, &facts);
         assert_eq!(refusal.as_deref(), Some("policy violation"));
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].level, "warn");
         assert_eq!(notices[0].text, "auto-denied tool");
         let (refusal, _) = reply_parts(
             &TurnOutcome::of(crate::conversation::StopReason::EndTurn),
-            &recorder,
+            &facts,
         );
         assert_eq!(refusal, None);
     }
@@ -2281,20 +2261,22 @@ mod tests {
             profile: None,
             usage: TurnUsage::default(),
         };
-        let recorder: Recorder = vec![FrontendEvent::TurnEnded {
+        let frontend = crate::host::http::http_frontend::HttpFrontend::new();
+        frontend.push_event(FrontendEvent::TurnEnded {
             turn_id: turn,
             ending: TurnEnding::succeeded(crate::conversation::StopReason::EndTurn, TurnUsage {
                 input_tokens: 7,
                 ..Default::default()
             }),
-        }];
+        });
+        let facts = frontend.drain();
         let answered = turn_response(
             &store,
             session,
             turn,
             Some(opened),
             &TurnOutcome::of(crate::conversation::StopReason::EndTurn),
-            &recorder,
+            &facts,
         )
         .await
         .expect("the run stands in for the row");
@@ -2308,7 +2290,7 @@ mod tests {
                 turn,
                 None,
                 &TurnOutcome::of(crate::conversation::StopReason::EndTurn),
-                &recorder
+                &facts
             )
             .await
             .is_err(),
@@ -2336,7 +2318,7 @@ mod tests {
             turn,
             None,
             &TurnOutcome::of(crate::conversation::StopReason::EndTurn),
-            &recorder,
+            &facts,
         )
         .await
         .expect("the row with the run's ending");

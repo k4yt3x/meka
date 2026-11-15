@@ -2549,8 +2549,9 @@ impl Agent {
         }
     }
 
-    /// Run the round's tool calls, size their results, read what arrived while they ran, and
-    /// persist the round as one unit with the assistant message that opened it.
+    /// Run the round's tool calls, size their results and announce each call's end with what its
+    /// result then holds, read what arrived while they ran, and persist the round as one unit with
+    /// the assistant message that opened it.
     async fn run_tool_round(
         &self,
         messages: &mut Conversation,
@@ -2560,7 +2561,7 @@ impl Agent {
         mut round_events: Vec<crate::store::RecordedEvent>,
     ) -> Result<()> {
         let session_id = run.session_id;
-        let (mut tool_results, tool_durations, inline_results) = self
+        let (mut tool_results, tool_durations, inline_results, completions) = self
             .execute_tool_calls(
                 assistant_message,
                 loaded,
@@ -2597,6 +2598,7 @@ impl Agent {
         {
             tracing::warn!("failed to persist oversized tool results: {error}");
         }
+        self.announce_completions(&tool_results, completions).await;
 
         // The round boundary is where what arrived while the tools ran is read: after the
         // results, in the same user message, which every wire accepts and which keeps the cache
@@ -10070,6 +10072,85 @@ mod tests {
             "the retry sent {} messages against the original's {}; compaction achieved nothing",
             requests[1].messages.len(),
             requests[0].messages.len(),
+        );
+    }
+
+    /// A stop during an emergency compaction's summarizer call ends the call: the compaction is
+    /// incidental to the work the stop ended, so its summary is neither waited out nor paid for,
+    /// and the turn ends as stopped. The reply is held on a gate the test opens only once the turn
+    /// has been polled after the stop, so a summary that arrived would be on the compaction's
+    /// record.
+    #[tokio::test]
+    async fn a_stop_during_an_emergency_summary_ends_the_call_and_the_turn() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let gate = CancellationToken::new();
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![MockEvent::FailContextOverflow {
+                message: "prompt is too long: 250000 tokens > 200000 maximum".to_string(),
+            }],
+            vec![
+                MockEvent::Hold { gate: gate.clone() },
+                MockEvent::Text {
+                    text: "a summary nobody waits for".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+        ]));
+        let (agent, store) =
+            agent_that_compacts_for_test(Arc::clone(&provider) as Arc<dyn Provider>).await;
+        let mut messages = Conversation::new();
+        for round in 0..4 {
+            messages.append(Message::user(format!("question {round}")));
+            messages.append(Message::assistant_text(format!("answer {round}")));
+        }
+
+        let cancellation = crate::agent::TurnCancellation::new();
+        let stop = async {
+            while provider.completions().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            cancellation.cancel(CancelReason::Client);
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            gate.cancel();
+        };
+        let (outcome, ()) = tokio::join!(
+            agent.run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("summarize the log".to_string(), Vec::new())
+                    .expect("a prompt"),
+                cancellation.clone(),
+            ),
+            stop
+        );
+        assert!(
+            matches!(outcome, Err(MekaError::Interrupted)),
+            "the turn ends as stopped: {outcome:?}"
+        );
+        let session_id = agent.session_id().expect("the turn's session");
+        let stopped: Vec<crate::conversation::FailedCompaction> = store
+            .load_events(session_id)
+            .await
+            .expect("events")
+            .into_iter()
+            .filter_map(|event| match event {
+                crate::conversation::Event::CompactionFailed(failure) => Some(failure),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stopped.len(), 1, "the compaction ended: {stopped:?}");
+        assert!(
+            stopped[0].error.is_none() && stopped[0].summarizer.is_empty(),
+            "stopped with no summary waited out: {stopped:?}"
+        );
+        assert_eq!(
+            provider.streams().len(),
+            1,
+            "nothing is sent after the stop"
         );
     }
 

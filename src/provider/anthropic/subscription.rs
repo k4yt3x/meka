@@ -3544,11 +3544,13 @@ mod tests {
         let before_catalog = registry.tool_catalog();
 
         // The server reconnects and advertises a different tool set.
-        registry.replace_server_tools("fs", vec![std::sync::Arc::new(
-            crate::tools::FixtureDeferredTool {
+        registry.replace_server_tools(
+            "fs",
+            vec![std::sync::Arc::new(crate::tools::FixtureDeferredTool {
                 name: "mcp__fs__new_tool".to_string(),
-            },
-        )]);
+            })],
+            &[],
+        );
 
         let after_system =
             build_system_prompt(crate::prompt::SystemPromptInputs::for_test(true, None));

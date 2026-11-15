@@ -839,9 +839,9 @@ impl Agent {
     /// the conversation records: a rewind that dropped the turn an item was added in has dropped
     /// the item, and a compaction carried the list on its boundary.
     ///
-    /// The one reset every door that rewrites the log, or swaps it for another session's, calls:
-    /// compaction, a rewind on every host, the screen's `/resume`, and a reload of what the store
-    /// holds after a failed save. A door that resets its own subset leaves the rest stale.
+    /// The one reset every door that rewrites the log calls: compaction, a rewind on every host,
+    /// and a reload of what the store holds after a failed save. A door that resets its own subset
+    /// leaves the rest stale.
     pub(crate) async fn reset_conversation_markers(
         &self,
         conversation: &crate::conversation::Conversation,
@@ -850,8 +850,20 @@ impl Agent {
         self.hydrate_checklist(conversation).await;
         self.last_accepted_len
             .store(LAST_ACCEPTED_UNKNOWN, std::sync::atomic::Ordering::Relaxed);
-        // What served the conversation is read back from its replies when next asked: they may
-        // now be another session's, or the rewrite may have taken the one last accepted here.
+        // `diagnostics.previous_message_id` and `cc_prev_req` name the response the conversation
+        // still ends on, which Claude Code reads off the last assistant message it sends. A rewrite
+        // that leaves no assistant message leaves nothing to name, the `null` and the absent
+        // segment a first request sends; one that leaves an earlier reply keeps both, since which
+        // response Claude Code names then is not known.
+        if !messages
+            .iter()
+            .any(|message| message.role == Role::Assistant)
+        {
+            *crate::sync::lock(&self.previous_message) = None;
+            *crate::sync::lock(&self.previous_request) = None;
+        }
+        // What served the conversation is read back from its replies when next asked: the rewrite
+        // may have taken the one last accepted here.
         *crate::sync::lock(&self.served_by) = None;
         *self.last_rendered_world.write().await = None;
         *crate::sync::lock(&self.context_compacted) = None;
@@ -887,16 +899,6 @@ impl Agent {
                 .emit(FrontendEvent::ChecklistUpdated { items: state.items })
                 .await;
         }
-    }
-
-    /// Serve another session from here on, one whose row holds `stats`: the counters and the
-    /// tools called become that session's, and the previous request, message and main response,
-    /// which were the last session's, go, as a resume starts without them.
-    pub(crate) fn adopt_session(&self, stats: &crate::stats::SessionStatsSnapshot) {
-        self.session_stats.adopt(stats);
-        *crate::sync::lock(&self.previous_request) = None;
-        *crate::sync::lock(&self.previous_message) = None;
-        *crate::sync::lock(&self.main_thread.last) = None;
     }
 
     /// The compaction the next request is the first to follow, if any; see
@@ -1210,6 +1212,55 @@ mod tests {
                 .is_err()
         );
         assert_eq!(conversation.as_slice(), &saved, "memory keeps the turn");
+    }
+
+    /// The previous message and request ids name a reply the conversation still holds: a rewind
+    /// that takes every reply clears both, as a first request has neither, and one that leaves a
+    /// reply keeps them.
+    #[tokio::test]
+    async fn a_rewind_that_takes_every_reply_forgets_the_previous_ids() {
+        use crate::conversation::{Conversation, Event, Message};
+        let provider: Arc<dyn Provider> =
+            Arc::new(crate::provider::mock::MockProvider::from_rounds(Vec::new()));
+        let (agent, store) = agent_for_test(provider).await;
+        for (turns, kept) in [(1, true), (2, false)] {
+            let id = store
+                .create_session(None, "test-profile".to_string())
+                .await
+                .expect("create");
+            let saved = [
+                Message::user("one?"),
+                Message::assistant_text("One."),
+                Message::user("two?"),
+                Message::assistant_text("Two."),
+            ];
+            for message in &saved {
+                store
+                    .save_event(id, &Event::Append(message.clone()), None)
+                    .await
+                    .expect("save");
+            }
+            let mut conversation =
+                Conversation::from_events(saved.iter().cloned().map(Event::Append).collect());
+            *crate::sync::lock(&agent.previous_message) = Some("msg_01last".to_string());
+            *crate::sync::lock(&agent.previous_request) = Some("req_011last".to_string());
+            let rewind = agent
+                .rewind_resident(id, &mut conversation, RewindCut::Turns(turns))
+                .await
+                .expect("rewind");
+            assert!(rewind.event.is_some(), "{turns} turn(s)");
+            let expected = |id: &str| kept.then(|| id.to_string());
+            assert_eq!(
+                *crate::sync::lock(&agent.previous_message),
+                expected("msg_01last"),
+                "{turns} turn(s)"
+            );
+            assert_eq!(
+                *crate::sync::lock(&agent.previous_request),
+                expected("req_011last"),
+                "{turns} turn(s)"
+            );
+        }
     }
 
     /// The number three separate sites divide by, pinned exactly.

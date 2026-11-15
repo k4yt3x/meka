@@ -351,6 +351,9 @@ pub(crate) struct Transcript {
     /// Bumped on every change, so the screen redraws only when something moved.
     revision: u64,
     next_id: u64,
+    /// The id of the last entry made before a switch to another session was asked for, while the
+    /// answer is awaited; see [`Self::expect_switch`].
+    switch_asked_after: Option<u64>,
     /// The pictures of the images the next page of the log holds, by the hash they rest under,
     /// since a page holds an image as a reference into the store.
     pictures: std::collections::HashMap<String, crate::render::tui::Picture>,
@@ -390,6 +393,7 @@ impl Transcript {
             open_thinking: None,
             revision: 0,
             next_id: 0,
+            switch_asked_after: None,
             pictures: std::collections::HashMap::new(),
             offered_pictures: Vec::new(),
         }
@@ -762,11 +766,34 @@ impl Transcript {
         self.revision += 1;
     }
 
-    /// Let go of everything the transcript holds of the session it showed but the banner: what
-    /// switching to another session does before that session's log is read.
+    /// A switch to another session has been asked for. Until it is answered, the notices, errors
+    /// and log rows drawn are what opening that session says, and [`Self::forget_session`] keeps
+    /// them: they can be drawn before the switch lets this transcript go.
+    pub(crate) fn expect_switch(&mut self) {
+        self.switch_asked_after = Some(self.next_id);
+    }
+
+    /// The switch asked for has been answered, whichever way.
+    pub(crate) fn settle_switch(&mut self) {
+        self.switch_asked_after = None;
+    }
+
+    /// Let go of everything the transcript holds of the session it showed but the banner, and
+    /// what opening the next session has said since the switch was asked for: what switching to
+    /// another session does before that session's log is read.
     pub(crate) fn forget_session(&mut self) {
-        self.tail
-            .retain(|entry| matches!(entry.item, Item::Banner { .. }));
+        let asked_after = self.switch_asked_after.take();
+        self.tail.retain_mut(|entry| match entry.item {
+            Item::Banner { .. } => true,
+            Item::Error(_) | Item::Notice { .. } | Item::Log { .. }
+                if asked_after.is_some_and(|after| entry.id > after) =>
+            {
+                // Said of the session being opened, whose log does not record it.
+                entry.left_to_replay = false;
+                true
+            }
+            _ => false,
+        });
         self.turn_level = None;
         self.held_checklist = None;
         self.background_tasks.clear();
@@ -1747,12 +1774,39 @@ impl Transcript {
                 id,
                 is_error,
                 content,
+                metadata,
                 display,
                 ..
             } => {
                 if let Some(index) = self.tool_index(&id) {
                     if let Some(entry) = self.tail.get_mut(index) {
-                        let (text, images) = result_text(&content);
+                        let (mut text, images) = result_text(&content);
+                        // A large output's result keeps its opening, and a row that streamed the
+                        // output was showing how it ends, which is what was being read when it
+                        // finished; a replay, which streams nothing, shows the opening. What was
+                        // streamed is the command's own output, so what the result's text says
+                        // around it goes around it here too: why Meka ended the command ahead,
+                        // the words the text ends on after.
+                        if let Item::ToolCall { output, .. } = &entry.item
+                            && !output.is_empty()
+                            && content
+                                .iter()
+                                .any(|part| matches!(part, ToolResultContent::LargeOutput { .. }))
+                        {
+                            let (reason, closing) = match &metadata {
+                                Some(crate::frontend::ToolOutputMetadata::CommandExit {
+                                    reason,
+                                    closing,
+                                    ..
+                                }) => (reason.as_deref(), closing.as_deref()),
+                                _ => (None, None),
+                            };
+                            text = match reason {
+                                Some(reason) => format!("{reason}\n{output}"),
+                                None => output.clone(),
+                            };
+                            text.push_str(closing.unwrap_or_default());
+                        }
                         settle_call(&mut entry.item, text, images, is_error, display.as_ref());
                     }
                     self.touch(index);
@@ -2309,9 +2363,8 @@ fn result_text(content: &[ToolResultContent]) -> (String, usize) {
     for part in content {
         let shown = match part {
             ToolResultContent::Text { text } => std::borrow::Cow::Borrowed(text.as_str()),
-            // A large output is spilled to the scratchpad after the live screen has drawn it
-            // whole, so the opening the log keeps of it is what a replay can show of the same
-            // output.
+            // The opening a large output keeps inline, the rest being in the scratchpad. A live
+            // row that streamed the output keeps its tail instead; see `Transcript::apply`.
             ToolResultContent::LargeOutput { preview, .. } => {
                 std::borrow::Cow::Borrowed(preview.as_str())
             }
@@ -2788,6 +2841,147 @@ mod tests {
         ));
     }
 
+    /// A finished call's row keeps the tail it streamed when its result is a large output, which
+    /// keeps the opening alone, so the row still ends where the output ended. A row that streamed
+    /// nothing shows the opening, as a replay does; one closed with a result kept whole shows the
+    /// result.
+    #[test]
+    fn a_large_output_s_row_keeps_the_tail_it_streamed() {
+        let large = ToolResultContent::LargeOutput {
+            scratchpad_entry: "shell_execute_x_1".into(),
+            size_bytes: 200_000,
+            preview: "1\n2\n".into(),
+        };
+        let closed = |streamed: &str, content: Vec<ToolResultContent>| {
+            let mut transcript = transcript();
+            transcript.apply(FrontendEvent::ToolCallStarted {
+                id: "call-1".into(),
+                name: "shell_execute".into(),
+                input: serde_json::json!({"command": "seq 200000"}),
+                display_summary: None,
+                unparsed: None,
+            });
+            if !streamed.is_empty() {
+                transcript.apply(FrontendEvent::ToolCallOutputDelta {
+                    id: "call-1".into(),
+                    chunk: streamed.into(),
+                });
+            }
+            transcript.apply(FrontendEvent::ToolCallCompleted {
+                id: "call-1".into(),
+                name: "shell_execute".into(),
+                is_error: false,
+                content,
+                metadata: None,
+                display: None,
+            });
+            match items(&transcript)[0] {
+                Item::ToolCall { result, .. } => result.clone(),
+                other => panic!("a call: {other:?}"),
+            }
+        };
+        assert_eq!(
+            closed("199999\n200000\n", vec![large.clone()]).as_deref(),
+            Some("199999\n200000\n")
+        );
+        assert_eq!(closed("", vec![large]).as_deref(), Some("1\n2\n"));
+        assert_eq!(
+            closed("streamed\n", vec![ToolResultContent::Text {
+                text: "the result\n".into()
+            }])
+            .as_deref(),
+            Some("the result\n")
+        );
+    }
+
+    /// The tail a row streamed is the command's own output, so a large output's row that keeps it
+    /// is led by why Meka ended the command, as the result's text is.
+    #[test]
+    fn a_large_output_s_row_is_led_by_why_meka_ended_the_command() {
+        let mut transcript = transcript();
+        transcript.apply(FrontendEvent::ToolCallStarted {
+            id: "call-1".into(),
+            name: "shell_execute".into(),
+            input: serde_json::json!({"command": "seq 200000; sleep 60"}),
+            display_summary: None,
+            unparsed: None,
+        });
+        transcript.apply(FrontendEvent::ToolCallOutputDelta {
+            id: "call-1".into(),
+            chunk: "199999\n200000\n".into(),
+        });
+        transcript.apply(FrontendEvent::ToolCallCompleted {
+            id: "call-1".into(),
+            name: "shell_execute".into(),
+            is_error: true,
+            content: vec![ToolResultContent::LargeOutput {
+                scratchpad_entry: "shell_execute_x_1".into(),
+                size_bytes: 200_000,
+                preview: "Command timed out after 1500ms\n1\n2\n".into(),
+            }],
+            metadata: Some(crate::frontend::ToolOutputMetadata::CommandExit {
+                exit_code: None,
+                signal: None,
+                reason: Some("Command timed out after 1500ms".into()),
+                closing: Some("\n(the pipe was left open)".into()),
+            }),
+            display: None,
+        });
+        match items(&transcript)[0] {
+            Item::ToolCall { result, .. } => assert_eq!(
+                result.as_deref(),
+                Some("Command timed out after 1500ms\n199999\n200000\n\n(the pipe was left open)")
+            ),
+            other => panic!("a call: {other:?}"),
+        }
+    }
+
+    /// What is said while a switch to another session is awaited is said of the session being
+    /// opened, so it outlives the transcript the switch lets go, even when it was drawn first;
+    /// what was said before the switch was asked for goes with the session left, and a switch
+    /// that was refused keeps nothing for the next one.
+    #[test]
+    fn what_opening_a_session_says_outlives_the_switch_to_it() {
+        let warn = |text: &str| Item::Notice {
+            level: NoticeLevel::Warn,
+            text: text.to_string(),
+        };
+        let texts = |transcript: &Transcript| -> Vec<String> {
+            items(transcript)
+                .into_iter()
+                .filter_map(|item| match item {
+                    Item::Notice { text, .. } | Item::Error(text) => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut transcript = transcript();
+        transcript.push(warn("said of the session left"));
+        transcript.expect_switch();
+        transcript.push(warn("the recorded directory no longer exists"));
+        transcript.push(Item::Error("said of the opening too".to_string()));
+        transcript.push(Item::Prompt {
+            text: "typed meanwhile".to_string(),
+            class: None,
+            inbox_id: None,
+            delivered: false,
+            ran_under: RanUnder::Pending,
+        });
+        transcript.forget_session();
+        assert_eq!(texts(&transcript), [
+            "the recorded directory no longer exists",
+            "said of the opening too"
+        ]);
+        assert_eq!(items(&transcript).len(), 2, "and nothing else is kept");
+
+        // A switch that was refused is settled, and what it said goes with the session then left.
+        transcript.expect_switch();
+        transcript.push(warn("said while a refused switch was awaited"));
+        transcript.settle_switch();
+        transcript.forget_session();
+        assert!(texts(&transcript).is_empty(), "{:?}", texts(&transcript));
+    }
+
     /// A call that went to the background is drawn from what its result records, the task and the
     /// sub-agent, whatever the words it was answered with say.
     #[test]
@@ -3236,6 +3430,8 @@ mod tests {
                 Some(ToolOutputMetadata::CommandExit {
                     exit_code: Some(2),
                     signal: None,
+                    reason: None,
+                    closing: None,
                 }),
             ),
             (

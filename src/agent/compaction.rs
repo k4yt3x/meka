@@ -709,6 +709,7 @@ impl Agent {
         } else {
             match self
                 .run_checkpoint_turn(
+                    session_id,
                     &request,
                     messages,
                     cancellation.clone(),
@@ -800,14 +801,14 @@ impl Agent {
             crate::tools::checklist::replay_checklist_over(baseline, &to_summarize)
         };
 
-        // The first of the places a fired token ends an automatic compaction; the summarizer ends
-        // one that lands during its call, and the check after the summary is built catches an
-        // interrupt that lands later. This one is
-        // for a token fired before or during the checkpoint, which answers it with `Ok(None)` and
-        // would otherwise send the conversation to the summarizer: a full request paid for and
-        // then thrown away by the check below. Same exception for `Manual`, and for the same
-        // reason: `/compact` is itself the thing asked for, so an interrupt there ends the
-        // checkpoint and falls back rather than abandoning the request.
+        // The first of the places a fired token ends an automatic compaction; the summarizer's
+        // call ends on one that fires during it, and the check after the summary is built catches
+        // an interrupt that lands later. This one is for a token fired before or during the
+        // checkpoint, which answers it with `Ok(None)` and would otherwise send the conversation
+        // to the summarizer; past it, the token the summarizer's request goes out under has not
+        // fired. Same exception for `Manual`, and for the same reason: `/compact` is itself the
+        // thing asked for, so an interrupt there ends the checkpoint and falls back rather than
+        // abandoning the request.
         if request.trigger != CompactionTrigger::Manual && cancellation.is_cancelled() {
             report_checkpoint_memories(&progress.memories_written);
             return Err(MekaError::Interrupted);
@@ -925,9 +926,9 @@ impl Agent {
             .collect();
 
         // The last point before the window is destroyed, and the one that catches an interrupt
-        // arriving inside the summarizer, whose request is sent under a token nothing fires:
-        // without it a stop lands mid-summary and the conversation is replaced by a summary written
-        // without the agent.
+        // arriving once the summary is written, past the checks before it and the summarizer's
+        // own call: without it a stop that lands as the summary message is built still replaces
+        // the conversation.
         //
         // Every origin but `Manual`: a compaction the turn asked for is incidental to work the user
         // has just stopped, whereas `/compact` is itself the thing asked for, so an interrupt there
@@ -1060,18 +1061,6 @@ impl Agent {
             *crate::sync::lock(&self.context_compacted) = Some(compaction_kind);
         }
         self.arm_response_before_compaction(response_before_compaction);
-        // `diagnostics.previous_message_id` and `cc_prev_req` name the response the conversation
-        // still ends on, which Claude Code reads off the last assistant message it sends. A
-        // compaction that summarized that response leaves nothing to name, the `null` and the
-        // absent segment a first request sends; a kept tail still carries both.
-        if !messages
-            .as_slice()
-            .iter()
-            .any(|message| message.role == Role::Assistant)
-        {
-            *crate::sync::lock(&self.previous_message) = None;
-            *crate::sync::lock(&self.previous_request) = None;
-        }
 
         Ok(record)
     }
@@ -1126,8 +1115,14 @@ impl Agent {
     /// token with no signal source, and the checkpoint is the longest thing compaction does: up to
     /// `CHECKPOINT_MAX_ITERATIONS` full-conversation calls, plus a prompt, with approvals on, that
     /// blocks until a human answers.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each is a fact the checkpoint runs under, or a buffer its caller keeps"
+    )]
     pub(super) async fn run_checkpoint_turn(
         &self,
+        // The session the compaction is for, whose scratchpad a call's output is saved to.
+        session_id: Uuid,
         request: &CompactRequest,
         messages: &Conversation,
         cancellation: CancellationToken,
@@ -1293,9 +1288,12 @@ impl Agent {
             checkpoint_messages.push(assistant_message);
             let mut results = Vec::with_capacity(tool_uses.len());
             for (tool_use_id, name, input, unparsed) in tool_uses {
-                // The id a frontend shows the call under, counted over the calls it shows: every
-                // call but the one that hands the summary in, which is the compaction's own.
-                let shown_as = if name == "context_replace" {
+                // The call that hands the summary in is the compaction's own: it comes through a
+                // door of its own, is shown under no id, and what it is answered with is neither
+                // told to a frontend nor put aside.
+                let hands_in_the_summary = name == "context_replace";
+                // The id a frontend shows the call under, counted over the calls it shows.
+                let shown_as = if hands_in_the_summary {
                     tool_use_id.clone()
                 } else {
                     place += 1;
@@ -1313,7 +1311,7 @@ impl Agent {
                     // `context_replace` comes through its own door, for the reason it bypasses the
                     // permission filter in `checkpoint_tools`.
                     Some(tool) => {
-                        let door = if name == "context_replace" {
+                        let door = if hands_in_the_summary {
                             super::dispatch::CallDoor::CheckpointSubmission
                         } else {
                             super::dispatch::CallDoor::Checkpoint
@@ -1354,8 +1352,30 @@ impl Agent {
                     memories_written.push(memory.to_string());
                 }
                 let display = self.result_display(&name, &output).await;
-                let content = bound_checkpoint_result(output.content);
-                if name != "context_replace" {
+                // Saved where the call named, as a round's call's output is: the request offers the
+                // parameter, and the checkpoint is where material is put aside to outlast the
+                // window it replaces. Ahead of the bound, which is for what stays inline, so the
+                // entry holds the output whole. Never the acknowledgement of the summary, which
+                // would replace what an entry of that name holds.
+                let mut content = output.content;
+                if output.is_output
+                    && !hands_in_the_summary
+                    && let Some(entry) = crate::tools::scratchpad::requested_entry(&input)
+                    && let Err(error) = crate::tools::scratchpad::save_to_named_entry(
+                        &self.store,
+                        session_id,
+                        &self.tool_registry.inherited_scratchpad_names(),
+                        entry,
+                        &mut content,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        "failed to save a checkpoint call's output to the scratchpad: {error}"
+                    );
+                }
+                let content = bound_checkpoint_result(content);
+                if !hands_in_the_summary {
                     self.cells
                         .frontend
                         .emit(FrontendEvent::CheckpointCallCompleted {
@@ -1422,9 +1442,8 @@ impl Agent {
         &self,
         request: &CompactRequest,
         to_summarize: Vec<Message>,
-        // The caller's, so a retry between attempts is interruptible for the same reason the
-        // checkpoint's rounds are, and an automatic compaction stopped during a call asks for no
-        // second summary. Each call itself is one `complete`, which this cannot reach inside.
+        // The caller's: it ends the wait between attempts, for the same reason the checkpoint's
+        // rounds are interruptible, and the call itself unless a person asked for the compaction.
         cancellation: &CancellationToken,
         // Each reply as returned, with what its provider said about it, kept by the caller
         // whatever the summary's outcome.
@@ -1451,10 +1470,18 @@ impl Agent {
         ));
 
         // Under the profile's thinking, as every request is: the profile is what the user chose for
-        // this model, and some models answer far worse without it. Sent under a token nothing
-        // fires: the caller's may already have, and the summary is the one thing a stop must not
-        // deny. See `complete_with_retry`.
+        // this model, and some models answer far worse without it.
+        //
+        // A stop ends the call unless a person asked for the compaction: for theirs the caller's
+        // token may have fired on the checkpoint already, and the summary is the one thing a stop
+        // must not deny (see `complete_with_retry`); any other compaction is incidental to the
+        // work the stop ended, and a summary waited out would be thrown away after.
         let unfired = CancellationToken::new();
+        let attempt_cancellation = if request.trigger == CompactionTrigger::Manual {
+            &unfired
+        } else {
+            cancellation
+        };
         let mut thinking_removed = false;
         let mut asked_again = false;
         loop {
@@ -1466,7 +1493,7 @@ impl Agent {
                             .attributed(self.compaction_attribution(request)),
                         None,
                         cancellation,
-                        &unfired,
+                        attempt_cancellation,
                     )
                     .await;
                 // The thinking goes out with the rest, since leaving it out unasked would cost the
@@ -1537,9 +1564,9 @@ impl Agent {
                 }
                 return Ok(summary_text);
             }
-            // A stop that landed during the call ends an automatic compaction here, whichever
-            // request it was, rather than after a second whole one or as a failure, as the checks
-            // around the checkpoint end it.
+            // A stop that landed as the call ended ends an automatic compaction here rather than
+            // after a second whole request or as a failure, as the checks around the checkpoint
+            // end it; one that landed during the call ended the call.
             if request.trigger != CompactionTrigger::Manual && cancellation.is_cancelled() {
                 return Err(MekaError::Interrupted);
             }
@@ -2532,6 +2559,216 @@ mod tests {
             })
             .collect();
         assert!(text.contains("not available during a checkpoint"), "{text}");
+    }
+
+    /// A checkpoint whose one call, `id` to the tool `name`, sends `input`, then hands in its
+    /// summary.
+    fn a_checkpoint_calling(id: &str, name: &str, input: serde_json::Value) -> MockProvider {
+        MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::ToolUseStart {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                },
+                MockEvent::ToolUseEnd { input },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            replace_round("what was found is kept", None),
+        ])
+    }
+
+    /// The results a compaction's checkpoint recorded for the call `id`.
+    fn checkpoint_results<'a>(
+        record: &'a CompactionRecord,
+        id: &str,
+    ) -> Vec<&'a [crate::conversation::ToolResultContent]> {
+        record
+            .checkpoint
+            .iter()
+            .flat_map(|round| round.message.content.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } if tool_use_id == id => Some(content.as_slice()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A checkpoint call that names an entry has its output saved there and reads the reference to
+    /// it, as a round's call does: the request offers the parameter, and the checkpoint is where
+    /// material is saved to outlive the window it replaces.
+    #[tokio::test]
+    async fn a_checkpoint_call_that_names_an_entry_saves_its_output_there() {
+        let provider = Arc::new(a_checkpoint_calling(
+            "search-1",
+            "file_search",
+            serde_json::json!({"regex": "TODO", "scratchpad": "kept"}),
+        ));
+        let registry = crate::tools::ToolRegistry::new();
+        registry
+            .register(Arc::new(StubTool {
+                name: "file_search".to_string(),
+                calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }))
+            .expect("register stub");
+        let (agent, store) = agent_with_registry_and_checkpoint(provider, registry).await;
+        let mut messages = conversation();
+
+        let record = compact(
+            &agent,
+            &store,
+            &mut messages,
+            CompactRequest::new(CompactionTrigger::Requested),
+        )
+        .await;
+
+        assert_eq!(record.source, CompactionSource::Checkpoint);
+        let session_id = agent.session_id().expect("a session");
+        assert_eq!(
+            store
+                .load_scratchpad_entry(session_id, "kept")
+                .await
+                .expect("read")
+                .as_deref(),
+            Some("stub ran"),
+            "the output went to the entry the call named"
+        );
+        let results = checkpoint_results(&record, "search-1");
+        let [content] = results.as_slice() else {
+            panic!("one result for the call: {results:?}");
+        };
+        let text = ContentBlock::tool_result_text_content(content);
+        assert!(
+            text.contains("scratchpad entry 'kept'") && !text.contains("stub ran"),
+            "{text}"
+        );
+    }
+
+    /// A checkpoint call that names an entry a parent lent read-only is refused as a round's call
+    /// is: nothing is written under the parent's name, and the output stays with the refusal
+    /// beside it.
+    #[tokio::test]
+    async fn a_checkpoint_call_that_names_a_lent_entry_keeps_its_output_and_says_why() {
+        let provider = Arc::new(a_checkpoint_calling(
+            "search-1",
+            "memory_search",
+            serde_json::json!({"query": "notes", "scratchpad": "lent"}),
+        ));
+        // A sub-agent's registry, the one kind a parent lends entries to. It holds no memory tools
+        // at this level, so the stub takes the name.
+        let registry = crate::tools::ToolRegistry::build_for_subagent(
+            &crate::session::SessionMaterials::for_test(Store::for_test().await),
+            &crate::session::SessionCells::for_test(
+                crate::permission::SharedPermission::new(
+                    crate::permission::Permission::Read,
+                    crate::permission::EnabledPermissions::ALL,
+                ),
+                crate::workspace::cwd_for_test(),
+                crate::workspace::roots_for_test(),
+                Arc::new(crate::frontend::SilentFrontend),
+            ),
+            crate::tools::RegistryScope {
+                tool_scope: crate::tools::ToolScope::default(),
+                memory_access: crate::config::MemoryAccess::None,
+                parent_session_id: None,
+                inherited_scratchpad_names: vec!["lent".to_string()],
+                context_ceiling_percent: 80,
+                auto_compact: false,
+            },
+        )
+        .expect("a sub-agent's registry");
+        registry
+            .register(Arc::new(StubTool {
+                name: "memory_search".to_string(),
+                calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }))
+            .expect("register stub");
+        let (agent, store) = agent_with_registry_and_checkpoint(provider, registry).await;
+        let mut messages = conversation();
+
+        let record = compact(
+            &agent,
+            &store,
+            &mut messages,
+            CompactRequest::new(CompactionTrigger::Requested),
+        )
+        .await;
+
+        let session_id = agent.session_id().expect("a session");
+        assert_eq!(
+            store
+                .load_scratchpad_entry(session_id, "lent")
+                .await
+                .expect("read"),
+            None,
+            "nothing is written under the lent name"
+        );
+        let results = checkpoint_results(&record, "search-1");
+        let [content] = results.as_slice() else {
+            panic!("one result for the call: {results:?}");
+        };
+        let text = ContentBlock::tool_result_text_content(content);
+        assert!(
+            text.contains("stub ran") && text.contains("inherited read-only"),
+            "{text}"
+        );
+    }
+
+    /// The checkpoint's own `context_replace` hands the summary in, and its acknowledgement is no
+    /// output to put aside: a `scratchpad` argument on it writes nothing, so the entry of that
+    /// name keeps what it held and the summary is taken as written.
+    #[tokio::test]
+    async fn a_summary_handed_in_with_a_scratchpad_argument_overwrites_no_entry() {
+        let provider = Arc::new(MockProvider::from_rounds(vec![vec![
+            MockEvent::ToolUseStart {
+                id: "call-1".to_string(),
+                name: "context_replace".to_string(),
+            },
+            MockEvent::ToolUseEnd {
+                input: serde_json::json!({"summary": "the summary itself", "scratchpad": "notes"}),
+            },
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::ToolUse,
+            },
+        ]]));
+        let (agent, store) =
+            agent_with_registry_and_checkpoint(provider, crate::tools::ToolRegistry::new()).await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        agent.cells().session_id.set(session_id);
+        store
+            .save_scratchpad_entry(session_id, "notes", "what the model kept")
+            .await
+            .expect("seed the entry");
+        let mut messages = conversation();
+
+        let record = agent
+            .compact_session(
+                &mut messages,
+                CompactRequest::new(CompactionTrigger::Requested),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the compaction lands");
+
+        assert_eq!(record.source, CompactionSource::Checkpoint);
+        assert!(the_summary_message(&messages).contains("the summary itself"));
+        assert_eq!(
+            store
+                .load_scratchpad_entry(session_id, "notes")
+                .await
+                .expect("read")
+                .as_deref(),
+            Some("what the model kept"),
+            "the acknowledgement was saved over the entry"
+        );
     }
 
     async fn agent_with_registry_and_checkpoint(
@@ -3910,34 +4147,6 @@ mod tests {
         );
     }
 
-    /// An agent moved to another session takes that session's counters and tools and forgets the
-    /// last one's previous request, message and main response, as a resume starts without them.
-    #[tokio::test]
-    async fn adopting_a_session_forgets_the_last_one_s_responses() {
-        let (agent, _store) = agent_for_test(Arc::new(MockProvider::from_rounds(vec![]))).await;
-        *crate::sync::lock(&agent.previous_message) = Some("msg_01last".to_string());
-        *crate::sync::lock(&agent.previous_request) = Some("req_011last".to_string());
-        *crate::sync::lock(&agent.main_thread.last) = Some(crate::provider::MainResponse {
-            message_id: Some("msg_01last".to_string()),
-            turn_position: None,
-        });
-        let tools = vec![crate::stats::ToolUsed {
-            name: "web_fetch".to_string(),
-            mcp: false,
-        }];
-        agent.adopt_session(&crate::stats::SessionStatsSnapshot {
-            turns: 4,
-            tools_used: tools.clone(),
-            ..Default::default()
-        });
-        assert_eq!(*crate::sync::lock(&agent.previous_message), None);
-        assert_eq!(*crate::sync::lock(&agent.previous_request), None);
-        assert_eq!(agent.take_response_before_compaction(), None);
-        let stats = agent.session_stats_snapshot();
-        assert_eq!(stats.turns, 4);
-        assert_eq!(stats.tools_used, tools);
-    }
-
     /// A compaction a person asks for keeps nothing verbatim unless they ask for a tail, whatever
     /// the checkpoint answers and whether one runs: they are starting the next stretch from the
     /// summary, which is what lets a switch to another provider send it nothing of the old one.
@@ -5201,9 +5410,58 @@ mod tests {
         );
     }
 
-    /// An automatic compaction that finds its token fired ends before the summarizer is paid
-    /// for. The checkpoint answers a fired token with `Ok(None)`, which must not hand the
-    /// conversation to the summarizer only for the check after it to throw the request away.
+    /// A stop during the summarizer's call of a compaction a person asked for does not cut it:
+    /// the summary is what they asked for, so the call runs to its answer and the window shrinks.
+    /// The reply is held on a gate the test opens only once the compaction has been polled after
+    /// the stop, so a call the stop cut would have ended by then.
+    #[tokio::test]
+    async fn a_stop_during_the_summary_of_a_compaction_a_person_asked_for_does_not_cut_it() {
+        let gate = CancellationToken::new();
+        let provider = Arc::new(MockProvider::from_rounds(vec![vec![
+            MockEvent::Hold { gate: gate.clone() },
+            MockEvent::Text {
+                text: "the summary".to_string(),
+            },
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::EndTurn,
+            },
+        ]]));
+        let (agent, store) =
+            agent_with_checkpoint(Arc::clone(&provider) as Arc<dyn Provider>, false).await;
+        agent.cells().session_id.set(
+            store
+                .create_session(None, "test-profile".to_string())
+                .await
+                .expect("create session"),
+        );
+        let mut messages = conversation();
+        let cancellation = CancellationToken::new();
+        let stop = async {
+            while provider.completions().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            cancellation.cancel();
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            gate.cancel();
+        };
+        let (outcome, ()) = tokio::join!(
+            agent.compact_session(
+                &mut messages,
+                CompactRequest::new(CompactionTrigger::Manual),
+                cancellation.clone(),
+            ),
+            stop
+        );
+        let record = outcome.expect("the summary is still written");
+        assert_eq!(record.source, CompactionSource::Summarizer);
+        assert!(the_summary_message(&messages).contains("the summary"));
+    }
+
+    /// An automatic compaction that finds its token fired ends before the summarizer is asked.
+    /// The checkpoint answers a fired token with `Ok(None)`, which must not hand the
+    /// conversation to the summarizer: its request would go out under a token already fired.
     #[tokio::test]
     async fn an_interrupt_before_the_summarizer_costs_no_request() {
         let provider = Arc::new(MockProvider::from_rounds(vec![text_round("unwanted")]));

@@ -407,8 +407,8 @@ fn first_under_the_name(
 /// One server's [`McpTool`]s from a fresh `tools/list`.
 ///
 /// The one door for every listing: the connector's first, the refresh a `tools/list_changed`
-/// notification triggers, the re-list after a reconnect, and a sub-agent's install. So none of them
-/// can admit, name or classify a tool differently from the others.
+/// notification triggers and the re-list after a reconnect. So none of them can admit, name or
+/// classify a tool differently from the others.
 pub(super) async fn build_mcp_tools(
     entry: &Arc<ServerEntry>,
     mcp_default_permission: Option<Permission>,

@@ -193,7 +193,7 @@ pub(crate) async fn compact(
         state.config.stream_replay_events,
     );
     // The terminal is recorded and the turn closed before the conversation is released, so a turn
-    // winning the lock next finds nothing of this one in the recorder or on the feed.
+    // winning the lock next finds nothing of this one in the turn's facts or on the feed.
     let answered = {
         let _in_flight = in_flight;
         let _published = published;
@@ -205,11 +205,11 @@ pub(crate) async fn compact(
             .agent
             .compact_session_under(&mut conversation, request, &cancellation, turn_id)
             .await;
-        // The checkpoint turn emits provider notices and the `Compacted` event into the
-        // session's recorder; its usage rides the terminal, and the rest is dropped, as every
-        // other path that runs a turn outside a request drops it: left alone the events
-        // accumulate across repeated compactions and surface in whichever turn drains next.
-        let recorder = entry.frontend.drain();
+        // The checkpoint turn emits provider notices and the `Compacted` event to the session's
+        // frontend; its usage rides the terminal, and the rest is dropped, as every other path
+        // that runs a turn outside a request drops it: left alone the notices accumulate across
+        // repeated compactions and surface in whichever turn drains next.
+        let facts = entry.frontend.drain();
         {
             use crate::host::http::handlers::turn::{terminal_event_parts, usage_from};
             let compacted = outcome
@@ -220,7 +220,7 @@ pub(crate) async fn compact(
                 cancellation
                     .reason()
                     .unwrap_or(crate::store::turns::CancelReason::Client),
-                usage_from(&recorder),
+                usage_from(&facts),
                 turn_id,
                 id,
                 state.config.relay_provider_errors,

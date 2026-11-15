@@ -135,6 +135,10 @@ round boundary of a running turn, or at the top of whichever turn the session ta
 a scheduled job's), as part of that message rather than as one of its own. Canceling several tasks
 costs no turns at all.
 
+A task reports to the session it started in, so the screen's `/resume` and `/fork` are refused
+while one of the session's tasks still runs: stop them with `/task cancel --all`, or wait for them
+to end.
+
 Under `meka serve` the turn that delivers an outcome is on the session's
 [event feed](./http-api.md#the-session-feed), opening with a `turn.started` whose `source` is
 `background`, so a client watching the session sees the report arrive and the agent act on it. One

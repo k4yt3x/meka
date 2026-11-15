@@ -222,7 +222,7 @@ Caching is prefix-based: the tools array precedes the system prompt, which prece
 - **The tools array does not change.** Under the backend's default [`deferred_tools = "native"`](../configuration/config-file.md#deferred_tools) every deferred tool is declared from the first request with `defer_loading`, and a `tool_load` answers with a reference the API expands in place rather than adding to the array. Under `append` the array grows at the tail instead, and the request after a load rewrites the whole cache once.
 - **Permission toggles cost nothing.** See [Permissions](../usage/permissions.md).
 
-Three things do legitimately invalidate it, all by necessity rather than oversight: compaction, which rewrites the head of the conversation; a `tool_load` call on an `append` profile, which grows the tools array; and an MCP server withdrawing a tool via `tools/list_changed`, which removes it from the array. A change to the array re-caches everything behind it once, the system prompt included, and the following request reads it all back.
+Three things do legitimately invalidate it, all by necessity rather than oversight: compaction, which rewrites the head of the conversation; a `tool_load` call on an `append` profile, which grows the tools array; and an MCP server whose tools change (after `tools/list_changed` or a reconnect), which rewrites the array from the first tool that changed. A listing that changes nothing invalidates nothing. A change to the array re-caches everything behind it once, the system prompt included, and the following request reads it all back.
 
 You can see the effect directly: `/status` reports the cache hit ratio, and reads should dominate from the second turn onward.
 

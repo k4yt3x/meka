@@ -64,15 +64,16 @@ pub(crate) fn spawn(state: ServerState) -> tokio::task::JoinHandle<()> {
 /// occurrence with a compare-and-swap (`ScheduleStore::claim_occurrence`), so the hosts that lose
 /// it return before running the gate.
 ///
-/// There are two ways to be runnable, and the order matters. A resident session is runnable by
-/// definition, and has to be checked first because *this* process is the one holding its file lock
-/// -- probing would report our own sessions as busy. Everything else is a lock probe:
-/// `lock_session` already uses a non-blocking `try_write`, so taking the lock and dropping it is a
-/// cheap, synchronous "is anyone else on this".
+/// There are two ways to be runnable, and the order matters. A resident session is runnable when
+/// no turn is in flight on it, and has to be checked first because *this* process is the one
+/// holding its file lock -- probing would report our own sessions as busy. Everything else is a
+/// lock probe: `lock_session` already uses a non-blocking `try_write`, so taking the lock and
+/// dropping it is a cheap, synchronous "is anyone else on this".
 ///
 /// The window between this and `ensure_session_loaded` is left open deliberately. A lock taken
 /// inside it still produces a deferral, which is correct and costs one gate evaluation; what this
-/// removes is paying that on every tick, forever.
+/// removes is paying that on every tick, forever. So is the window before the fire takes the
+/// conversation: a turn begun inside it defers the fire the same way.
 fn runnable_here(
     state: &ServerState,
 ) -> Arc<dyn Fn(&crate::schedule::ScheduledJob) -> bool + Send + Sync> {
@@ -84,8 +85,11 @@ fn runnable_here(
                 // `try_read` rather than `read`: the map is briefly write-locked while a session
                 // loads, and blocking a sweep behind that is worse than skipping a tick.
                 match sessions.try_read() {
-                    Ok(open) if open.contains_key(&job.session_id) => Residency::Resident,
-                    Ok(_) => Residency::NotResident,
+                    Ok(open) => match open.get(&job.session_id) {
+                        Some(entry) if entry.is_busy() => Residency::MidTurn,
+                        Some(_) => Residency::Resident,
+                        None => Residency::NotResident,
+                    },
                     Err(_) => Residency::Unknown,
                 }
             },
@@ -118,6 +122,8 @@ fn runnable_here(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Residency {
     Resident,
+    /// Loaded, with a turn in flight on it.
+    MidTurn,
     NotResident,
     /// The session map could not be read without blocking, so we do not know.
     Unknown,
@@ -134,6 +140,9 @@ enum Residency {
 fn runnable(residency: impl FnOnce() -> Residency, lock_is_free: impl FnOnce() -> bool) -> bool {
     match residency() {
         Residency::Resident => true,
+        // Held over until a sweep finds the session free. Offered now, the job's gate would run
+        // and its fire then defer behind the turn, on every sweep for as long as the turn lasts.
+        Residency::MidTurn => false,
         Residency::NotResident => lock_is_free(),
         // Declined rather than probed. We may be the holder, and answering "busy" for one sweep
         // costs a tick, where answering "free" would hand the job to a `run_wakeup` that then has
@@ -332,17 +341,17 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
         };
         // Drained here rather than in `finished`, which runs after and finds it empty: the usage
         // and the withdrawal ride the terminal.
-        let recorder = entry.frontend.drain();
+        let facts = entry.frontend.drain();
         let (event_type, data) = terminal_event_parts(
             Ok(outcome.as_ref()),
             cancellation
                 .reason()
                 .unwrap_or(crate::store::turns::CancelReason::Client),
-            usage_from(&recorder),
+            usage_from(&facts),
             turn_id,
             entry.id,
             self.state.config.relay_provider_errors,
-            message_withdrawn(&recorder),
+            message_withdrawn(&facts),
             position_for_terminal(&self.state.shared.store, entry.id).await,
             served_by_for_terminal(&self.state.shared.store, entry.id, turn_id).await,
         );
@@ -444,7 +453,7 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
         job: Option<&crate::schedule::ScheduledJob>,
         outcome: &Result<(), crate::error::MekaError>,
     ) {
-        let _scheduled_turn_events = entry.frontend.drain();
+        let _scheduled_turn_facts = entry.frontend.drain();
         if let Some(job) = job {
             self.notify(job, fired_status(outcome));
         }
@@ -487,7 +496,7 @@ mod tests {
 
     /// The ordering that makes the probe safe. Every session `meka serve` has loaded is one whose
     /// file lock *this process* holds, so probing a resident session would report it busy and the
-    /// server would stop running its own jobs.
+    /// server would stop running its own jobs. One mid-turn is held over, unprobed too.
     #[test]
     fn a_resident_session_is_never_probed() {
         let probed = Cell::new(false);
@@ -503,6 +512,18 @@ mod tests {
             !probed.get(),
             "and asking the lock would have said otherwise"
         );
+        let takeable = runnable(
+            || Residency::MidTurn,
+            || {
+                probed.set(true);
+                true
+            },
+        );
+        assert!(
+            !takeable,
+            "a session mid-turn waits for a sweep that finds it free"
+        );
+        assert!(!probed.get(), "without asking the lock either");
     }
 
     /// The case this exists for: a session an operator has open in a screen. Declining here is what

@@ -77,7 +77,7 @@ What to expect:
 
 - An entry that is not there is skipped silently, since most directories have no `AGENTS.md`. The list has one rule, so this holds for an absolute entry too. A file that exists but cannot be read, or is not UTF-8, is skipped with a warning. Neither stops the session.
 - A directory entry takes any regular file in it, in lexical order, the way `MEKA_INSTRUCTIONS_FILE` reads one.
-- The files are read when a session **opens**, not at startup. A `meka -c`, a fork, a re-attach and a new `serve` session read them fresh, so an edit applies from the next open. `/cd` does not re-read them.
+- The files are read when a session **opens**, not at startup. A `meka -c`, the screen's `/resume`, a fork over ACP or the HTTP API, a re-attach and a new `serve` session read them fresh, so an edit applies from the next open. `/cd` does not re-read them.
 - `--instructions` and `MEKA_INSTRUCTIONS` replace the standing text only; the listed files still apply. Setting `MEKA_INSTRUCTIONS=` to the empty string blanks the standing text and nothing else. To stop reading a file, remove it from the list.
 - Sub-agents receive them together with the standing text under `instructions: "inherit"`, and nothing otherwise.
 - `GET /v1/instructions` on the HTTP API returns the standing text alone, since what a session read depends on its directory.

@@ -170,13 +170,14 @@ impl Agent {
     /// `content_started` is `false` by construction: nothing is shown, so a retry cannot
     /// double-emit. `cancellation` gates the *waits*, as the loops in `run_streaming` and
     /// `run_turn` do, or a `Retry-After` could hold Ctrl+C for a minute; `attempt_cancellation`
-    /// gates the request itself, and the two differ on purpose. The checkpoint hands its turn's
-    /// token to both, so a stop drops a reply it is still waiting on. The summarizer hands
+    /// gates the request itself, and the two differ on purpose. The checkpoint, and the summarizer
+    /// of every compaction but one a person asked for, hand their token to both, so a stop drops a
+    /// reply still being waited on. The summarizer of a compaction a person asked for hands
     /// `attempt_cancellation` a token nothing fires: a canceled token there means the checkpoint
     /// was interrupted and `compact_session` has fallen back to `summarize_via_provider`, the
     /// tier that guarantees the window shrinks, so refusing to send would leave a `/compact` the
     /// user just pressed Ctrl+C on with the window as full as before.
-    /// `an_interrupt_ends_the_checkpoint_and_falls_back` pins it.
+    /// `a_stop_during_the_summary_of_a_compaction_a_person_asked_for_does_not_cut_it` pins it.
     pub(super) async fn complete_with_retry(
         &self,
         what: &str,

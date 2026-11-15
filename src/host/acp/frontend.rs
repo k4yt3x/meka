@@ -700,22 +700,20 @@ impl Frontend for AcpFrontend {
                 display,
             } => {
                 let id = crate::sync::lock(&self.call_ids).close(&id);
-                let live = {
-                    // The completion update carries the authoritative output, so the live view has
-                    // done its job either way; take the mode and any bytes the throttle swallowed.
-                    self.live_output()
-                        .remove(&id)
-                        .map(|mut entry| (entry.mode, entry.take_pending()))
-                };
+                // The live view has done its job either way; take it with what it holds.
+                let mut live = self.live_output().remove(&id);
                 // A command that exits immediately after printing can have its last chunk still
                 // inside the throttle window. In terminal mode those bytes live nowhere else -- the
                 // client's scrollback is the only copy -- so flush them before marking the call
                 // done.
-                if let Some((LiveOutputMode::Terminal, Some(pending))) = &live {
+                if let Some(entry) = live.as_mut()
+                    && entry.mode == LiveOutputMode::Terminal
+                    && let Some(pending) = entry.take_pending()
+                {
                     self.send_update(SessionUpdate::ToolCallUpdate(live_output_update(
                         &id,
                         LiveOutputMode::Terminal,
-                        pending,
+                        &pending,
                     )));
                 }
                 let status = if is_error {
@@ -725,7 +723,11 @@ impl Frontend for AcpFrontend {
                 };
                 let mut fields = ToolCallUpdateFields::new().status(status);
                 let mut update_meta = None;
-                if let Some((LiveOutputMode::Terminal, _)) = live {
+                if let Some(LiveOutput {
+                    mode: LiveOutputMode::Terminal,
+                    ..
+                }) = live
+                {
                     // Keep the terminal as the call's content: it already holds the full
                     // scrollback, and replacing it with a text block here would
                     // swap a live, scrollable, color-rendered view for a
@@ -742,7 +744,8 @@ impl Frontend for AcpFrontend {
                         }),
                     ));
                 } else {
-                    fields = fields.content(build_completion_content(
+                    fields = fields.content(completion_content_after_live_text(
+                        live.as_ref().map(|entry| entry.text.as_str()),
                         &name,
                         &content,
                         metadata,
@@ -1753,6 +1756,42 @@ pub(super) fn build_completion_content(
             ToolResultContent::HarnessNote { .. } => None,
         })
         .collect()
+}
+/// [`build_completion_content`] for a call whose live view drew `shown` as text, the window of a
+/// running command's output a client without terminal rendering replaces its block with. A
+/// result that keeps only the opening of an output too large to keep inline closes on that window
+/// instead, which is how the output ends and what the client was showing; a replay, which has no
+/// window, shows the opening. The window holds only what the command printed, so what the result
+/// says of how the command ended goes around it as it goes around the output in the result's
+/// text: why Meka ended it ahead, and after it the words the text ends on.
+pub(super) fn completion_content_after_live_text(
+    shown: Option<&str>,
+    tool_name: &str,
+    content: &[ToolResultContent],
+    metadata: Option<ToolOutputMetadata>,
+    display: Option<&crate::conversation::ResultDisplay>,
+) -> Vec<ToolCallContent> {
+    if let Some(shown) = shown.filter(|shown| !shown.trim_end().is_empty())
+        && content
+            .iter()
+            .any(|part| matches!(part, ToolResultContent::LargeOutput { .. }))
+    {
+        let (reason, closing) = match &metadata {
+            Some(ToolOutputMetadata::CommandExit {
+                reason, closing, ..
+            }) => (reason.as_deref(), closing.as_deref()),
+            _ => (None, None),
+        };
+        let mut closed = String::new();
+        if let Some(reason) = reason {
+            closed.push_str(reason);
+            closed.push('\n');
+        }
+        closed.push_str(shown);
+        closed.push_str(closing.unwrap_or_default());
+        return vec![console_content_block(&closed)];
+    }
+    build_completion_content(tool_name, content, metadata, display)
 }
 /// One entry of a session's log as a replay says it: a message, or a compaction where the log has
 /// a boundary.

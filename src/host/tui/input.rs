@@ -225,11 +225,17 @@ pub(crate) struct Completer {
     pub(crate) skill_names: Arc<std::sync::RwLock<Vec<String>>>,
     pub(crate) profile_names: Vec<String>,
     pub(crate) project_names: Vec<String>,
-    pub(crate) cwd: crate::workspace::SharedCwd,
 }
 
 impl Completer {
-    pub(crate) fn suggestions(&self, line: &str, pos: usize) -> Vec<Suggestion> {
+    /// What fits the token under `pos` in `line`; a `/cd` argument completes against `cwd`, the
+    /// directory of the session on screen.
+    pub(crate) fn suggestions(
+        &self,
+        line: &str,
+        pos: usize,
+        cwd: &crate::workspace::SharedCwd,
+    ) -> Vec<Suggestion> {
         let Some(after_slash) = line.strip_prefix('/') else {
             return Vec::new();
         };
@@ -334,7 +340,7 @@ impl Completer {
                     Vec::new()
                 }
             }
-            "cd" => complete_cd_path(&self.cwd, prefix, token_start, pos),
+            "cd" => complete_cd_path(cwd, prefix, token_start, pos),
             _ => Vec::new(),
         }
     }
@@ -1042,7 +1048,7 @@ impl Composer {
     /// Open, narrow or close the list for the line as it now stands: there as soon as `/` is
     /// typed, gone when nothing fits. The pick follows its value, so narrowing keeps what the
     /// user moved to.
-    pub(crate) fn suggest(&mut self, completer: &Completer) {
+    pub(crate) fn suggest(&mut self, completer: &Completer, cwd: &crate::workspace::SharedCwd) {
         let Some((line, pos)) = self.line_at_cursor() else {
             self.completion = None;
             return;
@@ -1052,7 +1058,7 @@ impl Composer {
             return;
         }
         self.dismissed = None;
-        let rows = completer.suggestions(&line, pos);
+        let rows = completer.suggestions(&line, pos, cwd);
         if rows.is_empty() {
             self.completion = None;
             return;
@@ -1068,13 +1074,13 @@ impl Composer {
 
     /// Tab: fill in the picked row and offer what comes next, or open the list again after Esc
     /// closed it.
-    pub(crate) fn complete(&mut self, completer: &Completer) {
+    pub(crate) fn complete(&mut self, completer: &Completer, cwd: &crate::workspace::SharedCwd) {
         if self.completion.is_none() {
             self.dismissed = None;
-            self.suggest(completer);
+            self.suggest(completer, cwd);
         }
         self.accept_completion();
-        self.suggest(completer);
+        self.suggest(completer, cwd);
     }
 
     /// Enter on the list: the picked row replaces the token it completes.
@@ -1429,13 +1435,17 @@ mod tests {
             skill_names: Arc::new(std::sync::RwLock::new(vec!["review".into()])),
             profile_names: vec!["work".into(), "play".into()],
             project_names: vec!["webdev".into()],
-            cwd: crate::workspace::SharedCwd::new(std::env::temp_dir()),
         }
+    }
+
+    /// The directory a test's completions are made in when none of them is a `/cd`.
+    fn cwd() -> crate::workspace::SharedCwd {
+        crate::workspace::SharedCwd::new(std::env::temp_dir())
     }
 
     #[test]
     fn a_command_word_completes_from_the_table() {
-        let rows = completer().suggestions("/he", 3);
+        let rows = completer().suggestions("/he", 3, &cwd());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].value, "/help");
         assert_eq!((rows[0].start, rows[0].end), (0, 3));
@@ -1446,24 +1456,24 @@ mod tests {
     fn an_argument_completes_from_what_the_command_takes() {
         let completer = completer();
         let levels: Vec<String> = completer
-            .suggestions("/permission w", 13)
+            .suggestions("/permission w", 13, &cwd())
             .into_iter()
             .map(|row| row.value)
             .collect();
         assert_eq!(levels, vec!["workspace"]);
         let servers: Vec<String> = completer
-            .suggestions("/mcp login ", 11)
+            .suggestions("/mcp login ", 11, &cwd())
             .into_iter()
             .map(|row| row.value)
             .collect();
         assert_eq!(servers, vec!["exa", "notion"]);
         let skills: Vec<String> = completer
-            .suggestions("/skill r", 8)
+            .suggestions("/skill r", 8, &cwd())
             .into_iter()
             .map(|row| row.value)
             .collect();
         assert_eq!(skills, vec!["review"]);
-        assert!(completer.suggestions("/mcp list ", 10).is_empty());
+        assert!(completer.suggestions("/mcp list ", 10, &cwd()).is_empty());
     }
 
     #[test]
@@ -1472,18 +1482,16 @@ mod tests {
         std::fs::create_dir(temp.path().join("docs")).expect("dir");
         std::fs::create_dir(temp.path().join(".git")).expect("dir");
         std::fs::write(temp.path().join("notes.txt"), b"x").expect("file");
-        let completer = Completer {
-            cwd: crate::workspace::SharedCwd::new(temp.path().to_path_buf()),
-            ..completer()
-        };
+        let completer = completer();
+        let cwd = crate::workspace::SharedCwd::new(temp.path().to_path_buf());
         let rows: Vec<String> = completer
-            .suggestions("/cd ", 4)
+            .suggestions("/cd ", 4, &cwd)
             .into_iter()
             .map(|row| row.value)
             .collect();
         assert_eq!(rows, vec!["docs/"]);
         let hidden: Vec<String> = completer
-            .suggestions("/cd .", 5)
+            .suggestions("/cd .", 5, &cwd)
             .into_iter()
             .map(|row| row.value)
             .collect();
@@ -1497,7 +1505,7 @@ mod tests {
         let completer = completer();
         let mut composer = Composer::new(None);
         composer.edit(key(KeyCode::Char('/'), KeyModifiers::NONE));
-        composer.suggest(&completer);
+        composer.suggest(&completer, &cwd());
         let open = composer
             .completion
             .as_ref()
@@ -1507,7 +1515,7 @@ mod tests {
         let moved_to = composer.completion.as_ref().unwrap().rows[1].value.clone();
         let narrowing = moved_to.chars().nth(1).unwrap();
         composer.edit(key(KeyCode::Char(narrowing), KeyModifiers::NONE));
-        composer.suggest(&completer);
+        composer.suggest(&completer, &cwd());
         let open = composer
             .completion
             .as_ref()
@@ -1517,19 +1525,19 @@ mod tests {
             "the pick follows its value through a narrowing"
         );
         composer.close_completion();
-        composer.suggest(&completer);
+        composer.suggest(&completer, &cwd());
         assert!(
             composer.completion.is_none(),
             "closed stays closed while the line stands"
         );
         composer.edit(key(KeyCode::Backspace, KeyModifiers::NONE));
-        composer.suggest(&completer);
+        composer.suggest(&completer, &cwd());
         assert!(
             composer.completion.is_some(),
             "a changed line opens the list again"
         );
         composer.set_text("/nothing-like-this");
-        composer.suggest(&completer);
+        composer.suggest(&completer, &cwd());
         assert!(composer.completion.is_none(), "nothing fits, no list");
     }
 
@@ -1628,10 +1636,10 @@ mod tests {
     fn accepting_a_completion_replaces_the_token_it_completes() {
         let mut composer = Composer::new(None);
         composer.set_text("/perm");
-        composer.complete(&completer());
+        composer.complete(&completer(), &cwd());
         assert_eq!(composer.text(), "/permission ");
         composer.set_text("/permission w");
-        composer.complete(&completer());
+        composer.complete(&completer(), &cwd());
         assert_eq!(composer.text(), "/permission workspace ");
     }
 

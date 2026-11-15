@@ -1,7 +1,7 @@
 //! What every host does when the scheduler fires a job or the background poller finds finished
 //! work: find the session, take its runtime, publish a token, fold undelivered outcomes into the
-//! prompt, run the turn, and report. One driver, so the hosts cannot disagree on whether an ungated
-//! job waits behind a turn, whether a canceled fire counts as failed, or who announces outcomes and
+//! prompt, run the turn, and report. One driver, so the hosts cannot disagree on whether a job
+//! waits behind a turn, whether a canceled fire counts as failed, or who announces outcomes and
 //! when; what differs is asked through [`HostHooks`].
 
 use std::ops::ControlFlow;
@@ -181,7 +181,7 @@ pub(crate) trait HostHooks: crate::scheduler::ResidentPermissions {
     async fn resident(&self, session_id: uuid::Uuid) -> anyhow::Result<Option<Self::Entry>>;
 
     /// Whether `entry` is still the session this host holds under its id, asked once the
-    /// conversation lock has been won. A fire queued on that lock can outlive the session: ACP's
+    /// conversation lock has been won. The entry a fire found can outlive the session: ACP's
     /// `session/close` and `serve`'s idle eviction remove the entry and wait on or skip the same
     /// lock, and the fire then ran a whole turn against a session the editor had closed, pushing
     /// its transcript to a session id the client no longer had. Hosts with a map answer from
@@ -311,10 +311,10 @@ pub(crate) trait HostHooks: crate::scheduler::ResidentPermissions {
 
 /// Fire one scheduled job in its session.
 ///
-/// A gated job waits for the runtime: its probe has just said "now", and the wait is what makes a
-/// gate on a busy session mean anything. An ungated one does not queue behind a turn; it defers to
-/// the next tick, so a long turn cannot pile fires up behind it. A fire the host's leaving cut
-/// short is deferred, so the occurrence runs again on the next start.
+/// A fire never waits for the runtime, gated or not: one that finds its session mid-turn defers,
+/// handing the occurrence back with its gate baseline unwritten, since the sweep awaits each fire
+/// and a wait here would hold every other session's jobs for as long as the turn runs. A fire the
+/// host's leaving cut short is deferred, so the occurrence runs again on the next start.
 #[allow(
     clippy::significant_drop_tightening,
     reason = "the conversation guard is the fire's exclusivity and lives to the end on purpose"
@@ -349,16 +349,12 @@ pub(crate) async fn run_wakeup<H: HostHooks>(hooks: &H, wakeup: Wakeup) -> FireO
         }
     };
     entry.touch();
-    let mut conversation = if job.gate.is_some() {
-        entry.conversation.lock().await
-    } else {
-        match entry.conversation.try_lock() {
-            Ok(conversation) => conversation,
-            Err(_) => {
-                tracing::debug!("scheduled job {job_id} found its session mid-turn; deferring");
-                return FireOutcome::Deferred;
-            }
-        }
+    // Mid-turn here only when a turn began after the sweep found the session free, while the
+    // occurrence was claimed and its gate ran: the scopes of `serve` and ACP decline a busy
+    // session, and the screen sweeps between turns.
+    let Ok(mut conversation) = entry.conversation.try_lock() else {
+        tracing::debug!("scheduled job {job_id} found its session mid-turn; deferring");
+        return FireOutcome::Deferred;
     };
     if !hooks.still_resident(&entry).await {
         tracing::debug!(
@@ -1162,6 +1158,121 @@ mod tests {
         );
         assert!(admitted < stamped, "and ahead of the one-way stamp");
     }
+
+    /// A host holding one session, for driving a fire directly.
+    struct OneSessionHooks {
+        entry: HeldSession,
+        store: Store,
+    }
+
+    #[derive(Clone)]
+    struct HeldSession(ResidentSession);
+
+    impl std::ops::Deref for HeldSession {
+        type Target = ResidentSession;
+
+        fn deref(&self) -> &ResidentSession {
+            &self.0
+        }
+    }
+
+    #[async_trait]
+    impl crate::scheduler::ResidentPermissions for OneSessionHooks {
+        async fn live_permission_of(
+            &self,
+            _session_id: uuid::Uuid,
+        ) -> Option<crate::permission::Permission> {
+            None
+        }
+    }
+
+    #[async_trait]
+    impl HostHooks for OneSessionHooks {
+        type Entry = HeldSession;
+
+        async fn resident(&self, _session_id: uuid::Uuid) -> anyhow::Result<Option<HeldSession>> {
+            Ok(Some(self.entry.clone()))
+        }
+
+        fn background_enabled(&self) -> bool {
+            false
+        }
+
+        fn store(&self) -> &Store {
+            &self.store
+        }
+    }
+
+    /// A fire never waits for its session, gated or not: one that finds a turn holding the
+    /// conversation defers at once, so the sweep it runs in goes on to every other session's jobs.
+    #[tokio::test]
+    async fn a_gated_fire_on_a_session_mid_turn_defers_without_waiting() {
+        let store = Store::for_test().await;
+        let cells = crate::session::SessionCells::for_test(
+            crate::permission::SharedPermission::new(
+                crate::permission::Permission::Unrestricted,
+                crate::permission::EnabledPermissions::ALL,
+            ),
+            crate::workspace::SharedCwd::new(std::env::temp_dir()),
+            crate::workspace::SharedRoots::default(),
+            std::sync::Arc::new(crate::frontend::SilentFrontend),
+        );
+        let agent = crate::host::assemble_agent(
+            crate::session::SessionMaterials::for_test(store.clone()),
+            cells,
+            crate::session::AgentOptions::for_test(),
+        )
+        .await
+        .expect("the agent builds");
+        let session_id = uuid::Uuid::new_v4();
+        let session = ResidentSession::from_parts(
+            session_id,
+            std::sync::Arc::new(agent),
+            std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::conversation::Conversation::new(),
+            )),
+            crate::host::CancelCell::default(),
+        );
+        let hooks = OneSessionHooks {
+            entry: HeldSession(session.clone()),
+            store,
+        };
+        let now = chrono::Utc::now();
+        let wakeup = Wakeup {
+            job: ScheduledJob {
+                id: "gated".to_string(),
+                session_id,
+                schedule: crate::schedule::Schedule::At(now),
+                prompt: "check".to_string(),
+                gate: Some(crate::schedule::Gate {
+                    probe: crate::schedule::GateProbe::Shell {
+                        command: "true".to_string(),
+                    },
+                    predicate: crate::schedule::GatePredicate::Succeeded,
+                    last_output: None,
+                    permission: crate::permission::Permission::Unrestricted,
+                }),
+                created_at: now,
+                last_fired_at: None,
+                next_fire_at: now,
+                attempts: 0,
+            },
+            gate_output: Some(String::new()),
+            late_by: chrono::Duration::zero(),
+            coalesced: 0,
+        };
+
+        let _turn = session
+            .conversation
+            .try_lock()
+            .expect("nothing holds it yet");
+        assert_eq!(
+            futures::FutureExt::now_or_never(run_wakeup(&hooks, wakeup)),
+            Some(FireOutcome::Deferred),
+            "the fire waited on the turn, holding every other session's jobs"
+        );
+    }
+
     /// A fire that completed before the drain reached it is complete: its reply is in the store,
     /// and a deferred occurrence would deliver it again on the next start. Only the host's leaving
     /// hands the occurrence back, on every host, and a fire someone stopped first is spent.

@@ -150,15 +150,27 @@ pub(crate) enum HostEvent {
     /// outcome to report. Carries no payload; the host re-reads both, because between the watcher
     /// noticing and this arriving the job could have been canceled.
     Wake,
-    /// The user moved this session's permission level, to be recorded on the row: a scheduled
-    /// gate is re-checked at fire time against the row, so the withdrawal has to reach the
-    /// database without waiting for a turn.
-    PermissionChanged(crate::permission::Permission),
-    /// The user toggled whether calls above the level are submitted for approval.
-    ApprovalsChanged(bool),
-    /// The user moved this session's working directory, which is where the next resume opens
-    /// and where a scheduled tool gate is re-checked.
-    CwdChanged(std::path::PathBuf),
+    /// The user moved the permission level of the session whose id cell is `session`, to be
+    /// recorded on its row: a scheduled gate is re-checked at fire time against the row, so the
+    /// withdrawal has to reach the database without waiting for a turn. The session's own cell
+    /// rather than the loop's id, so a change made just before a `/resume` is recorded on the
+    /// session it was made on.
+    PermissionChanged {
+        session: crate::session::SharedSessionId,
+        level: crate::permission::Permission,
+    },
+    /// The user toggled whether calls above the level are submitted for approval, on `session`
+    /// as for [`Self::PermissionChanged`].
+    ApprovalsChanged {
+        session: crate::session::SharedSessionId,
+        approvals: bool,
+    },
+    /// The user moved the working directory of `session`, as for [`Self::PermissionChanged`],
+    /// which is where the next resume opens and where a scheduled tool gate is re-checked.
+    CwdChanged {
+        session: crate::session::SharedSessionId,
+        path: std::path::PathBuf,
+    },
     /// Leave. `interrupted` marks the ladder's third press, which exits 130 as an interrupted run
     /// does, after the same teardown as any other exit.
     Exit {

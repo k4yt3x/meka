@@ -42,6 +42,18 @@ whose pattern was written against the appended copy (its heading, or its pretty-
 no longer matches: write the pattern against the server's own text, or use an `at` pointer, which
 reads the structured value and is unaffected.
 
+**A call's end carries a large result as the history holds it.** On the HTTP feed and a streamed
+turn, `tool_call.completed` used to carry a call's whole output, megabytes included. Now it carries
+the result as `GET /v1/sessions/{id}/history` holds it: an output too large to keep inline, one
+over 30,000 bytes (a line range `scratchpad_read` returns is sized to the context and is never
+one), is a `large_output` item (`scratchpad_entry`, `size_bytes`, and `preview`, its opening), and a call that
+named a `scratchpad` entry is the line that refers to the entry. A client that showed the whole
+output from this event can show the `preview`, or read the whole text from the scratchpad entry in
+the session's archive (`GET /v1/sessions/{id}/export`). A running command's output still streams
+whole as `tool_call.output_delta`. An ACP `tool_call_update` follows: its `rawOutput` is that same
+result, live as on a `session/load`, and its content shows the opening, except that a command
+drawn as text keeps the window it was showing and a terminal keeps its scrollback.
+
 ## 0.93 to 0.94
 
 The store moves forward on its first open, behind the automatic backup, so that a turn that fails

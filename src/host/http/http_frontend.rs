@@ -1,6 +1,6 @@
 //! `HttpFrontend`, the `meka serve` impl of [`crate::frontend::Frontend`].
 //!
-//! Blocking mode buffers every emitted event into the turn's recorder; mid-turn pause primitives
+//! Blocking mode folds every emitted event into the turn's [`TurnFacts`]; mid-turn pause primitives
 //! (permission approval, MCP elicitation) short-circuit to their safe defaults (`Deny`,
 //! `Decline`) and append a diagnostic `Notice` so the caller can detect the misconfiguration.
 //!
@@ -40,15 +40,14 @@ use crate::frontend::{
 const DISCONNECT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// The HTTP host's frontend, one per resident session, held on its `SessionEntry` for as long as
-/// the session is resident. A turn handler reads the recorded events out of it to assemble the JSON
-/// response body.
+/// the session is resident. A turn handler reads the turn's facts out of it to assemble the
+/// terminal and the JSON response body.
 ///
-/// One HttpFrontend per session. The blocking-mode recorder is a [`Mutex`] around
-/// [`Recorder`]; the session feed is installed once by [`Self::install_feed`], and `emit` fans
-/// events out to both.
+/// One HttpFrontend per session. The turn's facts are a [`Mutex`] around [`TurnFacts`]; the
+/// session feed is installed once by [`Self::install_feed`], and `emit` fans events out to both.
 pub(crate) struct HttpFrontend {
-    recorder: Mutex<Recorder>,
-    /// Whether events are kept for a blocking response. A sub-agent's feed has no host draining
+    facts: Mutex<TurnFacts>,
+    /// Whether events are folded into the turn's facts. A sub-agent's feed has no host draining
     /// it, so it publishes and keeps nothing.
     records: bool,
     /// What the feed was installed with, for the feeds of this session's sub-agents.
@@ -279,9 +278,37 @@ impl PermissionResolution {
     }
 }
 
-/// What a blocking-mode turn collects on its way to producing the JSON response. The turn
-/// handler reads this back after `run_turn` returns.
-pub(crate) type Recorder = Vec<FrontendEvent>;
+/// What a turn's events said that its terminal and a held turn's answer are built from, folded as
+/// each event passes so that nothing else of an event is kept. The turn handler reads it back
+/// after `run_turn` returns.
+#[derive(Debug, Default)]
+pub(crate) struct TurnFacts {
+    /// Whether a `TurnStarted` passed.
+    pub(crate) started: bool,
+    /// Whether a `PromptWithdrawn` passed.
+    pub(crate) prompt_withdrawn: bool,
+    /// The last usage reported.
+    pub(crate) usage: Option<crate::stats::TokenUsage>,
+    /// How each turn that ended said it ended, by its id.
+    pub(crate) endings: HashMap<uuid::Uuid, crate::store::turns::TurnEnding>,
+    /// The notices said, in the order they came.
+    pub(crate) notices: Vec<Notice>,
+}
+
+impl TurnFacts {
+    fn fold(&mut self, event: FrontendEvent) {
+        match event {
+            FrontendEvent::TurnStarted { .. } => self.started = true,
+            FrontendEvent::PromptWithdrawn => self.prompt_withdrawn = true,
+            FrontendEvent::TokenUsage(usage) => self.usage = Some(usage),
+            FrontendEvent::TurnEnded { turn_id, ending } => {
+                self.endings.insert(turn_id, ending);
+            }
+            FrontendEvent::Notice(notice) => self.notices.push(notice),
+            _ => {}
+        }
+    }
+}
 
 impl HttpFrontend {
     #[cfg(test)]
@@ -291,7 +318,7 @@ impl HttpFrontend {
 
     pub(crate) fn with_capabilities(capabilities: SessionCapabilities) -> Self {
         Self {
-            recorder: Mutex::new(Recorder::default()),
+            facts: Mutex::new(TurnFacts::default()),
             records: true,
             wiring: Mutex::new(None),
             feed: Mutex::new(None),
@@ -444,11 +471,11 @@ impl HttpFrontend {
         crate::sync::lock(&self.pending).len() as u64
     }
 
-    /// Swap the recorder out for an empty one and return what was collected. Called by the
+    /// Swap the turn's facts out for empty ones and return what was collected. Called by the
     /// turn handler after `run_turn` returns; the per-session `HttpFrontend` lives across
     /// turns so consuming `self` isn't an option.
-    pub(crate) fn drain(&self) -> Recorder {
-        let mut guard = crate::sync::lock(&self.recorder);
+    pub(crate) fn drain(&self) -> TurnFacts {
+        let mut guard = crate::sync::lock(&self.facts);
         std::mem::take(&mut *guard)
     }
 
@@ -480,7 +507,7 @@ impl HttpFrontend {
     }
 
     /// Publish and keep nothing: for a feed no host drains.
-    fn without_recorder(mut self) -> Self {
+    fn without_facts(mut self) -> Self {
         self.records = false;
         self
     }
@@ -847,15 +874,15 @@ impl HttpFrontend {
         }
     }
 
-    /// Record a warn-level notice in the recorder (and broadcast it if streaming) without
+    /// Record a warn-level notice in the turn's facts (and broadcast it if streaming) without
     /// going through the `Frontend::emit` trait method, so it can be called from a context that
     /// already holds `&self` in a non-async fashion.
     async fn record_warn_notice(&self, notice: Notice) {
         self.emit(FrontendEvent::Notice(notice)).await;
     }
 
-    /// Publish an event to the feed and the recorder. Public so a host can push a frontend event
-    /// it assembled itself, such as the prompt of a scheduled fire.
+    /// Publish an event to the feed and fold it into the turn's facts. Public so a host can push a
+    /// frontend event it assembled itself, such as the prompt of a scheduled fire.
     pub(crate) fn push_event(&self, event: FrontendEvent) {
         // Tool calls begin and end inside a turn, so live output still buffered here belongs to a
         // call that never delivered its completion (a canceled turn, or a stream retried after
@@ -872,7 +899,7 @@ impl HttpFrontend {
         {
             turn.permission = Some(permission);
         }
-        // Push to the broadcast BEFORE recording, so a slow blocking-mode Mutex can't delay live
+        // Push to the broadcast BEFORE folding, so a slow blocking-mode Mutex can't delay live
         // subscribers.
         //
         // The feed lock is held across the entire publish (`ids.next()` + `send`) so concurrent
@@ -890,7 +917,7 @@ impl HttpFrontend {
         }
 
         if self.records {
-            crate::sync::lock(&self.recorder).push(event);
+            crate::sync::lock(&self.facts).fold(event);
         }
     }
 
@@ -999,7 +1026,7 @@ impl Frontend for HttpFrontend {
         }) else {
             return Arc::new(forward);
         };
-        let feed = Arc::new(HttpFrontend::with_capabilities(self.capabilities).without_recorder());
+        let feed = Arc::new(HttpFrontend::with_capabilities(self.capabilities).without_facts());
         // A worker's feed mirrors nothing to the server feed, where the registry announces its
         // record changes; a grandchild's feed is wired by this one, the feed above it.
         feed.install_feed(child, &FeedWiring {
@@ -1267,9 +1294,9 @@ impl Frontend for HttpFrontend {
     ///
     /// Both halves are needed. The capability alone is the session's *permission* to receive
     /// reasoning, not evidence that it did: a blocking turn has nothing listening, so the deltas
-    /// reach the recorder and [`super::handlers::turn`] drops them there, serving whole blocks
-    /// instead. Answering on the capability alone refuses the retry on every blocking turn of such
-    /// a session, for reasoning nobody was sent, and reasoning is the first thing a turn produces.
+    /// reach nobody and [`super::handlers::turn`] serves whole blocks instead. Answering on the
+    /// capability alone refuses the retry on every blocking turn of such a session, for reasoning
+    /// nobody was sent, and reasoning is the first thing a turn produces.
     ///
     /// A block *can* complete and the attempt fail after it, so what keeps the whole-block readers
     /// safe is not that they hear nothing: it is that neither emitter of the block can be followed
@@ -2249,22 +2276,43 @@ mod tests {
         assert!(backlog.iter().all(|event| !event.event_type.is_transient()));
     }
 
+    /// A drain hands back what the turn said that its ending is built from, the last of its usages
+    /// among it, and leaves nothing of it for the turn after.
     #[tokio::test]
-    async fn emit_buffers_events_in_order() {
+    async fn a_drain_hands_back_the_turn_s_facts_and_starts_over() {
         let frontend = HttpFrontend::new();
-        frontend
-            .emit(FrontendEvent::TurnStarted {
-                turn_id: uuid::Uuid::nil(),
-            })
-            .await;
-        frontend
-            .emit(FrontendEvent::AssistantTextDelta("hello".into()))
-            .await;
-        frontend.emit(FrontendEvent::TurnFinished).await;
-        let recorder = frontend.drain();
-        assert_eq!(recorder.len(), 3);
-        assert!(matches!(recorder[0], FrontendEvent::TurnStarted { .. }));
-        assert!(matches!(recorder[2], FrontendEvent::TurnFinished));
+        let turn_id = uuid::Uuid::from_u128(0x7);
+        let usage = |input_tokens| crate::stats::TokenUsage {
+            input_tokens,
+            ..Default::default()
+        };
+        for event in [
+            FrontendEvent::TurnStarted { turn_id },
+            FrontendEvent::AssistantTextDelta("hello".into()),
+            FrontendEvent::TokenUsage(usage(1)),
+            FrontendEvent::Notice(Notice::warn("said once")),
+            FrontendEvent::TokenUsage(usage(2)),
+            FrontendEvent::PromptWithdrawn,
+            FrontendEvent::TurnEnded {
+                turn_id,
+                ending: crate::store::turns::TurnEnding::succeeded(
+                    crate::conversation::StopReason::EndTurn,
+                    crate::store::turns::TurnUsage::default(),
+                ),
+            },
+            FrontendEvent::TurnFinished,
+        ] {
+            frontend.emit(event).await;
+        }
+        let facts = frontend.drain();
+        assert!(facts.started && facts.prompt_withdrawn);
+        assert_eq!(facts.usage.map(|usage| usage.input_tokens), Some(2));
+        assert_eq!(facts.notices.len(), 1);
+        assert!(facts.endings.contains_key(&turn_id));
+
+        let next = frontend.drain();
+        assert!(!next.started && !next.prompt_withdrawn, "{next:?}");
+        assert!(next.usage.is_none() && next.notices.is_empty() && next.endings.is_empty());
     }
 
     #[tokio::test]
@@ -2281,17 +2329,14 @@ mod tests {
             })
             .await;
         assert_eq!(outcome, PermissionOutcome::Deny);
-        let recorder = frontend.drain();
-        let notice_count = recorder
+        let notice_count = frontend
+            .drain()
+            .notices
             .iter()
-            .filter(|event| {
-                matches!(
-                    event,
-                    FrontendEvent::Notice(notice)
-                        if notice.text.contains("shell_execute")
-                            && notice.text.contains("refused without asking")
-                            && notice.text.contains("`attend=true`")
-                )
+            .filter(|notice| {
+                notice.text.contains("shell_execute")
+                    && notice.text.contains("refused without asking")
+                    && notice.text.contains("`attend=true`")
             })
             .count();
         assert_eq!(
@@ -2339,13 +2384,12 @@ mod tests {
                 .is_empty(),
             "nothing should have been parked"
         );
-        let recorder = frontend.drain();
         assert!(
-            recorder.iter().any(|event| matches!(
-                event,
-                FrontendEvent::Notice(notice)
-                    if notice.text.contains("supports_permission_prompts")
-            )),
+            frontend
+                .drain()
+                .notices
+                .iter()
+                .any(|notice| notice.text.contains("supports_permission_prompts")),
             "the deny must explain itself in the response, not just in the timing"
         );
     }
@@ -2381,13 +2425,10 @@ mod tests {
             PermissionOutcome::Allow,
             "tools in always_allowed must not re-prompt"
         );
-        let recorder = frontend.drain();
         // No diagnostic notice should be emitted: the sticky path bypasses both the streaming
         // SSE pause and the blocking-mode refusal.
         assert!(
-            !recorder
-                .iter()
-                .any(|event| matches!(event, FrontendEvent::Notice(_))),
+            frontend.drain().notices.is_empty(),
             "sticky allow must not emit a diagnostic Notice"
         );
     }
@@ -2497,10 +2538,6 @@ mod tests {
             events[1].event_type,
             super::SseEventType::AssistantTextDelta
         );
-
-        // The recorder still has all three (blocking-mode JSON path is unaffected).
-        let recorder = frontend.drain();
-        assert_eq!(recorder.len(), 3);
     }
 
     #[tokio::test]
@@ -3167,12 +3204,12 @@ mod tests {
         };
         let response = frontend.handle_elicitation(prompt).await;
         assert!(matches!(response, ElicitationResponse::Decline));
-        let recorder = frontend.drain();
         assert!(
-            recorder.iter().any(|event| matches!(
-                event,
-                FrontendEvent::Notice(notice) if notice.text.contains("github")
-            )),
+            frontend
+                .drain()
+                .notices
+                .iter()
+                .any(|notice| notice.text.contains("github")),
             "elicitation decline must surface a diagnostic Notice"
         );
     }

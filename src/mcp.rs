@@ -332,10 +332,12 @@ pub(crate) struct McpClientManager {
     /// been started so a second call is a no-op; avoids re-spawning the connector if a test or the
     /// screen re-enters the same manager.
     pending_entries: std::sync::Mutex<Option<Vec<Arc<ServerEntry>>>>,
-    /// Live snapshot of every connected server's currently-registered tools. The connector writes
+    /// The tools each server last listed, kept until the server is removed: a server that has
+    /// failed since keeps its listing here, as the registries keep its tools. The connector writes
     /// here as each server reaches `Connected`, and `on_tool_list_changed` writes here on dynamic
-    /// updates. A new subscriber is replayed this snapshot at [`Self::subscribe`] time.
-    tools_snapshot: tokio::sync::RwLock<HashMap<String, ServerTools>>,
+    /// updates. Kept in server name order, the order in which [`Self::subscribe`] replays it to a
+    /// new subscriber and [`Self::connected_server_tools`] hands it to a worker's registry.
+    tools_snapshot: tokio::sync::RwLock<std::collections::BTreeMap<String, ServerTools>>,
     /// Who is told when a server's tool list changes, held weakly: a session's registry subscribes
     /// when the session opens and leaves when it closes, or once nothing else holds it, so a
     /// session dropped without closing takes its registry, and everything the registry holds, with
@@ -1419,7 +1421,7 @@ impl McpClientManager {
             overlay: OnceLock::from(overlay),
             settled: settled_tx,
             pending_entries: std::sync::Mutex::new(Some(pending)),
-            tools_snapshot: tokio::sync::RwLock::new(HashMap::new()),
+            tools_snapshot: tokio::sync::RwLock::new(std::collections::BTreeMap::new()),
             observers: tokio::sync::RwLock::new(Vec::new()),
             connect_timeout: OnceLock::new(),
             connects,
@@ -1998,25 +2000,26 @@ impl McpClientManager {
         Ok(count)
     }
 
-    /// One server's tools as [`McpTool`]s, from a fresh `tools/list`. Empty for a name nothing
-    /// configured.
-    pub(crate) async fn discover_tools_for_server(
-        &self,
-        server_name: &str,
-    ) -> Result<Vec<McpTool>> {
-        let Some(entry) = self.entry(server_name) else {
-            return Ok(Vec::new());
-        };
-        connector::build_mcp_tools(&entry, self.mcp_default_permission, self.request_timeout())
+    /// Every `Connected` server's tools as the manager last listed them, in server name order:
+    /// what every session's registry holds of it, with no round trip to the server.
+    pub(crate) async fn connected_server_tools(&self) -> Vec<(String, ServerTools)> {
+        let listed: Vec<(String, ServerTools)> = self
+            .tools_snapshot
+            .read()
             .await
-            .map(|(tools, _)| tools)
-    }
-
-    /// [`Self::discover_tools_for_server`], classified the way the connector classifies a listing.
-    pub(crate) async fn discover_server_tools(&self, server_name: &str) -> Result<ServerTools> {
-        Ok(ServerTools::from_tools(
-            self.discover_tools_for_server(server_name).await?,
-        ))
+            .iter()
+            .map(|(name, tools)| (name.clone(), tools.clone()))
+            .collect();
+        let mut connected = Vec::with_capacity(listed.len());
+        for (name, tools) in listed {
+            let Some(entry) = self.entry(&name) else {
+                continue;
+            };
+            if matches!(entry.state().await, ServerState::Connected { .. }) {
+                connected.push((name, tools));
+            }
+        }
+        connected
     }
 
     /// Heal one server on demand, picking the right repair for the state it is actually in.
@@ -2112,8 +2115,9 @@ impl McpClientManager {
     /// names are available. Permission is resolved through the normal 5-step chain with the winning
     /// step recorded on each entry.
     ///
-    /// Differs from [`Self::discover_tools_for_server`] by (a) not filtering by allow/block lists,
-    /// (b) not registering adapters, and (c) capturing the resolution source for display.
+    /// Differs from [`connector::build_mcp_tools`], the listing registries are built from, by (a)
+    /// not filtering by allow/block lists, (b) not registering adapters, and (c) capturing the
+    /// resolution source for display.
     pub(crate) async fn list_advertised_tools(
         &self,
         server_name: &str,
@@ -4907,6 +4911,123 @@ mod tests {
         assert!(
             registry.get("mcp_resource_list").is_none(),
             "no MCP meta-tools should land on the registry when no servers configured"
+        );
+    }
+
+    /// A sub-agent's registry takes its parent's tools from the listing the manager already holds:
+    /// a spawn costs no server a `tools/list`, each tool arrives deferred or eager as it did for
+    /// the parent, and neither a server the worker's scope denies nor one not connected now
+    /// contributes a tool.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_worker_registry_takes_the_listing_without_asking_the_server_again() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let log = |name: &str| temp.path().join(format!("{name}.jsonl"));
+        let stub = |name: &str| {
+            let state = temp.path().join(format!("{name}.json"));
+            std::fs::write(
+                &state,
+                // A legacy server: a modern one's listing carries a time to live, inside which the
+                // client answers a second `tools/list` itself, and a spawn's would never reach it.
+                serde_json::json!({
+                    "tools": ["search", "create_page"],
+                    "legacy_only": true,
+                    "log": log(name),
+                })
+                .to_string(),
+            )
+            .expect("write the stub's state");
+            let mut config = McpServerConfig::for_test(name);
+            config.transport = McpTransport::Stdio;
+            config.url = None;
+            config.command = Some("python3".to_string());
+            config.args = Some(vec![
+                format!(
+                    "{}/tests/fixtures/mcp_stub_server.py",
+                    env!("CARGO_MANIFEST_DIR")
+                ),
+                state.display().to_string(),
+            ]);
+            config.eager_load_tools = Some(vec!["search".to_string()]);
+            config
+        };
+        let context = McpClientContext::new();
+        let manager = McpClientManager::prepare(
+            &[
+                stub("notion"),
+                stub("linear"),
+                McpServerConfig::for_test("ida"),
+            ],
+            None,
+            None,
+            Arc::clone(&context),
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+        )
+        .await
+        .expect("prepare");
+        context.set_manager(Arc::downgrade(&manager));
+        for name in ["notion", "linear"] {
+            connector::connect_one(
+                manager.entry(name).expect("the configured entry"),
+                Arc::clone(&manager),
+                std::time::Duration::from_secs(20),
+            )
+            .await;
+        }
+        // The snapshot holds a listing for a server that is not connected now, as it does for one
+        // that is reconnecting.
+        let ida = manager.entry("ida").expect("the configured entry");
+        manager
+            .update_server_tools(&ida, ServerTools {
+                tools: vec![fixture_tool("mcp__ida__decompile")],
+                deferred: Vec::new(),
+            })
+            .await;
+        let parent = crate::tools::ToolRegistry::new();
+        let _subscription =
+            crate::tools::mcp_adapter::attach_session_registry(&manager, parent.clone()).await;
+        assert!(parent.get("mcp__ida__decompile").is_some());
+        let listings = || {
+            ["notion", "linear"].map(|name| {
+                std::fs::read_to_string(log(name))
+                    .unwrap_or_default()
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .filter(|request| request["method"] == "tools/list")
+                    .count()
+            })
+        };
+        let listed = listings();
+        assert!(listed.iter().all(|count| *count >= 1), "the connects list");
+
+        let worker = crate::tools::ToolRegistry::scoped_for_test(crate::tools::ToolScope::new(
+            vec!["linear".to_string()],
+            Vec::new(),
+        ));
+        crate::tools::mcp_adapter::install_on_worker_registry(&manager, &worker).await;
+
+        assert_eq!(
+            listings(),
+            listed,
+            "the spawn asked a server for its tools again"
+        );
+        for name in ["mcp__notion__search", "mcp__notion__create_page"] {
+            assert!(worker.get(name).is_some(), "{name} reached the worker");
+            assert_eq!(
+                worker.is_deferred(name),
+                parent.is_deferred(name),
+                "{name} is deferred for the worker as for its parent"
+            );
+        }
+        assert!(worker.is_deferred("mcp__notion__create_page"));
+        assert!(parent.get("mcp__linear__search").is_some());
+        assert!(
+            worker.get("mcp__linear__search").is_none(),
+            "a server the worker's scope denies"
+        );
+        assert!(
+            worker.get("mcp__ida__decompile").is_none(),
+            "a server that is not connected"
         );
     }
 

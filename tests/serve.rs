@@ -2847,6 +2847,124 @@ fn a_scheduled_fire_waits_for_a_free_slot() {
     );
 }
 
+/// One session's long turn holds no other session's jobs. A job whose session is mid-turn is held
+/// over before its gate runs while another session's job fires, and once the turn is over the
+/// held job's gate runs and it fires.
+#[cfg(unix)]
+#[test]
+fn a_job_on_a_session_mid_turn_is_held_over_without_holding_another_session_s() {
+    let script = serde_json::json!([
+        // The busy session's turn, until the test cancels it.
+        [
+            { "type": "sleep", "ms": 120_000 },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        // The free session's fire, while the other turn runs.
+        [
+            { "type": "text", "text": "the free session's fire" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        // The busy session's fire, once its turn is over.
+        [
+            { "type": "text", "text": "the held fire" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn_with(
+        "",
+        "\n[schedule]\npoll_interval = \"1s\"\n",
+        script,
+        "sk_test_token",
+        &["sessions:r", "sessions:w", "schedule:r", "schedule:w"],
+    );
+    let busy = create_session_id(&harness);
+    let free = create_session_id(&harness);
+    let gate_ran = harness.root().join("gate-ran");
+    let scheduled_turn_started = |id: &str| -> bool {
+        let turns: serde_json::Value = harness
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/turns"))
+            .send()
+            .expect("turns")
+            .json()
+            .expect("parse");
+        turns["turns"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|turn| turn["source"] == "schedule")
+    };
+    let wait_for_a_scheduled_turn = |id: &str| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !scheduled_turn_started(id) {
+            assert!(
+                Instant::now() < deadline,
+                "no scheduled turn started on session {id} within 30s"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+
+    let long_turn = request_on_a_thread(
+        &harness,
+        reqwest::Method::POST,
+        &format!("/v1/sessions/{busy}/turns"),
+        serde_json::json!({ "message": "a long turn" }),
+    );
+    harness.wait_until_in_flight(&busy);
+    for job in [
+        serde_json::json!({
+            "session_id": busy,
+            "prompt": "the busy session's job",
+            "at": "1s",
+            "gate": {
+                "check": { "command": format!("touch '{}'", gate_ran.display()) },
+                "when": "succeeded",
+            },
+        }),
+        serde_json::json!({ "session_id": free, "prompt": "the free session's job", "at": "2s" }),
+    ] {
+        let created = harness
+            .request(reqwest::Method::POST, "/v1/jobs")
+            .json(&job)
+            .send()
+            .expect("send");
+        assert_eq!(
+            created.status(),
+            201,
+            "{}",
+            created.text().unwrap_or_default()
+        );
+    }
+
+    wait_for_a_scheduled_turn(&free);
+    let record: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{busy}"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        record["turn_in_flight"], true,
+        "the long turn is still running"
+    );
+    assert!(
+        !gate_ran.exists() && !scheduled_turn_started(&busy),
+        "the busy session's job is held over, its gate unrun"
+    );
+
+    let canceled = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{busy}/cancel"),
+        )
+        .send()
+        .expect("send");
+    assert_eq!(canceled.status(), 204);
+    long_turn.join().expect("the long turn's request");
+    wait_for_a_scheduled_turn(&busy);
+    assert!(gate_ran.exists(), "the held job fired through its gate");
+}
+
 /// Process-wide `max_concurrent_turns = 1` rejects the second concurrent turn (across distinct
 /// sessions) with 429 + concurrency-limit. Validates the `TurnGuard` admission check.
 #[test]
@@ -10671,6 +10789,74 @@ fn a_commands_output_streams_live_and_the_result_still_arrives_whole() {
     assert!(
         !replay.contains("Last-Event-ID"),
         "and no hole is reported where the deltas were: {replay}"
+    );
+}
+
+/// A call's end is announced with what its result records: for an output too large to keep
+/// inline, `tool_call.completed` carries the `large_output` the history holds, naming the entry
+/// that has it whole, never the megabytes themselves.
+#[test]
+fn a_large_result_is_announced_as_the_history_holds_it() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let path = workspace.path().join("large.txt");
+    let line = format!("{}\n", "x".repeat(4095));
+    std::fs::write(&path, line.repeat(1280)).expect("write the file");
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "file_read" },
+            { "type": "tool_use_end", "input": {"path": path} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "read" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"working_directory": workspace.path().to_string_lossy()}))
+        .send()
+        .expect("create");
+    assert_eq!(create.status(), 201);
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+    let accepted = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/inbox"))
+        .json(&serde_json::json!({"message": "read it", "class": "followup"}))
+        .send()
+        .expect("send");
+    assert_eq!(accepted.status(), 202);
+
+    let body = read_feed_until(feed, |text| text.contains("event: turn.finished"));
+    let completed = sse_event_data(&body, "tool_call.completed").expect("completed");
+    let announced = &completed["content"];
+    assert_eq!(announced[0]["type"], "large_output", "{completed}");
+    assert!(
+        announced.to_string().len() < 8 * 1024,
+        "{} bytes announced",
+        announced.to_string().len()
+    );
+
+    let history: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/history"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let recorded = history["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .flat_map(|item| item["content"].as_array().into_iter().flatten())
+        .find(|block| block["type"] == "tool_result" && block["tool_use_id"] == "tu_1")
+        .unwrap_or_else(|| panic!("the result is in the history: {history}"));
+    assert_eq!(
+        &recorded["content"], announced,
+        "the event says what the history says"
     );
 }
 

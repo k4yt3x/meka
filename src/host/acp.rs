@@ -1357,6 +1357,119 @@ mod tests {
         assert!(build_completion_content("shell_execute", &content, None, None).is_empty());
     }
 
+    /// A command whose output was too large to keep inline closes on the window its live text
+    /// view was showing, which is how the output ends, rather than on the opening its result
+    /// keeps; with no window to keep, it closes on the opening, as a replay does.
+    #[test]
+    fn a_large_output_closes_on_the_window_its_live_text_showed() {
+        let text_of = |blocks: Vec<ToolCallContent>| {
+            assert_eq!(blocks.len(), 1, "{blocks:?}");
+            serde_json::to_value(&blocks[0]).expect("json")["content"]["text"].clone()
+        };
+        let content = vec![ToolResultContent::LargeOutput {
+            scratchpad_entry: "shell_execute_x_1".to_string(),
+            size_bytes: 200_000,
+            preview: "1\n2\n".to_string(),
+        }];
+        let closed = |shown| {
+            completion_content_after_live_text(shown, "shell_execute", &content, None, None)
+        };
+        assert_eq!(
+            text_of(closed(Some("199999\n200000\n"))),
+            "```console\n199999\n200000\n```"
+        );
+        assert_eq!(text_of(closed(None)), "```console\n1\n2\n```");
+    }
+
+    /// The window holds only what the command printed, so a large output that closes on it says
+    /// how the command ended as the result's text does: why Meka ended it ahead of the output,
+    /// the code it exited with after.
+    #[test]
+    fn a_large_output_s_window_closes_with_how_the_command_ended() {
+        let text_of = |blocks: Vec<ToolCallContent>| {
+            assert_eq!(blocks.len(), 1, "{blocks:?}");
+            serde_json::to_value(&blocks[0]).expect("json")["content"]["text"].clone()
+        };
+        let content = vec![ToolResultContent::LargeOutput {
+            scratchpad_entry: "shell_execute_x_1".to_string(),
+            size_bytes: 200_000,
+            preview: "1\n2\n".to_string(),
+        }];
+        assert_eq!(
+            text_of(completion_content_after_live_text(
+                Some("199999\n200000\n"),
+                "shell_execute",
+                &content,
+                Some(ToolOutputMetadata::CommandExit {
+                    exit_code: Some(3),
+                    signal: None,
+                    reason: None,
+                    closing: Some("\nExit code: 3".to_string()),
+                }),
+                None,
+            )),
+            "```console\n199999\n200000\n\nExit code: 3\n```"
+        );
+        assert_eq!(
+            text_of(completion_content_after_live_text(
+                Some("199999\n200000\n"),
+                "shell_execute",
+                &content,
+                Some(ToolOutputMetadata::CommandExit {
+                    exit_code: None,
+                    signal: None,
+                    reason: Some("Command timed out after 1500ms".to_string()),
+                    closing: None,
+                }),
+                None,
+            )),
+            "```console\nCommand timed out after 1500ms\n199999\n200000\n```"
+        );
+        // A command a signal ended has no code to state beside it, and the text still ends on
+        // the line it gives one.
+        assert_eq!(
+            text_of(completion_content_after_live_text(
+                Some("199999\n200000\n"),
+                "shell_execute",
+                &content,
+                Some(ToolOutputMetadata::CommandExit {
+                    exit_code: None,
+                    signal: Some("SIGSEGV".to_string()),
+                    reason: None,
+                    closing: Some("\nExit code: -1".to_string()),
+                }),
+                None,
+            )),
+            "```console\n199999\n200000\n\nExit code: -1\n```"
+        );
+    }
+
+    /// A result kept whole closes on itself whatever its live text view showed last, which is only
+    /// a tail of what the result holds.
+    #[test]
+    fn a_result_kept_whole_closes_on_itself_after_a_live_text_view() {
+        let content = vec![ToolResultContent::Text {
+            text: "hello\nworld\n".to_string(),
+        }];
+        assert_eq!(
+            serde_json::to_value(completion_content_after_live_text(
+                Some("world\n"),
+                "shell_execute",
+                &content,
+                None,
+                None,
+            ))
+            .expect("json"),
+            serde_json::to_value(build_completion_content(
+                "shell_execute",
+                &content,
+                None,
+                None
+            ))
+            .expect("json")
+        );
+    }
+
     fn empty_live_output() -> LiveOutput {
         LiveOutput::new(LiveOutputMode::Text)
     }

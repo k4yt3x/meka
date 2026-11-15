@@ -435,8 +435,8 @@ mod tests {
         ]);
     }
 
-    /// Adopting another session's row replaces everything in place, the tools included, so an
-    /// agent that moves to another session neither keeps the last one's nor adds to them.
+    /// Adopting a row replaces everything in place, the tools included, so the counters a session
+    /// is reopened with are its row's and nothing else's.
     #[test]
     fn adopting_a_row_replaces_every_field_in_place() {
         let stats = SessionStats::default();

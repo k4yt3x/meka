@@ -260,6 +260,14 @@ and `meka serve` leaves that session's jobs to whoever holds it rather than reac
 handing the occurrence back afterwards, which matters most for a gated job, since deciding late
 would mean running its probe on every tick.
 
+A job whose session is mid-turn is held over the same way: `meka serve` and `meka acp` leave it,
+with no gate run and nothing claimed, until a sweep finds the session free, and fire other
+sessions' jobs meanwhile. A session whose turns follow one another without a pause, as when inbox
+items arrive faster than its turns end, is not found free until they stop, and its jobs wait until
+then. A turn that begins while a job's gate runs defers that fire: the
+occurrence is handed back with the gate's baseline unchanged, and the gate is asked again once the
+session is free.
+
 ### More than one host on the same store
 
 Several Meka processes pointed at one data directory (two `meka serve` instances, or a daemon and
@@ -297,7 +305,9 @@ That collapsing is per job. A session with several jobs all due at once still wa
 and a sweep runs at most `[schedule] max_consecutive_fires` (5 by default) of any **one session's**
 jobs before moving on. The rest keep their occurrence and their gate baseline and are taken by the
 next sweep, most-overdue first, so nothing is lost and nothing starves. A job held over runs no gate
-and is not claimed, so holding one over is free.
+and is not claimed, so holding one over is free. A job whose session is mid-turn is held over too,
+until a sweep finds the session free, so one session's long turn does not hold back another
+session's jobs.
 
 **What this does and does not do.** It bounds a *batch*, not a total: forty due jobs still produce
 forty turns, and they are not spaced out: a sweep that ran long leaves the next one already due.

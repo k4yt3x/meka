@@ -103,20 +103,14 @@ fn call_context(context: ToolContext) -> CallContext {
     }
 }
 
-/// Put one server's listing into a registry.
-///
-/// Marks after replacing, because [`ToolRegistry::replace_server_tools`] drops the deferred marks
-/// of the names it removes.
+/// Put one server's listing into a registry, its tools and its deferred marks in one step.
 fn apply(registry: &ToolRegistry, server_name: &str, tools: &ServerTools) {
     let adapted = tools
         .tools
         .iter()
         .map(|tool| Arc::new(McpToolAdapter::new(Arc::clone(tool))) as Arc<dyn Tool>)
         .collect();
-    registry.replace_server_tools(server_name, adapted);
-    for name in &tools.deferred {
-        registry.mark_deferred(name);
-    }
+    registry.replace_server_tools(server_name, adapted, &tools.deferred);
 }
 
 impl ServerToolsObserver for ToolRegistry {
@@ -166,13 +160,13 @@ pub(crate) async fn detach_session_registry(manager: &McpClientManager, registry
 }
 
 /// Install MCP tools onto a freshly built worker registry. Mirrors [`attach_session_registry`]
-/// minus the subscription: only already-`Connected` servers contribute tools, and Pending or Failed
-/// servers are skipped silently, so their tools simply do not appear in the worker's catalog. A
-/// server the registry's denials name is not even listed.
+/// minus the subscription: every `Connected` server contributes the tools the manager last listed
+/// for it, the listing its parent's registry holds, deferred as there, with no round trip to the
+/// server; Pending or Failed servers are skipped, so their tools simply do not appear in the
+/// worker's catalog. A server the registry's scope withholds contributes nothing.
 ///
-/// Mirrors the connector's deferred-mark step, so a worker sees the same eager-vs-deferred split as
-/// its parent. Idempotent and safe to call concurrently from separate `agent_spawn` invocations
-/// operating on distinct registries.
+/// Idempotent and safe to call concurrently from separate `agent_spawn` invocations operating on
+/// distinct registries.
 pub(crate) async fn install_on_worker_registry(
     manager: &Arc<McpClientManager>,
     registry: &ToolRegistry,
@@ -181,24 +175,9 @@ pub(crate) async fn install_on_worker_registry(
     // not a bare "not registered".
     registry.set_mcp_manager(Arc::downgrade(manager));
     mcp_resources::register_all(registry, Arc::clone(manager));
-    for name in manager.server_names() {
-        // Skip the round trip entirely rather than discovering and then filtering: a denied
-        // server should not even be listed, and `list_all_tools` on a server the worker cannot
-        // use is latency the spawn pays for nothing.
+    for (name, tools) in manager.connected_server_tools().await {
         if !registry.tool_scope().admits_server(&name) {
             tracing::info!("MCP server '{name}' is outside the sub-agent's tool scope");
-            continue;
-        }
-        let tools = match manager.discover_server_tools(&name).await {
-            Ok(tools) => tools,
-            Err(error) => {
-                // A Pending or Failed server falls through `require_connected` as `Err`, which is
-                // the normal state during the parent's handshake, so not a warning.
-                tracing::debug!("MCP server '{name}' skipped for sub-agent registry: {error}");
-                continue;
-            }
-        };
-        if tools.tools.is_empty() {
             continue;
         }
         apply(registry, &name, &tools);

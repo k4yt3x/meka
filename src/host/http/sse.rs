@@ -331,8 +331,7 @@ pub(crate) fn translate(
         FrontendEvent::ThinkingBlock { .. } => {
             // Not forwarded. The deltas above already carried this text, and the agent emits them
             // for every block that has any -- including the ones a non-streaming provider hands
-            // back whole -- so forwarding the block as well would deliver the reasoning twice. The
-            // blocking response still reads it from the recorder, which sees both.
+            // back whole -- so forwarding the block as well would deliver the reasoning twice.
             return None;
         }
         // The only event that separates "the model is writing a message" from any other work in a
@@ -413,8 +412,8 @@ pub(crate) fn translate(
             SseEventType::ChecklistUpdated,
             serde_json::json!({ "items": items }),
         ),
-        // Metadata-only: the recorder captures it for the blocking JSON / terminal SSE payload
-        // but it gets no wire event of its own.
+        // Metadata-only: the turn's facts keep the last one for the terminal's `usage`, but it
+        // gets no wire event of its own.
         FrontendEvent::TokenUsage(_) => return None,
         // The occupancy `GET /context` answers with, pushed as it is measured: `used` after every
         // provider round and every rewrite, `window` beside it once known.
@@ -442,7 +441,7 @@ pub(crate) fn translate(
         FrontendEvent::SubAgentActivity { .. } => return None,
         // Not a rewrite of anything: each update is a fact about the call's progress the client
         // did not have, and an MCP call can be minutes long with `tool_call.completed` the only
-        // other sign of life. Dropped by the blocking recorder, which has no live reader.
+        // other sign of life. A blocking turn keeps nothing of it, having no live reader.
         FrontendEvent::McpProgress(update) => (
             SseEventType::ToolCallProgress,
             serde_json::json!(ProgressView::from(update)),

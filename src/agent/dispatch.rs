@@ -28,6 +28,13 @@ pub(super) struct ResolvedCall<'a> {
     pub(super) unparsed: Option<&'a crate::conversation::UnparsedArguments>,
 }
 
+/// What announcing a call's end takes that its result block does not hold, kept from its run
+/// until its result is settled; see [`Agent::announce_completions`].
+pub(super) struct PendingCompletion {
+    pub(super) name: String,
+    pub(super) metadata: Option<crate::frontend::ToolOutputMetadata>,
+}
+
 /// Which door a resolved call comes through; see [`Agent::run_admitted_call`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum CallDoor {
@@ -76,7 +83,9 @@ impl Agent {
     /// `loaded` is the turn's active-tool set, used only to tell a call made against a schema the
     /// model has actually seen from one made blind; see [`Self::schema_advisory`]. The third value
     /// names the calls whose result is a word about the call rather than the tool's output, which
-    /// the `scratchpad` redirect leaves inline; see [`crate::tools::ToolOutput::is_output`].
+    /// the `scratchpad` redirect leaves inline; see [`crate::tools::ToolOutput::is_output`]. The
+    /// fourth is what announcing each call's end takes beside its result, in the order of the
+    /// results, for [`Self::announce_completions`] once they are settled.
     pub(super) async fn execute_tool_calls(
         &self,
         assistant_message: &Message,
@@ -87,6 +96,7 @@ impl Agent {
         Vec<ContentBlock>,
         Vec<crate::provider::ToolDuration>,
         Vec<String>,
+        Vec<PendingCompletion>,
     ) {
         // Emit tool-call indicators in source order. The streaming path already emitted these as
         // `ToolUseEnd` events; this loop only fires for the blocking provider path. Serial so
@@ -158,13 +168,12 @@ impl Agent {
         });
         let outputs = futures::future::join_all(futures).await;
 
-        // Serial pass to accumulate scratchpad hints, emit per-tool completion events in source
-        // order, build ToolResult blocks, and emit a single ChecklistUpdated event if any
-        // `checklist_*` call landed and actually changed the state.
+        // Serial pass to accumulate scratchpad hints and build ToolResult blocks in source order,
+        // with what announcing each call's end takes beside its result.
         let mut results = Vec::with_capacity(planned.len());
         let mut durations = Vec::with_capacity(planned.len());
         let mut inline_results = Vec::new();
-        let mut checklist_fired = false;
+        let mut pending = Vec::with_capacity(planned.len());
         for ((id, name, ..), (output, elapsed)) in planned.into_iter().zip(outputs) {
             let (id, name) = (id.to_string(), name.to_string());
             if !output.is_output {
@@ -174,9 +183,6 @@ impl Agent {
                 name: name.clone(),
                 elapsed,
             });
-            if crate::tools::checklist::changes_the_list(&name) {
-                checklist_fired = true;
-            }
             if output.spill_hint != crate::tools::SpillHint::default() {
                 self.scratchpad_hints
                     .write()
@@ -184,26 +190,59 @@ impl Agent {
                     .insert(id.clone(), output.spill_hint.clone());
             }
             let display = self.result_display(&name, &output).await;
-            // Notify the frontend of completion BEFORE building the ToolResult content block so ACP
-            // `tool_call_update` notifications arrive before the next assistant turn's text starts
-            // streaming.
-            self.cells
-                .frontend
-                .emit(FrontendEvent::ToolCallCompleted {
-                    id: id.clone(),
-                    name: name.clone(),
-                    is_error: output.is_error,
-                    content: output.content.clone(),
-                    metadata: output.frontend_metadata.clone(),
-                    display: display.clone(),
-                })
-                .await;
+            pending.push(PendingCompletion {
+                name,
+                metadata: output.frontend_metadata,
+            });
             results.push(ContentBlock::ToolResult {
                 tool_use_id: id,
                 content: output.content,
                 is_error: output.is_error,
                 display,
             });
+        }
+
+        (results, durations, inline_results, pending)
+    }
+
+    /// Announce the end of each of a round's calls, in the order the model wrote them, with what
+    /// its settled result holds, so every surface is told what the conversation records; then the
+    /// checklist once, if a `checklist_*` call changed it. `results` are the round's results once
+    /// [`crate::tools::scratchpad::save_explicit_scratchpad_results`] and
+    /// [`crate::tools::scratchpad::persist_oversized_results`] have settled them, and `pending`
+    /// what [`Self::execute_tool_calls`] kept beside each, in the same order. Called before the
+    /// next request is sent, so ACP's `tool_call_update` reaches the editor before the next
+    /// reply's text streams.
+    pub(super) async fn announce_completions(
+        &self,
+        results: &[ContentBlock],
+        pending: Vec<PendingCompletion>,
+    ) {
+        let mut checklist_fired = false;
+        for (result, PendingCompletion { name, metadata }) in results.iter().zip(pending) {
+            let ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                display,
+            } = result
+            else {
+                continue;
+            };
+            if crate::tools::checklist::changes_the_list(&name) {
+                checklist_fired = true;
+            }
+            self.cells
+                .frontend
+                .emit(FrontendEvent::ToolCallCompleted {
+                    id: tool_use_id.clone(),
+                    name,
+                    is_error: *is_error,
+                    content: content.clone(),
+                    metadata,
+                    display: display.clone(),
+                })
+                .await;
         }
         if checklist_fired {
             let state = self.cells.checklist.get();
@@ -226,8 +265,6 @@ impl Agent {
                     .await;
             }
         }
-
-        (results, durations, inline_results)
     }
 
     pub(super) async fn resolve_and_execute_tool(
@@ -1097,7 +1134,7 @@ mod tests {
                 .collect(),
             provider_fields: None,
         };
-        let (results, _, inline_results) = agent
+        let (results, _, inline_results, _) = agent
             .execute_tool_calls(
                 &message,
                 &[],
@@ -1165,7 +1202,7 @@ mod tests {
             }],
             provider_fields: None,
         };
-        let (results, _durations, _) = agent
+        let (results, ..) = agent
             .execute_tool_calls(
                 &call,
                 &[],
@@ -1527,6 +1564,8 @@ mod tests {
                         crate::frontend::ToolOutputMetadata::CommandExit {
                             exit_code: Some(7),
                             signal: None,
+                            reason: None,
+                            closing: None,
                         },
                     ),
                 )
@@ -1732,7 +1771,7 @@ mod tests {
             ],
             provider_fields: None,
         };
-        let (results, durations, _) = agent
+        let (results, durations, ..) = agent
             .execute_tool_calls(
                 &message,
                 &[],
@@ -1907,6 +1946,8 @@ mod tests {
                 metadata: crate::frontend::ToolOutputMetadata::CommandExit {
                     exit_code: Some(3),
                     signal: None,
+                    reason: None,
+                    closing: None,
                 },
             }))
             .expect("registration");
@@ -2001,6 +2042,19 @@ mod tests {
         );
     }
 
+    /// Run `message`'s calls and announce their ends, as a round does, with the results unsettled.
+    async fn run_and_announce(agent: &Agent, message: &Message) {
+        let (results, _, _, pending) = agent
+            .execute_tool_calls(
+                message,
+                &[],
+                &crate::provider::Attribution::default(),
+                CancellationToken::new(),
+            )
+            .await;
+        agent.announce_completions(&results, pending).await;
+    }
+
     /// One `ChecklistUpdated` per change. A read changes nothing and announces nothing; an edit
     /// that empties the list announces the empty list, which is what lets a surface clear it.
     #[tokio::test]
@@ -2058,35 +2112,22 @@ mod tests {
                 .count()
         };
 
-        agent
-            .execute_tool_calls(
-                &call("checklist_add", serde_json::json!({"items": ["first"]})),
-                &[],
-                &crate::provider::Attribution::default(),
-                CancellationToken::new(),
-            )
-            .await;
+        run_and_announce(
+            &agent,
+            &call("checklist_add", serde_json::json!({"items": ["first"]})),
+        )
+        .await;
         assert_eq!(rendered(), 1, "a new item is announced once");
-        agent
-            .execute_tool_calls(
-                &call("checklist_read", serde_json::json!({})),
-                &[],
-                &crate::provider::Attribution::default(),
-                CancellationToken::new(),
-            )
-            .await;
+        run_and_announce(&agent, &call("checklist_read", serde_json::json!({}))).await;
         assert_eq!(rendered(), 1, "a read announces nothing");
-        agent
-            .execute_tool_calls(
-                &call(
-                    "checklist_edit",
-                    serde_json::json!({"id": 1, "status": "completed"}),
-                ),
-                &[],
-                &crate::provider::Attribution::default(),
-                CancellationToken::new(),
-            )
-            .await;
+        run_and_announce(
+            &agent,
+            &call(
+                "checklist_edit",
+                serde_json::json!({"id": 1, "status": "completed"}),
+            ),
+        )
+        .await;
         assert_eq!(
             rendered(),
             2,
@@ -2096,6 +2137,210 @@ mod tests {
             frontend.events().last(),
             Some(FrontendEvent::ChecklistUpdated { items }) if items.is_empty()
         ));
+    }
+
+    /// A tool that answers with its call's `say`, or with `size` bytes of `x`.
+    struct Echo;
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for Echo {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "echo".to_string(),
+                description: "fixture".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"say": {"type": "string"}, "size": {"type": "integer"}}
+                }),
+                ..Default::default()
+            }
+        }
+
+        fn required_permission(&self) -> crate::permission::Permission {
+            crate::permission::Permission::Read
+        }
+
+        async fn execute(
+            &self,
+            input: serde_json::Value,
+            _context: crate::tools::ToolContext,
+        ) -> crate::error::Result<crate::tools::ToolOutput> {
+            let said = match input["size"].as_u64() {
+                Some(size) => "x".repeat(usize::try_from(size).expect("a size")),
+                None => input["say"].as_str().unwrap_or_default().to_string(),
+            };
+            Ok(crate::tools::ToolOutput::text(said, false))
+        }
+    }
+
+    /// An agent in a session of its own with [`Echo`] registered, whose provider makes `calls`
+    /// (each an id, a tool's name and its arguments) in one round and then answers, and whose
+    /// frontend records what it is told.
+    async fn agent_making_calls(
+        calls: &[(&str, &str, serde_json::Value)],
+    ) -> (
+        Agent,
+        crate::store::Store,
+        Arc<crate::frontend::testing::RecordingFrontend>,
+    ) {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let mut round = Vec::new();
+        for (id, name, input) in calls {
+            round.push(MockEvent::ToolUseStart {
+                id: id.to_string(),
+                name: name.to_string(),
+            });
+            round.push(MockEvent::ToolUseEnd {
+                input: input.clone(),
+            });
+        }
+        round.push(MockEvent::MessageEnd {
+            stop_reason: MockStopReason::ToolUse,
+        });
+        let answer = vec![
+            MockEvent::Text {
+                text: "done".to_string(),
+            },
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::EndTurn,
+            },
+        ];
+        let registry = crate::tools::ToolRegistry::new();
+        registry.register(Arc::new(Echo)).expect("registration");
+        let (mut agent, store) = agent_with_registry_for_test(
+            Arc::new(MockProvider::from_rounds(vec![round, answer])),
+            registry,
+        )
+        .await;
+        let frontend = Arc::new(crate::frontend::testing::RecordingFrontend::new());
+        agent.cells.frontend = Arc::clone(&frontend) as Arc<dyn crate::frontend::Frontend>;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("a session");
+        agent.cells.session_id.set(session_id);
+        (agent, store, frontend)
+    }
+
+    /// Run a turn on `agent` and answer the conversation it leaves.
+    async fn run_a_turn(agent: &Agent) -> Conversation {
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the turn runs");
+        messages
+    }
+
+    /// Each call's end is announced with what its result holds once the round is settled, so a
+    /// surface is told what the conversation records: an output too large to keep inline as the
+    /// large output naming its entry, never its megabytes; an output its call saved to an entry as
+    /// the reference to it; a small output as it is.
+    #[tokio::test]
+    async fn a_round_announces_each_call_s_end_as_its_result_records_it() {
+        let size = 5 * crate::text::MIB;
+        let (agent, _store, frontend) = agent_making_calls(&[
+            ("call-1", "echo", serde_json::json!({"size": size})),
+            (
+                "call-2",
+                "echo",
+                serde_json::json!({"say": "kept", "scratchpad": "notes"}),
+            ),
+            ("call-3", "echo", serde_json::json!({"say": "small"})),
+        ])
+        .await;
+        let messages = run_a_turn(&agent).await;
+
+        let recorded: Vec<(String, Vec<ToolResultContent>)> = messages
+            .as_slice()
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => Some((tool_use_id.clone(), content.clone())),
+                _ => None,
+            })
+            .collect();
+        let announced: Vec<(String, Vec<ToolResultContent>)> = frontend
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                FrontendEvent::ToolCallCompleted { id, content, .. } => Some((id, content)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            announced == recorded,
+            "each end is announced as its result records it"
+        );
+        let [(_, large), (_, named), (_, small)] = announced.as_slice() else {
+            panic!("three calls end");
+        };
+        assert!(
+            matches!(large.as_slice(), [ToolResultContent::LargeOutput { size_bytes, .. }]
+                if *size_bytes == size)
+        );
+        let bytes = serde_json::to_string(large).expect("serialize").len();
+        assert!(bytes < 8 * crate::text::KIB, "{bytes} bytes announced");
+        let reference = ContentBlock::tool_result_text_content(named);
+        assert!(
+            reference.contains("scratchpad entry 'notes'"),
+            "{reference}"
+        );
+        assert_eq!(small, &vec![ToolResultContent::Text {
+            text: "small".to_string()
+        }]);
+    }
+
+    /// A round's ends are announced in the order the model wrote its calls, and the checklist a
+    /// call changed after them all.
+    #[tokio::test]
+    async fn a_round_announces_its_ends_in_the_order_written_and_the_checklist_after_them() {
+        let (agent, store, frontend) = agent_making_calls(&[
+            ("call-1", "echo", serde_json::json!({"say": "first"})),
+            (
+                "call-2",
+                "checklist_add",
+                serde_json::json!({"items": ["second"]}),
+            ),
+            ("call-3", "echo", serde_json::json!({"say": "third"})),
+        ])
+        .await;
+        agent
+            .tool_registry
+            .register(Arc::new(crate::tools::checklist::ChecklistAddTool {
+                checklist: agent.cells.checklist.clone(),
+                store,
+                site: agent.cells.site(),
+            }))
+            .expect("registration");
+        run_a_turn(&agent).await;
+
+        let events = frontend.events();
+        let ended: Vec<(usize, &str)> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(place, event)| match event {
+                FrontendEvent::ToolCallCompleted { id, .. } => Some((place, id.as_str())),
+                _ => None,
+            })
+            .collect();
+        let ids: Vec<&str> = ended.iter().map(|(_, id)| *id).collect();
+        assert_eq!(ids, ["call-1", "call-2", "call-3"]);
+        let listed = events
+            .iter()
+            .position(|event| matches!(event, FrontendEvent::ChecklistUpdated { .. }))
+            .expect("the list is announced");
+        assert!(ended.iter().all(|(place, _)| *place < listed), "{events:?}");
     }
 
     /// What a test asks a [`StartFixture`]'s start step to do.

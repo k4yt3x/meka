@@ -780,7 +780,7 @@ mod tests {
     ) -> Fixture {
         let mut list = crate::tools::Registered::default();
         for tool in registered {
-            list.push(tool);
+            list.insert(tool);
         }
         let tools: ToolStorage = Arc::new(RwLock::new(list));
         let deferred: DeferredStorage = Arc::new(RwLock::new(

@@ -106,25 +106,38 @@ pub(crate) async fn save_explicit_scratchpad_results(
             if inline.iter().any(|id| id == tool_use_id) {
                 continue;
             }
-            match redirect(inherited_names, name, content) {
-                None => {}
-                Some(Redirect::Refused(note)) => {
-                    content.push(ToolResultContent::Text { text: note })
-                }
-                Some(Redirect::Save {
-                    name,
-                    text,
-                    reference,
-                }) => {
-                    store
-                        .save_scratchpad_entry(session_id, &name, &text)
-                        .await?;
-                    let notes = notes_of(content);
-                    *content = std::iter::once(ToolResultContent::Text { text: reference })
-                        .chain(notes)
-                        .collect();
-                }
-            }
+            save_to_named_entry(store, session_id, inherited_names, name, content).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Save the output `content` holds under `name`, the entry its call named, and leave the reference
+/// to it in its place with Meka's notes about the call; or, where `name` is one a parent lent,
+/// leave the output with the refusal beside it. What a round's call
+/// ([`save_explicit_scratchpad_results`]) and a checkpoint's call save their output through.
+pub(crate) async fn save_to_named_entry(
+    store: &Store,
+    session_id: Uuid,
+    inherited_names: &[String],
+    name: &str,
+    content: &mut Vec<ToolResultContent>,
+) -> Result<()> {
+    match redirect(inherited_names, name, content) {
+        None => {}
+        Some(Redirect::Refused(note)) => content.push(ToolResultContent::Text { text: note }),
+        Some(Redirect::Save {
+            name,
+            text,
+            reference,
+        }) => {
+            store
+                .save_scratchpad_entry(session_id, &name, &text)
+                .await?;
+            let notes = notes_of(content);
+            *content = std::iter::once(ToolResultContent::Text { text: reference })
+                .chain(notes)
+                .collect();
         }
     }
     Ok(())

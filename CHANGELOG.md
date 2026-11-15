@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Session archives are `format_version` 29; older archives are brought forward on import.
 - A memory export lists tags and references one per line and quotes only what YAML requires.
 - `meka skill get --format json` and `show --format json` print the description as the file has it.
+- **Breaking:** `tool_call.completed` gives a large result as history does; see the upgrade guide.
+- An ACP `tool_call_update` no longer carries a large result whole; see the upgrade guide.
+- A gated job due while its session is mid-turn runs its gate once the session is free.
+- MCP tools follow the built-in ones in a request, sorted by name, whichever server answers first.
+- On the screen, a large result that did not stream shows its opening, as a resumed session does.
+- After the screen's `/resume`, the context gauge shows the session's own last measurement.
 
 ### Fixed
 
@@ -82,6 +88,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A memory export keeps a control character in a description or a source.
 - `memory_write` clears `source` when given `""`, as its schema says.
 - `GET /v1/skills/{name}` returns the description as the file has it, not a stripped copy.
+- The screen's `/resume` and `/fork` are refused while a background task runs, keeping its report.
+- The screen's `/resume` runs the session under its own directory's `[instructions].files`.
+- After the screen's `/resume`, the context block no longer counts the last session's compactions.
+- A scheduled job whose session is mid-turn no longer holds back other sessions' jobs.
+- `meka serve` no longer keeps every event of a running turn in memory until the turn ends.
+- An MCP server listing its tools again keeps their place, so a reconnect keeps the prompt cache.
+- A server's deferred tools no longer reach one request undeferred while its listing is applied.
+- Spawning or following up a sub-agent no longer asks every connected MCP server for its tools.
+- A compaction's checkpoint saves a call's output to the entry its `scratchpad` argument names.
+- Stopping a turn ends an automatic compaction's summary request instead of waiting it out.
+- A Claude subscription request after a rewind that removed every reply names no previous one.
 
 ## [0.94.0] - 2026-11-12
 

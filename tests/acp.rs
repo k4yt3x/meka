@@ -3028,6 +3028,86 @@ fn acp_client_without_terminal_capability_gets_console_text() {
     );
 }
 
+/// A command whose output is too large to keep inline is closed, for a client drawing it as text,
+/// on the window it was showing, which is how the output ends, and on the code it exited with,
+/// which no window holds; `rawOutput` is the result as the log records it: a large output naming
+/// its entry. A replay has no window and shows the opening, with the same `rawOutput`.
+#[test]
+fn a_large_output_drawn_as_text_closes_on_its_window_and_replays_as_recorded() {
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "call_exec", "name": "shell_execute" },
+            { "type": "tool_use_end", "input": { "command": "cat numbered.txt; exit 3" } },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let mut harness = AcpTestHarness::spawn_with_capabilities(
+        ACP_UNRESTRICTED_CONFIG,
+        Some(script),
+        serde_json::json!({ "terminal": false }),
+    );
+    let cwd = harness.work_dir();
+    let lines: String = (1..=2000)
+        .map(|line| format!("line {line:05} {}\n", "x".repeat(50)))
+        .collect();
+    std::fs::write(cwd.join("numbered.txt"), lines).expect("write the file");
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "run it");
+    let (updates, response) = harness.collect_updates(&session_id, id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    let completion = |updates: &[serde_json::Value]| -> serde_json::Value {
+        updates
+            .iter()
+            .map(|value| &value["params"]["update"])
+            .find(|update| {
+                update["sessionUpdate"] == "tool_call_update"
+                    && update["toolCallId"] == "call_exec"
+                    && !update["status"].is_null()
+            })
+            .cloned()
+            .unwrap_or_else(|| panic!("the command must complete: {updates:?}"))
+    };
+    let live = completion(&updates);
+    assert_eq!(live["status"], "failed", "{live}");
+    let shown = live["content"][0]["content"]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a text block: {live}"));
+    assert!(
+        shown.contains("line 02000") && !shown.contains("line 00001"),
+        "{shown}"
+    );
+    assert!(
+        shown.trim_end().ends_with("Exit code: 3\n```"),
+        "the close says how the command ended: {shown}"
+    );
+    assert_eq!(live["rawOutput"][0]["type"], "large_output", "{live}");
+
+    let closed = harness.request(
+        "session/close",
+        serde_json::json!({ "sessionId": session_id }),
+    );
+    assert!(closed["result"].is_object(), "close must succeed: {closed}");
+    let id = harness.send_request(
+        "session/load",
+        serde_json::json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
+    );
+    let (updates, response) = harness.collect_updates(&session_id, id);
+    assert!(
+        response["result"].is_object(),
+        "load must succeed: {response}"
+    );
+    let replayed = completion(&updates);
+    assert_eq!(replayed["rawOutput"], live["rawOutput"], "{replayed}");
+    let opening = replayed["content"][0]["content"]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a text block: {replayed}"));
+    assert!(opening.contains("line 00001"), "{opening}");
+}
+
 /// Build a JSON-RPC error response for a request the dispatch closure wants to fail.
 fn jsonrpc_error(id: serde_json::Value, message: &str) -> serde_json::Value {
     serde_json::json!({
@@ -8160,6 +8240,124 @@ poll_interval = "200ms"
         );
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
+}
+
+/// A job whose session is mid-turn is held over ahead of its gate while another session's job
+/// fires, as `meka serve` holds one, and fires through its gate once the turn is over: the scope
+/// the ACP scheduler sweeps declines a busy session, so one tab's long turn holds no other tab's
+/// jobs.
+#[cfg(unix)]
+#[test]
+fn an_acp_job_on_a_session_mid_turn_is_held_over_while_another_session_s_fires() {
+    let script = serde_json::json!([
+        // The busy session's turn, until the test cancels it.
+        [
+            { "type": "text", "text": "LONG_TURN_RUNNING" },
+            { "type": "sleep", "ms": 120_000 },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        // The free session's fire, while the other turn runs.
+        [
+            { "type": "text", "text": "the free session's fire" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        // The busy session's fire, once its turn is over.
+        [
+            { "type": "text", "text": "the held fire" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let config = format!("{ACP_UNRESTRICTED_CONFIG}\n[schedule]\npoll_interval = \"200ms\"\n");
+    let mut harness = AcpTestHarness::spawn(&config, Some(script));
+    let busy = harness.new_session();
+    let free = harness.new_session();
+    let gate_ran = harness.work_dir().join("gate-ran");
+    let prompt = harness.prompt(&busy, "a long turn");
+    let started = read_until(&mut harness.reader, window(20), |line| {
+        line.contains("LONG_TURN_RUNNING")
+    });
+    assert!(
+        started
+            .iter()
+            .any(|line| line.contains("LONG_TURN_RUNNING")),
+        "the long turn never started"
+    );
+
+    // Seeded once the turn runs, in one transaction, the busy session's the more overdue: a
+    // sweep takes the most overdue first, so one that fires the free session's job has been
+    // offered the busy session's ahead of it.
+    {
+        let mut connection =
+            rusqlite::Connection::open(harness.database()).expect("open the store");
+        let now = chrono::Utc::now();
+        let seeded = connection.transaction().expect("begin");
+        for (session, prompt, overdue, gated) in [
+            (&busy, "the busy session's job", 120, true),
+            (&free, "the free session's job", 60, false),
+        ] {
+            let due = (now - chrono::Duration::seconds(overdue)).to_rfc3339();
+            let gate = gated.then(|| {
+                serde_json::json!({
+                    "shell": { "command": format!("touch '{}'", gate_ran.display()) },
+                    "when": "succeeded",
+                })
+                .to_string()
+            });
+            seeded
+                .execute(
+                    "INSERT INTO scheduled_jobs \
+                     (id, session_id, kind, spec, prompt, gate_kind, gate_spec_json, \
+                      gate_last_output, gate_permission, created_at, last_fired_at, next_fire_at) \
+                     VALUES (?1, ?2, 'at', ?3, ?4, ?5, ?6, NULL, ?7, ?8, NULL, ?3)",
+                    rusqlite::params![
+                        uuid::Uuid::new_v4().to_string(),
+                        session,
+                        due,
+                        prompt,
+                        gated.then_some("shell"),
+                        gate,
+                        gated.then_some("unrestricted"),
+                        now.to_rfc3339(),
+                    ],
+                )
+                .expect("seed the due job");
+        }
+        seeded.commit().expect("commit");
+    }
+
+    let database = harness.database();
+    let fired = |session: &str| -> bool {
+        rusqlite::Connection::open(&database)
+            .expect("open the store")
+            .query_row(
+                "SELECT count(*) FROM turns WHERE session_id = ?1 AND source = 'schedule'",
+                rusqlite::params![session],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count the fires' turns")
+            > 0
+    };
+    let wait_for_a_fire = |session: &str| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !fired(session) {
+            assert!(
+                Instant::now() < deadline,
+                "no scheduled turn started on session {session} within 30s"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    wait_for_a_fire(&free);
+    assert!(
+        !gate_ran.exists() && !fired(&busy),
+        "the busy session's job is held over, its gate unrun"
+    );
+
+    harness.cancel(&busy);
+    let (_updates, response) = harness.collect_updates(&busy, prompt);
+    assert_eq!(response["result"]["stopReason"], "cancelled", "{response}");
+    wait_for_a_fire(&busy);
+    assert!(gate_ran.exists(), "the held job fired through its gate");
 }
 
 /// `session/cancel` stops a turn a scheduled job started, not only one the editor prompted.

@@ -133,9 +133,13 @@ pub(crate) fn background_cancellation_notice(signaled: usize) -> Option<String> 
 /// the host leaves on a hangup or a termination, once the turn and the background tasks have been
 /// stopped: the screen as on the last press, the one-shot through its run's own exit path, which
 /// waits for the stopped turn to be saved.
+///
+/// `tasks` names the background tasks a stop reaches, asked at each stop since the session a screen
+/// shows can change under the listeners; `store` is where the stop is recorded.
 pub(crate) fn install_interrupt_handler(
     cancel: crate::host::CancelCell,
-    agent: &Agent,
+    store: Store,
+    tasks: impl Fn() -> crate::background::BackgroundTasks + Send + Sync + 'static,
     announce: impl Fn(&str) + Send + Sync + 'static,
     leave: impl Fn() + Send + Sync + 'static,
     #[cfg_attr(
@@ -151,6 +155,7 @@ pub(crate) fn install_interrupt_handler(
     if INSTALLED.set(()).is_err() {
         return;
     }
+    let tasks = Arc::new(tasks);
 
     // A hangup or a termination has no ladder: the terminal is going or gone, so the turn is
     // stopped, and the background tasks with it, whose process groups would otherwise outlive the
@@ -159,8 +164,8 @@ pub(crate) fn install_interrupt_handler(
     #[cfg(unix)]
     tokio::spawn({
         let cancel = cancel.clone();
-        let tasks = agent.background_tasks();
-        let store = agent.store();
+        let tasks = Arc::clone(&tasks);
+        let store = store.clone();
         async move {
             use tokio::signal::unix::{SignalKind, signal};
             let (Ok(mut hangup), Ok(mut terminate)) = (
@@ -178,6 +183,7 @@ pub(crate) fn install_interrupt_handler(
                 .told_to_leave
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             cancel.cancel(crate::store::turns::CancelReason::ServerShutdown);
+            let tasks = tasks();
             // The process is going away under them, which is what `interrupted` says.
             tasks
                 .stop_all(
@@ -196,8 +202,6 @@ pub(crate) fn install_interrupt_handler(
             leave_on_signal();
         }
     });
-    let tasks = agent.background_tasks();
-    let store = agent.store();
     tokio::spawn(async move {
         loop {
             if tokio::signal::ctrl_c().await.is_err() {
@@ -210,7 +214,7 @@ pub(crate) fn install_interrupt_handler(
                 // `count_press` has already fired the turn's token, when there was one.
                 Escalation::CancelTurn => {}
                 Escalation::CancelBackgroundTasks => {
-                    let signaled = tasks
+                    let signaled = tasks()
                         .stop_all(
                             &store.background_store(),
                             crate::store::background::TaskStatus::Canceled,
@@ -222,7 +226,7 @@ pub(crate) fn install_interrupt_handler(
                 }
                 Escalation::Leave => {
                     announce("Interrupted");
-                    if tokio::time::timeout(INTERRUPT_DRAIN_GRACE, tasks.wait_all())
+                    if tokio::time::timeout(INTERRUPT_DRAIN_GRACE, tasks().wait_all())
                         .await
                         .is_err()
                     {

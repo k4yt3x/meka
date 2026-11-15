@@ -270,6 +270,28 @@ mod tests {
         }
     }
 
+    /// A session is busy while a turn is admitted on it, and while one holds its conversation
+    /// before it is counted, as a scheduled fire does; with neither, it is free.
+    #[tokio::test]
+    async fn a_session_is_busy_while_a_turn_is_admitted_or_holds_its_conversation() {
+        let store = Store::for_test().await;
+        let (session, _manager) = session_for_test(&store, uuid::Uuid::new_v4(), &[]).await;
+        assert!(!session.is_busy(), "nothing runs on a session just opened");
+        let admitted = session.admit_turn(None).expect("no cap to refuse it");
+        assert!(
+            session.is_busy(),
+            "admitted, not yet holding the conversation"
+        );
+        drop(admitted);
+        let held = session.conversation.try_lock().expect("nothing holds it");
+        assert!(
+            session.is_busy(),
+            "holding the conversation, not yet counted"
+        );
+        drop(held);
+        assert!(!session.is_busy(), "both let go");
+    }
+
     #[test]
     fn a_cancel_during_admission_still_stops_the_turn() {
         let cell = CancelCell::default();
@@ -519,6 +541,14 @@ impl ResidentSession {
             background_running,
             last,
         )
+    }
+
+    /// Whether work is in flight on the session: a turn or a claim counted on it (a compaction, a
+    /// rewind, a fork, a change of its row), or its conversation held by work that is not counted
+    /// on it. Answered without waiting.
+    pub(crate) fn is_busy(&self) -> bool {
+        self.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0
+            || self.conversation.try_lock().is_err()
     }
 }
 impl Drop for TurnGuard {

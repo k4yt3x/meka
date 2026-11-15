@@ -109,10 +109,17 @@ impl BackgroundTasks {
         self.inner.lock().await.remove(id);
     }
 
-    /// How many tasks this process is running, across sessions. For the screen's survivor line,
-    /// which cannot name a session for the same reason [`Self::cancel_all`] cannot.
-    pub(crate) async fn running_count_all(&self) -> usize {
-        self.inner.lock().await.len()
+    /// How many tasks this process is running that nothing has told to stop, across sessions,
+    /// since the screen that asks cannot name one for the same reason [`Self::cancel_all`] cannot.
+    /// One told to stop is on its way out, its row already saying how it ended, so the screen's
+    /// move to another session does not wait for it and its survivor line does not count it.
+    pub(crate) async fn unstopped_count_all(&self) -> usize {
+        self.inner
+            .lock()
+            .await
+            .values()
+            .filter(|handle| !handle.cancellation.is_cancelled())
+            .count()
     }
 
     /// How many of `session_id`'s tasks are running here. Backs the `max_tasks` ceiling.
@@ -547,6 +554,38 @@ mod tests {
         }
     }
 
+    /// A task told to stop is still registered until its work has ended, and is no longer one a
+    /// move to another session waits for: what was asked of it has been asked.
+    #[tokio::test]
+    async fn a_task_told_to_stop_is_no_longer_counted_as_unstopped() {
+        let tasks = BackgroundTasks::default();
+        let session_id = Uuid::new_v4();
+        for id in ["one", "two"] {
+            assert!(
+                tasks
+                    .try_reserve(
+                        id.to_string(),
+                        session_id,
+                        tokio_util::sync::CancellationToken::new(),
+                        4,
+                    )
+                    .await
+            );
+        }
+        assert_eq!(tasks.unstopped_count_all().await, 2);
+
+        assert!(tasks.cancel("one").await);
+        assert_eq!(tasks.unstopped_count_all().await, 1);
+        assert_eq!(
+            tasks.running_count(session_id).await,
+            2,
+            "both are still registered"
+        );
+
+        tasks.cancel_all(TaskStatus::Canceled).await;
+        assert_eq!(tasks.unstopped_count_all().await, 0);
+    }
+
     /// The ceiling has to hold against the sibling calls in one assistant message, which
     /// `execute_tool_calls` dispatches concurrently: counting and then registering separately lets
     /// every call read "zero running" and start.
@@ -648,7 +687,7 @@ mod tests {
             "the task must have reached its cleanup before the wait returned",
         );
         assert_eq!(
-            tasks.running_count_all().await,
+            tasks.running_count(session_id).await,
             0,
             "and the registry must be empty afterwards",
         );

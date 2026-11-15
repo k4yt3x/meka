@@ -986,7 +986,8 @@ pub(crate) enum Opening {
 /// Open session `id` in this process: hydrate its conversation, build its agent and hold its lock.
 /// Every host that makes a persisted session resident goes through here, so what it takes to reopen
 /// one is decided once: `session/load`, `session/resume` and `session/fork` for ACP, re-attach and
-/// `POST /v1/sessions` for HTTP, and a fresh row through [`Opening::Fresh`].
+/// `POST /v1/sessions` for HTTP, the screen's `/resume`, and a fresh row through
+/// [`Opening::Fresh`].
 pub(crate) async fn open_session(
     shared: &SharedDeps,
     id: uuid::Uuid,

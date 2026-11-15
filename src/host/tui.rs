@@ -82,15 +82,6 @@ pub(crate) async fn run_interactive(
         None => None,
     };
 
-    // What `/profile` reports and rewrites. Seeded through the same door the agent resolves with,
-    // so a resumed session shows the profile it recorded rather than the configured default.
-    let current_profile = Arc::new(std::sync::RwLock::new(match &repin {
-        Some(profile) => profile.clone(),
-        None => crate::provider::profile_for_config(&store, &config, session_id)
-            .await
-            .unwrap_or_default(),
-    }));
-
     // Per-session working directory, shared by reference between the screen (the status row and
     // `/cd`) and the agent. The process directory is never moved. A resumed session opens where it
     // recorded rather than where this shell is; see `resume_working_directory`.
@@ -181,15 +172,6 @@ pub(crate) async fn run_interactive(
             std::sync::atomic::Ordering::Relaxed,
         );
     }
-    let context_indicator = config
-        .status_row
-        .contains(&crate::config::StatusFact::Context)
-        .then(|| {
-            (
-                Arc::clone(&context_tokens),
-                Arc::clone(&context_window_gauge),
-            )
-        });
 
     // Before the agent, because the agent resolves the row: a repin that has not landed yet would
     // build this run on the profile the session is leaving.
@@ -285,14 +267,19 @@ pub(crate) async fn run_interactive(
     // The resumed log is what the list is; read it before the first prompt rather than at the
     // first turn, so `/status` and a `/fork` between them see the session as it was left.
     agent.hydrate_checklist(&messages).await;
-    let agent = Arc::new(agent);
-    let conversation = Arc::new(tokio::sync::Mutex::new(messages));
+    let mut agent = Arc::new(agent);
+    let mut conversation = Arc::new(tokio::sync::Mutex::new(messages));
+    let shared_agent = SharedAgent::new(Arc::clone(&agent));
     let cancel = crate::host::CancelCell::default();
     // In raw mode Ctrl+C is a key the screen answers; this listener is for a SIGINT sent from
     // outside, and says what it did through the screen like everything else.
     install_interrupt_handler(
         cancel.clone(),
-        &agent,
+        store.clone(),
+        {
+            let shared_agent = shared_agent.clone();
+            move || shared_agent.get().background_tasks()
+        },
         {
             let ui = ui.clone();
             move |note: &str| ui.note(note)
@@ -358,12 +345,9 @@ pub(crate) async fn run_interactive(
         host: host_sender,
         logs: screen_logs,
         transcript,
-        shared_permission: shared_permission.clone(),
         sandbox_state,
-        cwd: cwd.clone(),
         launch_cwd: launch_cwd.clone(),
         status_row: config.status_row.clone(),
-        context: context_indicator,
         recall,
         completer: input::Completer {
             mcp_server_names: config
@@ -378,14 +362,12 @@ pub(crate) async fn run_interactive(
                 .map(|profile| profile.name.clone())
                 .collect(),
             project_names: store.project_names().await?,
-            cwd: cwd.clone(),
         },
         skill_roots: config.skill_roots(),
-        current_profile: Arc::clone(&current_profile),
         configured_profiles: config.profile_summaries.clone(),
         schedule: config.schedule.clone(),
         store: store.clone(),
-        agent: Arc::clone(&agent),
+        agent: shared_agent.clone(),
         running_subagents: shared.running_subagents.clone(),
         cancel: cancel.clone(),
         send_class: inbox_class(config.send_class),
@@ -413,7 +395,7 @@ pub(crate) async fn run_interactive(
     });
 
     // One slot for the session lock from here on, whichever way the session was reached.
-    let session_lock = agent.session_lock_slot();
+    let mut session_lock = agent.session_lock_slot();
     hold_session_lock(&session_lock, resumed_lock);
 
     // Mirrors the loop's `session_id` for the watcher below, which runs on another task and cannot
@@ -431,7 +413,7 @@ pub(crate) async fn run_interactive(
         let watcher_schedule_config = config.schedule.clone();
         let watcher_residents = ScreenResidents {
             session_id: Arc::clone(&shared_session_id),
-            permission: agent.cells().permission.clone(),
+            agent: shared_agent.clone(),
         };
         let ui = ui.clone();
         tokio::spawn(async move {
@@ -488,8 +470,8 @@ pub(crate) async fn run_interactive(
     while let Some(event) = host_receiver.recv().await {
         match event {
             // Recorded on the row, then nothing else: this is not a turn.
-            HostEvent::PermissionChanged(level) => {
-                let Some(id) = session_id else {
+            HostEvent::PermissionChanged { session, level } => {
+                let Some(id) = session.get() else {
                     continue;
                 };
                 if let Err(error) =
@@ -502,8 +484,8 @@ pub(crate) async fn run_interactive(
                     tracing::warn!("{error}");
                 }
             }
-            HostEvent::ApprovalsChanged(approvals) => {
-                let Some(id) = session_id else {
+            HostEvent::ApprovalsChanged { session, approvals } => {
+                let Some(id) = session.get() else {
                     continue;
                 };
                 if let Err(error) =
@@ -516,8 +498,8 @@ pub(crate) async fn run_interactive(
                     tracing::warn!("{error}");
                 }
             }
-            HostEvent::CwdChanged(path) => {
-                record_session_cwd(&store, session_id, &path).await;
+            HostEvent::CwdChanged { session, path } => {
+                record_session_cwd(&store, session.get(), &path).await;
             }
             HostEvent::Wake => {
                 if let Some(entry) = resident.clone() {
@@ -606,10 +588,9 @@ pub(crate) async fn run_interactive(
             }
             HostEvent::Command(command) => {
                 let mut messages = conversation.lock().await;
-                commands::answer(command, commands::HostCommandContext {
+                let opened = commands::answer(command, commands::HostCommandContext {
                     agent: &agent,
                     shared: &shared,
-                    current_profile: &current_profile,
                     cancel: &cancel,
                     config: &config,
                     ui: &ui,
@@ -623,6 +604,35 @@ pub(crate) async fn run_interactive(
                     launch_cwd: &launch_cwd,
                 })
                 .await;
+                drop(messages);
+                // `/resume` opened the session it moves to whole; the one on screen is let go only
+                // now, as a screen that leaves lets it go, and everything that reads the session on
+                // screen moves to the new one in this step.
+                if let Some(opened) = opened {
+                    // Ahead of the switch's own word to the screen, so nothing the screen does
+                    // once it has shown the session reads the one let go.
+                    shared_agent.set(Arc::clone(&opened.agent));
+                    // The checklist the session announced as it opened reached the screen ahead of
+                    // the switch, which lets it go with the session left; said again after it, it
+                    // waits for the session's first page, as a launch's does.
+                    ui.switched();
+                    ui.send(UiEvent::Agent(
+                        crate::frontend::FrontendEvent::ChecklistUpdated {
+                            items: opened.cells().checklist.get().items,
+                        },
+                    ));
+                    crate::host::release_agent(&agent, &cancel, mcp_manager.as_ref()).await;
+                    hold_session_lock(&session_lock, None);
+                    agent = Arc::clone(&opened.agent);
+                    conversation = Arc::clone(&opened.conversation);
+                    session_lock = agent.session_lock_slot();
+                    session_id = Some(opened.id);
+                    if config.show_session_id_on_resume {
+                        ui.session_id("Resuming session", &opened.id.to_string());
+                    }
+                    ui.reload();
+                }
+                ui.done();
             }
             HostEvent::Exit { interrupted } => {
                 interrupted_exit = interrupted;
@@ -729,7 +739,7 @@ fn inbox_class(class: crate::config::SendClass) -> crate::store::inbox::InboxCla
 /// What survived an interrupt, said on the screen: Ctrl+C stops the turn, not the detached work,
 /// and the user may not have registered that anything was detached.
 async fn report_background_survivors_to(agent: &Agent, ui: &Ui) {
-    let running = agent.background_tasks().running_count_all().await;
+    let running = agent.background_tasks().unstopped_count_all().await;
     if running > 0 {
         ui.note(format!(
             "{running} background task(s) still running; stop them with `/task cancel --all`"
@@ -759,10 +769,31 @@ struct TuiHooks {
 }
 
 /// The host's one session as the watcher task sees it: resident whenever it is the loop's current
-/// session, at the level the permission cell holds.
+/// session, at the level the permission cell of the session on screen holds.
 struct ScreenResidents {
     session_id: Arc<std::sync::RwLock<Option<uuid::Uuid>>>,
-    permission: SharedPermission,
+    agent: SharedAgent,
+}
+
+/// The agent of the session on screen, which `/resume` replaces with the one it opens: the one
+/// place the screen, the schedule watcher and the signal listeners read a session's cells from, so
+/// a switch leaves none of them on the session it let go of.
+#[derive(Clone)]
+pub(crate) struct SharedAgent(Arc<std::sync::RwLock<Arc<Agent>>>);
+
+impl SharedAgent {
+    fn new(agent: Arc<Agent>) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(agent)))
+    }
+
+    /// The agent of the session on screen now.
+    pub(crate) fn get(&self) -> Arc<Agent> {
+        Arc::clone(&crate::sync::read(&self.0))
+    }
+
+    fn set(&self, agent: Arc<Agent>) {
+        *crate::sync::write(&self.0) = agent;
+    }
 }
 
 #[async_trait::async_trait]
@@ -771,7 +802,8 @@ impl crate::scheduler::ResidentPermissions for ScreenResidents {
         &self,
         session_id: uuid::Uuid,
     ) -> Option<crate::permission::Permission> {
-        (*crate::sync::read(&self.session_id) == Some(session_id)).then(|| self.permission.get())
+        (*crate::sync::read(&self.session_id) == Some(session_id))
+            .then(|| self.agent.get().cells().permission.get())
     }
 }
 

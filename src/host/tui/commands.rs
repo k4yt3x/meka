@@ -19,9 +19,8 @@ use crate::{
 /// What answering a command needs from the host loop.
 pub(crate) struct HostCommandContext<'a> {
     pub(crate) agent: &'a agent::Agent,
-    /// What a `/profile` switch resolves against, and the name the status row shows.
+    /// What a `/profile` switch resolves against.
     pub(crate) shared: &'a crate::host::SharedDeps,
-    pub(crate) current_profile: &'a Arc<std::sync::RwLock<String>>,
     /// Where a turn this command runs publishes its token for Ctrl+C.
     pub(crate) cancel: &'a crate::host::CancelCell,
     pub(crate) config: &'a crate::config::ResolvedConfig,
@@ -38,26 +37,17 @@ pub(crate) struct HostCommandContext<'a> {
     pub(crate) launch_cwd: &'a std::path::Path,
 }
 
-/// What [`attach_session`] moves: the loop's own cells and the agent's, which every tool reads.
-struct AttachContext<'a> {
-    store: &'a Store,
-    config: &'a crate::config::ResolvedConfig,
-    shared: &'a crate::host::SharedDeps,
-    agent: &'a agent::Agent,
-    session_id: &'a mut Option<uuid::Uuid>,
-    session_lock: &'a crate::store::SessionLockSlot,
-    messages: &'a mut conversation::Conversation,
-    current_profile: &'a Arc<std::sync::RwLock<String>>,
-    launch_cwd: &'a std::path::Path,
-    ui: &'a Ui,
-}
-
-/// Refuse moving the screen to another session, by `/resume` or `/fork`, while a sub-agent still
-/// runs: it shares the session's counters and its list of tools called, which the move hands to
-/// the other session in place, so it would go on writing into that one. The remedy is the screen's
-/// second Ctrl+C, which stops every background task of the process; `/task cancel --all` reaches
-/// only this session's, not one a sub-agent started.
-fn refuse_a_switch_while_subagents_run(shared: &crate::host::SharedDeps) -> anyhow::Result<()> {
+/// Refuse moving the screen to another session, by `/resume` or `/fork`, while the session on
+/// screen still runs background work. `/resume` lets the session go as leaving the screen does,
+/// which stops its tasks, and a switch stops nothing; after `/fork` a task would report to the
+/// original, which nobody is in. A sub-agent shares the session's counters and its list of tools
+/// called, which `/fork` hands to the copy in place, so it would go on writing into that one. The
+/// remedy for a sub-agent is the screen's second Ctrl+C, which stops every background task of the
+/// process; `/task cancel --all` reaches only this session's, not one a sub-agent started.
+async fn refuse_a_switch_while_background_work_runs(
+    agent: &agent::Agent,
+    shared: &crate::host::SharedDeps,
+) -> anyhow::Result<()> {
     let running = shared.running_subagents.running_ids().len();
     if running > 0 {
         anyhow::bail!(
@@ -65,87 +55,99 @@ fn refuse_a_switch_while_subagents_run(shared: &crate::host::SharedDeps) -> anyh
              switching sessions"
         );
     }
+    // One already told to stop is not waited for: the remedy below has been taken, and its row
+    // says how it ended.
+    let running = agent.background_tasks().unstopped_count_all().await;
+    if running > 0 {
+        anyhow::bail!(
+            "{running} background task(s) still running; stop them with `/task cancel --all` \
+             before switching sessions"
+        );
+    }
     Ok(())
 }
 
-/// Make the session `value` names this run's, in place: what a resume at startup does, done
-/// between turns. Everything of the new session is taken and read before anything of the old one
-/// is let go, so a failure leaves the screen where it was, and the new lock drops with it.
-async fn attach_session(value: &str, context: AttachContext<'_>) -> anyhow::Result<()> {
-    let AttachContext {
-        store,
-        config,
-        shared,
-        agent,
-        session_id,
-        session_lock,
-        messages,
-        current_profile,
-        launch_cwd,
-        ui,
-    } = context;
+/// Open the session `value` names for `/resume` as `meka serve` and `meka acp` open a stored
+/// session, through [`crate::host::open_session`]: its lock, its row's level, approvals and
+/// directory in cells of its own, and an agent built for it. Everything is refused or built here,
+/// before anything of the session on screen is let go, so a failure leaves the screen where it was
+/// and the new lock drops with it. `None` when `value` names the session on screen.
+async fn open_resumed_session(
+    value: &str,
+    agent: &agent::Agent,
+    shared: &crate::host::SharedDeps,
+    session_id: Option<uuid::Uuid>,
+    cancel: &crate::host::CancelCell,
+    launch_cwd: &std::path::Path,
+    ui: &Ui,
+) -> anyhow::Result<Option<crate::host::ResidentSession>> {
+    let store = &shared.store;
+    let config = &shared.config;
     let id = store.resolve_session_id(value).await?;
-    if *session_id == Some(id) {
+    if session_id == Some(id) {
         ui.reply("Already on this session");
-        return Ok(());
+        return Ok(None);
     }
-    refuse_a_switch_while_subagents_run(shared)?;
+    refuse_a_switch_while_background_work_runs(agent, shared).await?;
     crate::host::refuse_a_spawned_session(store, Some(id)).await?;
     // Locked, then read, so the row this run moves to is the one it now owns.
     let (lock, recorded) = store.open_session_row(id).await?;
-    let hydrated = crate::host::hydrate_conversation(store, id).await?;
-    let stats = store.load_session_stats(id).await?;
-    let profile = crate::provider::profile_for_config(store, config, Some(id)).await?;
-    let resolved = crate::host::resolve_profile_switch(shared, &profile).await?;
-    // The row's project, refused by name when the store no longer has it, as the profile is.
-    let project = (!recorded.project.is_empty()).then(|| recorded.project.clone());
-    if let Some(name) = &project {
-        crate::host::resolve_project_switch(shared, name).await?;
-    }
     // The row's level, clamped to what the configuration still allows, as every resume reads it.
     let level = config
         .enabled_permissions
         .admit_recorded(recorded.permission, &format!("session {id}"))
         .unwrap_or(config.permission);
-
-    // Nothing above has moved; from here the switch is made whole.
-    crate::host::terminal::hold_session_lock(session_lock, Some(lock));
-    *session_id = Some(id);
     let cells = agent.cells();
-    cells.session_id.set(id);
-    agent.adopt_session(&stats);
-    agent.set_provider(resolved);
-    agent.set_project(project);
-    *crate::sync::write(current_profile) = profile;
-    if let Err(error) = cells.permission.try_set(level) {
-        tracing::warn!("{error}");
+    let spec = crate::host::SessionSpec {
+        session_id: Some(id),
+        permission: crate::permission::SharedPermission::new(level, config.enabled_permissions)
+            .with_approvals(recorded.approvals),
+        frontend: Arc::clone(&cells.frontend),
+        cwd: crate::workspace::SharedCwd::new(crate::host::resume_working_directory(
+            recorded.cwd,
+            launch_cwd,
+            Some(id),
+        )),
+        // The run's, which every session it opens is handed.
+        roots: cells.roots.clone(),
+        read_only_roots: cells.read_only_roots.clone(),
+        context_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        context_overhead: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        context_window: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        // The build reads the row's.
+        project: None,
+    };
+    let opened = crate::host::open_session(
+        shared,
+        id,
+        spec,
+        crate::host::Opening::Hydrate,
+        lock,
+        cancel.clone(),
+    )
+    .await?;
+    // As the launch seeds the gauge: an estimate of the conversation where the row recorded no
+    // measurement, so the gauge is not blank until the first turn measures.
+    if !matches!(store.load_context_tokens(id).await, Ok(Some(_))) {
+        let estimate =
+            crate::tokens::estimate_messages(opened.conversation.lock().await.as_slice());
+        opened
+            .cells()
+            .context_tokens
+            .store(estimate, std::sync::atomic::Ordering::Relaxed);
     }
-    cells.permission.set_approvals(recorded.approvals);
-    cells.cwd.set(crate::host::resume_working_directory(
-        recorded.cwd,
-        launch_cwd,
-        Some(id),
-    ));
-    // Ahead of the reset below, whose checklist is the resumed session's and waits for its log.
-    ui.switched();
-    // The agent's markers against message positions, its read tracker and its world-state
-    // delta all describe the conversation being let go of; the one reset every rewrite calls
-    // clears them and seeds the gauge with the new conversation's estimate.
-    agent.reset_conversation_markers(&hydrated).await;
-    *messages = hydrated;
-    if config.show_session_id_on_resume {
-        ui.session_id("Resuming session", &id.to_string());
-    }
-    ui.reload();
-    Ok(())
+    Ok(Some(opened))
 }
 
-/// Answer one forwarded command. Exhaustive over [`SlashCommand`] on purpose; see the module docs.
-pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_>) {
+/// Answer one forwarded command, handing back the session `/resume` opened, for the loop to move
+/// to. Exhaustive over [`SlashCommand`] on purpose; see the module docs.
+pub(crate) async fn answer(
+    command: SlashCommand,
+    context: HostCommandContext<'_>,
+) -> Option<crate::host::ResidentSession> {
     let HostCommandContext {
         agent,
         shared,
-        current_profile,
         cancel,
         config,
         ui,
@@ -160,6 +162,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
     } = context;
     let session_id_cell = session_id;
     let mut session_id = *session_id_cell;
+    let mut opened = None;
     match command {
         SlashCommand::Title(text) => match (&session_id, text) {
             (None, _) => ui.reply("No active session yet"),
@@ -291,7 +294,10 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
             None => ui.reply("No active session to export"),
         },
         SlashCommand::Fork => match session_id {
-            Some(_) if let Err(error) = refuse_a_switch_while_subagents_run(shared) => {
+            Some(_)
+                if let Err(error) =
+                    refuse_a_switch_while_background_work_runs(agent, shared).await =>
+            {
                 ui.reply(error.to_string());
             }
             Some(id) => match crate::host::fork_and_lock(store, id).await {
@@ -575,7 +581,6 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                 break 'switch;
             }
             agent.set_provider(resolved);
-            *crate::sync::write(current_profile) = name.clone();
             ui.note(format!("Profile set to: {name}"));
         }
         // The row moves first, for the reason the profile's does: the row is where every other
@@ -612,22 +617,11 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
             ui.reply("Usage: /project [open <name>|close]");
         }
         SlashCommand::Resume(Some(value)) => {
-            // The local every arm moves, which the end of this function writes back for the loop.
-            if let Err(error) = attach_session(&value, AttachContext {
-                store,
-                config,
-                shared,
-                agent,
-                session_id: &mut session_id,
-                session_lock,
-                messages,
-                current_profile,
-                launch_cwd,
-                ui,
-            })
-            .await
+            match open_resumed_session(&value, agent, shared, session_id, cancel, launch_cwd, ui)
+                .await
             {
-                ui.reply(error.to_string());
+                Ok(resumed) => opened = resumed,
+                Err(error) => ui.reply(error.to_string()),
             }
         }
         SlashCommand::SkillInvoke {
@@ -714,7 +708,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
         }
     }
     *session_id_cell = session_id;
-    ui.done();
+    opened
 }
 
 /// The screen's side of an interactive MCP login. The terminal is the screen's, so the URL cannot
@@ -1431,53 +1425,5 @@ mod tests {
                 "{line}"
             );
         }
-    }
-
-    /// `/resume` swaps the conversation for another session's, so what it calls is the one reset
-    /// every rewrite calls: a door that resets its own subset leaves the rest stale.
-    #[test]
-    fn the_switch_resets_every_marker_the_conversation_held() {
-        let attach = include_str!("commands.rs")
-            .split("async fn attach_session(")
-            .nth(1)
-            .expect("the attach step")
-            .split("\n}\n")
-            .next()
-            .expect("the step ends");
-        assert!(attach.contains("reset_conversation_markers("), "{attach}");
-        assert!(
-            !attach.contains("hydrate_checklist("),
-            "the reset reads the checklist itself: {attach}"
-        );
-        // The counters and the tools called are the row's, read from it before anything moves,
-        // and never while a sub-agent sharing them still runs.
-        let at = |needle: &str| {
-            attach
-                .find(needle)
-                .unwrap_or_else(|| panic!("{needle} in {attach}"))
-        };
-        assert!(
-            at("refuse_a_switch_while_subagents_run(") < at("open_session_row("),
-            "{attach}"
-        );
-        assert!(
-            at("load_session_stats(id)") < at("hold_session_lock("),
-            "{attach}"
-        );
-        assert!(at("hold_session_lock(") < at("adopt_session("), "{attach}");
-        // `/fork` moves the screen to the copy, handing it the same counters, so it refuses the
-        // same way.
-        let fork = include_str!("commands.rs")
-            .split("SlashCommand::Fork => match session_id {")
-            .nth(1)
-            .expect("the fork arm")
-            .split("None => ui.reply(\"No active session to fork\")")
-            .next()
-            .expect("the arm ends");
-        let guard = fork
-            .find("refuse_a_switch_while_subagents_run(")
-            .unwrap_or_else(|| panic!("the guard in {fork}"));
-        let forked = fork.find("fork_and_lock(").expect("the fork");
-        assert!(guard < forked, "{fork}");
     }
 }
