@@ -238,16 +238,29 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                         let file = config::load_config_file_or_err()?;
                         let memory_inline_max_bytes =
                             config::MemoryConfig::inline_max_bytes(file.memory.as_ref());
-                        let permission = config::default_permission_on_disk()?;
-                        let context = store::migrations::Context::adopting(adopted.as_deref())
-                            .starting_at(&permission.to_string())
-                            .binding_mcp_credentials_to(installation::mcp::endpoints_of(
-                                &file.mcp_servers(),
-                            ))
-                            .sealing_chatgpt_reasoning_at(provider::chatgpt_reasoning_origins(
-                                &file.accounts,
-                                &file.profiles,
-                            ));
+                        let context = match config::default_permission_on_disk() {
+                            Ok(permission) => {
+                                store::migrations::Context::adopting(adopted.as_deref())
+                                    .starting_at(&permission.to_string())
+                                    .binding_mcp_credentials_to(installation::mcp::endpoints_of(
+                                        &file.mcp_servers(),
+                                    ))
+                                    .sealing_chatgpt_reasoning_at(
+                                        provider::chatgpt_reasoning_origins(
+                                            &file.accounts,
+                                            &file.profiles,
+                                        ),
+                                    )
+                            }
+                            // A `[permissions]` that names no start level is to the ledger a file
+                            // it cannot read: a level stamped once is read by every later process.
+                            // Not a hard error, for the reason an unparsable file is none; the
+                            // commands that read the settings refuse it themselves.
+                            Err(error) => {
+                                tracing::warn!("{error}");
+                                store::migrations::Context::on_unreadable_config()
+                            }
+                        };
                         (context, memory_inline_max_bytes)
                     }
                     Err(error) => {

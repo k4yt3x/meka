@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MCP tools follow the built-in ones in a request, sorted by name, whichever server answers first.
 - On the screen, a large result that did not stream shows its opening, as a resumed session does.
 - After the screen's `/resume`, the context gauge shows the session's own last measurement.
+- **Breaking:** A misspelled `MEKA_PERMISSION` or `MEKA_SANDBOX_BACKEND` stops the run at startup.
+- **Breaking:** A start level outside `[permissions].enabled` is refused; see the upgrade guide.
+- With `--permission` given, `MEKA_PERMISSION` is not read, so a misspelled one stops nothing.
+- `MEKA_PERMISSION` is read trimmed, and an empty one is unset without a warning.
+- The `scratchpad_*` and `checklist_*` tools and `context_replace` ignore a `scratchpad` argument.
 
 ### Fixed
 
@@ -99,6 +104,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A compaction's checkpoint saves a call's output to the entry its `scratchpad` argument names.
 - Stopping a turn ends an automatic compaction's summary request instead of waiting it out.
 - A Claude subscription request after a rewind that removed every reply names no previous one.
+- A one-shot run interrupted with Ctrl+C while waiting for background tasks exits 130.
+- Bubblewrap commands run where a masked directory, such as `$XDG_RUNTIME_DIR`, does not exist.
+- A write that meets another Meka process mid-write waits up to 5 seconds, not failing at once.
+- A session title taken from a long first prompt is at most 200 characters and can be set back.
+- A retention window is said in whole units wherever it shows, such as "90 days" or "6 months".
+- `scratchpad_write` with `scratchpad` keeps what it wrote; a checklist call returns its list.
+- On the screen, a followup still held when a hangup or a SIGTERM ends Meka is not sent.
+- A Ctrl+C or SIGTERM while `/mcp <server>:<prompt>` fetches its prompt stops the turn it opens.
+- After `/resume` or a pick in `meka -r`, a background report on the first page names its task.
+- An MCP form's answer to an integer field reaches the server as an integer, not a float.
 
 ## [0.94.0] - 2026-11-12
 

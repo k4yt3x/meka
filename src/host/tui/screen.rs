@@ -371,7 +371,16 @@ fn field_value(kind: &str, value: String) -> serde_json::Value {
             "false" | "no" | "n" => serde_json::Value::Bool(false),
             _ => serde_json::Value::String(value),
         },
-        "integer" | "number" => value
+        // Read as an integer first, which keeps every digit, and only then as a float spelling
+        // a whole number (`42.0`, `1e3`), which JSON Schema's `integer` matches too.
+        "integer" => match value.parse::<i64>().ok().or_else(|| {
+            let number = serde_json::Value::from(value.parse::<f64>().ok()?);
+            i64::try_from(crate::text::whole_number(&number)?).ok()
+        }) {
+            Some(number) => serde_json::Value::from(number),
+            None => serde_json::Value::String(value),
+        },
+        "number" => value
             .parse::<f64>()
             .ok()
             .and_then(serde_json::Number::from_f64)
@@ -728,6 +737,17 @@ impl Screen {
                     tracing::warn!("failed to read the session's turns: {error}");
                     Vec::new()
                 });
+            let tasks = match store
+                .background_store()
+                .list_background_tasks(session_id)
+                .await
+            {
+                Ok(tasks) => tasks,
+                Err(error) => {
+                    tracing::warn!("failed to read the background tasks for the log: {error}");
+                    Vec::new()
+                }
+            };
             let rewound = store.rewound(session_id).await.unwrap_or_else(|error| {
                 tracing::warn!("failed to read what the session's rewinds took: {error}");
                 Vec::new()
@@ -737,6 +757,7 @@ impl Screen {
                 log_end,
                 page,
                 turns,
+                tasks,
                 rewound,
                 pictures,
                 generation,
@@ -1170,6 +1191,7 @@ impl Screen {
                 log_end,
                 page,
                 turns,
+                tasks,
                 rewound,
                 pictures,
                 generation,
@@ -1183,6 +1205,7 @@ impl Screen {
                 self.history_loading = false;
                 self.launch.transcript.reset(log_end);
                 self.launch.transcript.set_turn_records(turns);
+                self.launch.transcript.remember_background_tasks(tasks);
                 self.launch.transcript.set_rewound(rewound);
                 self.launch.transcript.set_pictures(pictures);
                 self.launch.transcript.load_page_above(page);
@@ -3894,6 +3917,35 @@ mod tests {
         let (asked, answer) = question();
         drop(answer);
         assert_eq!(asked.answer(0), None, "nobody waits on the answer");
+    }
+
+    /// A whole number typed for an `integer` field goes to the server as a JSON integer, which a
+    /// server reading the field into an integer type takes, however it is spelled: with a point
+    /// or an exponent it is still one JSON Schema's `integer` matches. Anything else stays the
+    /// text typed. A `number` field's answer goes as a float.
+    #[test]
+    fn an_integer_field_s_whole_number_is_sent_as_an_integer() {
+        let answer = field_value("integer", "42".to_string());
+        assert_eq!(answer, serde_json::json!(42));
+        assert!(!answer.is_f64(), "{answer}");
+        assert_eq!(
+            field_value("integer", "-7".to_string()),
+            serde_json::json!(-7)
+        );
+        for (typed, whole) in [("42.0", 42), ("1e3", 1000), ("-7.00", -7)] {
+            let answer = field_value("integer", typed.to_string());
+            assert_eq!(answer, serde_json::json!(whole), "{typed}");
+            assert!(!answer.is_f64(), "{typed}: {answer}");
+        }
+        for typed in ["42.5", "abc", "inf", "NaN", "1e30"] {
+            assert_eq!(
+                field_value("integer", typed.to_string()),
+                serde_json::json!(typed)
+            );
+        }
+        let answer = field_value("number", "42".to_string());
+        assert_eq!(answer, serde_json::json!(42.0));
+        assert!(answer.is_f64(), "{answer}");
     }
 
     /// A sub-agent's approval prompt reaches the screen with the sub-agent asking, and the

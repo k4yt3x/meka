@@ -1744,13 +1744,12 @@ impl MemoryStore {
         let written = self
             .writable()?
             .call(move |connection| -> rusqlite::Result<_> {
-                // IMMEDIATE, not the `transaction()` default of DEFERRED. A deferred
-                // transaction takes a read snapshot first and upgrades on the write; under WAL,
-                // if another connection committed in between, SQLite returns `SQLITE_BUSY`
-                // *without invoking the busy handler*, so the 5s `busy_timeout` set in `Store` is
-                // inert on exactly this path and concurrent cross-process `meka memory add` runs
-                // fail outright with "database is locked". Taking the write lock up front is what
-                // lets the handler wait.
+                // IMMEDIATE. A deferred transaction takes a read snapshot first and upgrades on the
+                // write; under WAL, if another connection committed in between, SQLite returns
+                // `SQLITE_BUSY` *without invoking the busy handler*, so the 5s `busy_timeout` set
+                // in `Store` is inert on exactly this path and concurrent cross-process `meka
+                // memory add` runs fail outright with "database is locked". Taking the write lock
+                // up front is what lets the handler wait.
                 let transaction = connection
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 // Every tier, not the view's: whether a name is free is a property of the whole

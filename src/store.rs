@@ -227,6 +227,13 @@ impl Store {
                     "PRAGMA busy_timeout = 5000;\n\
                      PRAGMA foreign_keys = ON;",
                 )?;
+                // Every transaction takes the write lock at `BEGIN`, where the busy timeout
+                // applies. A deferred one that has read does not wait for the lock when it comes to
+                // write: SQLite answers `SQLITE_BUSY` at once. And SQLite can read inside a
+                // transaction before its first write (FTS5 reads its configuration the first time a
+                // connection meets the table). A transaction that only reads asks for `Deferred`,
+                // or it would wait on another process's writer for nothing.
+                connection.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
                 // The retry is the part that fixes something. Converting a rollback-journal
                 // database to WAL takes an exclusive lock, and SQLite does not always route *that*
                 // pragma's acquisition through the busy handler, so with a handler installed and
@@ -698,6 +705,53 @@ mod tests {
             "wal",
             "and must actually get WAL, not settle for the rollback journal"
         );
+    }
+
+    /// A transaction the store opens takes the write lock at `BEGIN`, so one that reads before it
+    /// writes waits out another process's writer. Opened deferred, it holds a read snapshot when it
+    /// comes to write, and SQLite refuses it at once, past the busy timeout. A second connection
+    /// stands in for the other process and holds the lock before the transaction begins; a write
+    /// that comes after the hold ends passes either way.
+    #[tokio::test]
+    async fn a_transaction_that_reads_before_it_writes_waits_for_another_writer() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("meka.db");
+        let store = Store::open(Some(&database_path), &Default::default())
+            .await
+            .expect("open");
+        let session = store
+            .create_session(None, "p".to_string())
+            .await
+            .expect("create");
+        let (held, holding) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn({
+            let database_path = database_path.clone();
+            move || {
+                let other = rusqlite::Connection::open(&database_path).expect("second connection");
+                other
+                    .execute_batch("BEGIN IMMEDIATE")
+                    .expect("the write lock");
+                held.send(()).expect("say it is held");
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                other.execute_batch("COMMIT").expect("let go");
+            }
+        });
+        holding.recv().expect("the lock is held");
+        store
+            .connection
+            .call(move |connection| -> rusqlite::Result<()> {
+                let transaction = connection.transaction()?;
+                transaction.query_row("SELECT count(*) FROM sessions", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+                transaction.execute("UPDATE sessions SET title = 'renamed' WHERE id = ?1", [
+                    session.to_string(),
+                ])?;
+                transaction.commit()
+            })
+            .await
+            .expect("the write waits for the other writer rather than failing");
+        writer.join().expect("the other writer let go");
     }
 
     // End-to-end regression tests for `meka session list`'s title. These tests mock the complete

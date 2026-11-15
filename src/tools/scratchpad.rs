@@ -66,7 +66,7 @@ fn large_output(scratchpad_entry: String, text: &str) -> ToolResultContent {
 /// Save tool results to the scratchpad when the agent explicitly requested it via the `scratchpad`
 /// parameter on a tool call. Replaces the inline result with a brief reference.
 ///
-/// `inherited_names` are the entries a parent lent this session read-only. The seven
+/// `inherited_names` are the entries a parent lent this session read-only. The
 /// `scratchpad_*` tools refuse to write those, and this door has to as well: it is the universal
 /// parameter every tool takes, so `shell_execute({.., scratchpad: "<inherited>"})` wrote a local
 /// row under the parent's name and every later `scratchpad_read` found the shadow first. The
@@ -74,11 +74,12 @@ fn large_output(scratchpad_entry: String, text: &str) -> ToolResultContent {
 ///
 /// `inline` names the calls whose result is a word about the call rather than the tool's output
 /// ([`crate::tools::ToolOutput::is_output`]): Meka's refusal, an argument error, an interruption,
-/// or a failure from a tool whose failed result is a complaint. Those stay inline whatever the
-/// call asked: the caller redirected the output, a sentence about the call is neither large nor
+/// or a failure from a tool whose failed result is a complaint. Those stay inline whatever the call
+/// asked: the caller redirected the output, a sentence about the call is neither large nor
 /// sensitive, and redirected it tells the caller only that the call failed, with a read of the
 /// entry owed to learn why. A command's failure, its output with its exit code, is its output and
-/// goes to the entry as asked.
+/// goes to the entry as asked. A result its tool keeps inline
+/// ([`crate::tools::Tool::keeps_result_inline`]) is named there too.
 pub(crate) async fn save_explicit_scratchpad_results(
     store: &Store,
     session_id: Uuid,
@@ -420,6 +421,10 @@ impl Tool for ScratchpadWriteTool {
         Permission::Read
     }
 
+    fn keeps_result_inline(&self) -> bool {
+        true
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -512,6 +517,10 @@ impl Tool for ScratchpadReadTool {
 
     fn required_permission(&self) -> Permission {
         Permission::Read
+    }
+
+    fn keeps_result_inline(&self) -> bool {
+        true
     }
 
     async fn execute(
@@ -703,6 +712,10 @@ impl Tool for ScratchpadEditTool {
         Permission::Read
     }
 
+    fn keeps_result_inline(&self) -> bool {
+        true
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -834,6 +847,10 @@ impl Tool for ScratchpadListTool {
         Permission::Read
     }
 
+    fn keeps_result_inline(&self) -> bool {
+        true
+    }
+
     async fn execute(
         &self,
         _input: serde_json::Value,
@@ -933,6 +950,10 @@ impl Tool for ScratchpadMergeTool {
 
     fn required_permission(&self) -> Permission {
         Permission::Read
+    }
+
+    fn keeps_result_inline(&self) -> bool {
+        true
     }
 
     async fn execute(
@@ -1096,6 +1117,10 @@ impl Tool for ScratchpadDeleteTool {
         Permission::Read
     }
 
+    fn keeps_result_inline(&self) -> bool {
+        true
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -1162,6 +1187,10 @@ impl Tool for ScratchpadRenameTool {
 
     fn required_permission(&self) -> Permission {
         Permission::Read
+    }
+
+    fn keeps_result_inline(&self) -> bool {
+        true
     }
 
     async fn execute(
@@ -1258,6 +1287,10 @@ impl Tool for ScratchpadLoadFileTool {
 
     fn required_permission(&self) -> Permission {
         Permission::Read
+    }
+
+    fn keeps_result_inline(&self) -> bool {
+        true
     }
 
     async fn execute(
@@ -1368,6 +1401,10 @@ impl Tool for ScratchpadSaveFileTool {
 
     fn required_permission(&self) -> Permission {
         Permission::Workspace
+    }
+
+    fn keeps_result_inline(&self) -> bool {
+        true
     }
 
     async fn refusal_at_level(

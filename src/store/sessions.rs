@@ -764,6 +764,16 @@ pub(crate) struct SessionSweep {
     /// because their lock could not be established either way.
     pub(crate) attached_elsewhere: u64,
 }
+
+impl SessionSweep {
+    /// The sentence the retention sweep logs for the sessions it deleted.
+    pub(crate) fn describe(&self, window: std::time::Duration) -> String {
+        let deleted = self.deleted;
+        let window = crate::text::format_duration_words(window);
+        format!("deleted {deleted} session(s) not updated in {window} (`[session].retention`)")
+    }
+}
+
 /// What a turn sweep deleted, so its caller can say so at the level a configured deletion is
 /// reported at.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -6525,6 +6535,20 @@ mod tests {
         ));
     }
 
+    /// A title derived from a long first prompt is one a user may set: the doors that set a title
+    /// accept it as it reads.
+    #[tokio::test]
+    async fn a_derived_title_can_be_set_as_it_reads() {
+        let store = Store::for_test().await;
+        let id = plain_session(&store, &"x".repeat(TITLE_MAX_CHARS + 50)).await;
+        let derived = row(&store, id).await.title;
+        assert!(derived.ends_with('…'), "{derived:?}");
+        assert_eq!(
+            normalize_title(&derived).expect("a derived title is within the cap"),
+            Some(derived)
+        );
+    }
+
     /// The listing's order and `meka -c` key on `updated_at`, so a label or a pin must not touch
     /// it, while a field the session runs as still does.
     #[tokio::test]
@@ -10901,6 +10925,17 @@ mod tests {
         );
     }
 
+    /// The retention sweep's line says its window in the largest unit that divides it.
+    #[test]
+    fn the_session_sweep_says_its_window_in_whole_units() {
+        let sweep = SessionSweep {
+            deleted: 2,
+            attached_elsewhere: 0,
+        };
+        let line = sweep.describe(std::time::Duration::from_secs(90 * 86_400));
+        assert!(line.contains("not updated in 90 days"), "{line}");
+    }
+
     #[tokio::test]
     async fn delete_expired_sessions_keeps_recent() {
         let store = Store::for_test().await;
@@ -11186,7 +11221,7 @@ mod tests {
         );
         assert_eq!(
             summary.title.chars().count(),
-            crate::conversation::TITLE_CHARS + 1
+            crate::conversation::TITLE_CHARS
         );
     }
 
@@ -11214,12 +11249,12 @@ mod tests {
             .list_sessions(10, None, &SessionFilter::default())
             .await
             .expect("list_sessions");
-        assert_eq!(wire[0].title.chars().count(), cap + 1);
+        assert_eq!(wire[0].title.chars().count(), cap);
         let (sized, _) = store
             .list_sessions_titled_within(10, None, &SessionFilter::default(), cap + 100)
             .await
             .expect("list_sessions_titled_within");
-        assert_eq!(sized[0].title.chars().count(), cap + 101);
+        assert_eq!(sized[0].title.chars().count(), cap + 100);
     }
 
     #[tokio::test]

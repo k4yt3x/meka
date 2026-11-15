@@ -82,10 +82,11 @@ impl Agent {
 
     /// `loaded` is the turn's active-tool set, used only to tell a call made against a schema the
     /// model has actually seen from one made blind; see [`Self::schema_advisory`]. The third value
-    /// names the calls whose result is a word about the call rather than the tool's output, which
-    /// the `scratchpad` redirect leaves inline; see [`crate::tools::ToolOutput::is_output`]. The
-    /// fourth is what announcing each call's end takes beside its result, in the order of the
-    /// results, for [`Self::announce_completions`] once they are settled.
+    /// names the calls whose result the `scratchpad` redirect leaves inline: a word about the call
+    /// rather than the tool's output, or a result its tool keeps there; see
+    /// [`crate::tools::ToolOutput::is_output`]. The fourth is what announcing each call's end takes
+    /// beside its result, in the order of the results, for [`Self::announce_completions`] once they
+    /// are settled.
     pub(super) async fn execute_tool_calls(
         &self,
         assistant_message: &Message,
@@ -811,16 +812,17 @@ impl Agent {
 
     /// Turn what `tool` returned into the output the model reads, marking the tool's output
     /// ([`crate::tools::ToolOutput::is_output`]): a result it returned, or a failure it reports
-    /// when it says its failures are its output. This is the one door a tool's result comes
-    /// through, inline, from a start step that refused, and from a run in the background, so the
-    /// mark is set here and nowhere else.
+    /// when it says its failures are its output, unless it keeps its result inline. This is the one
+    /// door a tool's result comes through, inline, from a start step that refused, and from a run
+    /// in the background, so the mark is set here and nowhere else.
     pub(super) fn tool_result(
         tool: &dyn crate::tools::Tool,
         result: Result<crate::tools::ToolOutput>,
     ) -> crate::tools::ToolOutput {
         match result {
             Ok(output) => said_even_when_empty(&tool.definition().name, crate::tools::ToolOutput {
-                is_output: !output.is_error || tool.reports_failure_as_output(),
+                is_output: !tool.keeps_result_inline()
+                    && (!output.is_error || tool.reports_failure_as_output()),
                 // A failed call changed nothing, whatever it reports, and every frontend's
                 // completion event is built from what leaves here. How a command ended is a fact
                 // about the failure itself and stays.
@@ -2299,6 +2301,76 @@ mod tests {
         assert_eq!(small, &vec![ToolResultContent::Text {
             text: "small".to_string()
         }]);
+    }
+
+    /// A round's call whose tool keeps its result inline reads it inline whatever entry it names:
+    /// `scratchpad_write` leaves what it wrote in the entry it named and reads its own
+    /// acknowledgement, and `checklist_add` reads its list and writes no entry, while another
+    /// tool's output still goes where its call asked.
+    #[tokio::test]
+    async fn a_round_s_call_whose_tool_keeps_its_result_inline_is_not_redirected() {
+        let (mut agent, store, _frontend) = agent_making_calls(&[
+            (
+                "call-1",
+                "scratchpad_write",
+                serde_json::json!({"name": "x", "content": "the real content", "scratchpad": "x"}),
+            ),
+            (
+                "call-2",
+                "checklist_add",
+                serde_json::json!({"items": ["one thing"], "scratchpad": "y"}),
+            ),
+            (
+                "call-3",
+                "echo",
+                serde_json::json!({"say": "kept", "scratchpad": "notes"}),
+            ),
+        ])
+        .await;
+        agent.tool_registry = crate::tools::ToolRegistry::build_default(
+            &crate::session::SessionMaterials {
+                skills: crate::skills::SkillCache::disabled(),
+                memories: crate::store::memory::MemoryStore::disabled(),
+                ..crate::session::SessionMaterials::for_test(store.clone())
+            },
+            agent.cells(),
+            &agent.options,
+        )
+        .expect("the production registry");
+        agent
+            .tool_registry
+            .register(Arc::new(Echo))
+            .expect("registration");
+        let messages = run_a_turn(&agent).await;
+
+        let session_id = agent.session_id().expect("a session");
+        let entry = |name: &'static str| store.load_scratchpad_entry(session_id, name);
+        assert_eq!(
+            entry("x").await.expect("read").as_deref(),
+            Some("the real content")
+        );
+        assert_eq!(entry("y").await.expect("read"), None);
+        assert_eq!(entry("notes").await.expect("read").as_deref(), Some("kept"));
+        let results: Vec<String> = messages
+            .as_slice()
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => {
+                    Some(ContentBlock::tool_result_text_content(content))
+                }
+                _ => None,
+            })
+            .collect();
+        let [written, listed, echoed] = results.as_slice() else {
+            panic!("three calls end: {results:?}");
+        };
+        assert!(
+            written.contains("Stored 16 bytes") && !written.contains("Output saved"),
+            "{written}"
+        );
+        assert!(listed.contains("one thing"), "{listed}");
+        assert!(echoed.contains("scratchpad entry 'notes'"), "{echoed}");
     }
 
     /// A round's ends are announced in the order the model wrote its calls, and the checklist a

@@ -285,11 +285,13 @@ You can change the start level with:
 - Environment variable: `export MEKA_PERMISSION=workspace`
 - Config file: `[permissions] default = "workspace"`; see [Config file](../configuration/config-file.md#permissions)
 
-If `--permission` or `MEKA_PERMISSION` selects a level that isn't in `[permissions].enabled`, Meka
-logs a warning and starts at the configured default instead of refusing to launch. A session whose
-recorded level has since left `[permissions].enabled` is treated the same way wherever it is
-reopened (a resume, `meka serve` re-attaching it, ACP `session/load`): it starts at the configured
-default, with one warning naming the session, rather than at authority the configuration withdrew.
+The flag wins over the variable, which wins over the file, and a variable the flag overrides is not
+read. If the level asked for, or `[permissions].default`, isn't in `[permissions].enabled`, Meka
+refuses to start, naming the level and the enabled ones; so does a `MEKA_PERMISSION` that names no
+level. An empty `MEKA_PERMISSION` is unset. A session whose recorded
+level has since left `[permissions].enabled` is not refused wherever it is reopened (a resume,
+`meka serve` re-attaching it, ACP `session/load`): it starts at the configured default, with one
+warning naming the session, rather than at authority the configuration withdrew.
 
 A level Meka does not have in `[permissions].enabled` or `default` is refused at parse, with the
 line. An `enabled` list that names nothing is different: Meka warns and falls back to **`read`

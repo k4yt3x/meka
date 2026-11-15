@@ -161,8 +161,9 @@ A `scratchpad` string parameter saves a tool's output to the scratchpad under th
 shell_execute({"command": "pdftotext doc.pdf -", "scratchpad": "pdf_text"})
 ```
 
-It is honored on **every** tool, MCP servers included: the redirect happens where the result is
-recorded, not inside the tool. Eleven built-ins also *advertise* it in their schema, which is how the
+It is honored on every tool, MCP servers included, but the `scratchpad_*` and `checklist_*` tools
+and `context_replace`, whose result has to come back inline: the redirect happens where the result
+is recorded, not inside the tool. Thirteen built-ins also *advertise* it in their schema, which is how the
 model discovers it: `file_read`, `file_edit`, `file_write`, `file_find`, `file_search`,
 `web_fetch`, `shell_execute`, `conversation_read`, `agent_spawn`, `agent_followup`
 and the `checklist_*` tools, the last for uniformity alone, since the list is kept as state and nothing is redirected.

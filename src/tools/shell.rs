@@ -34,7 +34,18 @@ fn bwrap_masks() -> Vec<std::path::PathBuf> {
     {
         masks.push(xdg.into());
     }
-    masks
+    existing_directories(masks)
+}
+
+/// The `candidates` that are directories. Under the read-only root Bubblewrap cannot make the mount
+/// point for a mask over a path that does not exist, and fails the command; where there is no
+/// directory there is nothing to hide.
+#[cfg(target_os = "linux")]
+fn existing_directories(candidates: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
+    candidates
+        .into_iter()
+        .filter(|path| path.is_dir())
+        .collect()
 }
 
 /// Every bwrap argument up to the `--` separator, for `writable` roots, reading everywhere or only
@@ -2726,6 +2737,18 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod bubblewrap_boundary {
         use std::path::PathBuf;
+
+        /// A mask is kept over a directory that exists and dropped over a path that does not, which
+        /// Bubblewrap cannot make a mount point for under the read-only root.
+        #[test]
+        fn a_mask_is_kept_over_a_directory_and_dropped_where_there_is_none() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let missing = dir.path().join("never-made");
+            assert_eq!(
+                super::existing_directories(vec![dir.path().to_path_buf(), missing]),
+                [dir.path().to_path_buf()]
+            );
+        }
 
         /// With reads confined the root is an empty tmpfs and only the readable paths are bound,
         /// read-only, after the masks and before the writable binds; `/dev` and `/proc` stay the

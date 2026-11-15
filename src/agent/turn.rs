@@ -12195,6 +12195,66 @@ mod tests {
         assert_eq!(saved.as_deref(), Some("42 passed"));
     }
 
+    /// A detached call whose tool keeps its result inline reports it inline whatever entry it
+    /// names: the entry keeps what the call wrote there, and the report is the call's own
+    /// acknowledgement.
+    #[tokio::test]
+    async fn a_background_call_whose_tool_keeps_its_result_inline_is_not_redirected() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "call-1".to_string(),
+                    name: "scratchpad_write".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({
+                        "name": "x",
+                        "content": "the real content",
+                        "background": true,
+                        "scratchpad": "x",
+                    }),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            text_round("started it"),
+        ]));
+        let (agent, store) = background_agent(provider, Arc::new(QuickFixture)).await;
+        let production = crate::tools::ToolRegistry::build_default(
+            &crate::session::SessionMaterials {
+                skills: crate::skills::SkillCache::disabled(),
+                memories: crate::store::memory::MemoryStore::disabled(),
+                ..crate::session::SessionMaterials::for_test(store.clone())
+            },
+            agent.cells(),
+            &agent.options,
+        )
+        .expect("the production registry");
+        agent
+            .tool_registry
+            .register(Arc::new(crate::tools::DetachableForTest(
+                production
+                    .get("scratchpad_write")
+                    .expect("scratchpad_write"),
+            )))
+            .expect("registration");
+
+        let task = finished_background_task(&agent, &store).await;
+        let outcome = task.outcome.as_deref().unwrap_or_default();
+        assert!(
+            outcome.contains("Stored 16 bytes") && !outcome.contains("Output saved"),
+            "{task:?}"
+        );
+        let saved = store
+            .load_scratchpad_entry(agent.session_id().expect("session"), "x")
+            .await
+            .expect("load");
+        assert_eq!(saved.as_deref(), Some("the real content"));
+    }
+
     /// A task stopped before its work came back has no say over the entry the call named: the
     /// work finishing anyway writes nothing there.
     #[tokio::test]

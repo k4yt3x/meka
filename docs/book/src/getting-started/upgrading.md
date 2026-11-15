@@ -54,6 +54,25 @@ whole as `tool_call.output_delta`. An ACP `tool_call_update` follows: its `rawOu
 result, live as on a `session/load`, and its content shows the opening, except that a command
 drawn as text keeps the window it was showing and a terminal keeps its scrollback.
 
+**A start level or a sandbox backend Meka cannot use is refused.** Meka used to log a warning and
+start on another level or backend. Now it stops, naming what was asked and what is allowed:
+
+- when `MEKA_PERMISSION` names no level, or `MEKA_SANDBOX_BACKEND` names no backend;
+- when the level asked for, with `--permission` or else `MEKA_PERMISSION`, is outside
+  `[permissions].enabled`;
+- when `[permissions].default` is outside `[permissions].enabled`, which is the file contradicting
+  itself.
+
+Fix or unset the variable, name an enabled level, or make `default` one of the levels `enabled`
+lists. A variable is read only when its flag is not given, so under `--permission` or
+`--sandbox-backend` a misspelled one stops nothing. An empty variable is unset, as before. What
+stops is a run, `meka serve`, `meka acp` and the commands that read the settings, such as
+`meka mcp list`; one that does not, such as `meka session list` or `meka profile set`, still runs.
+The `mekabox` wrapper sets `MEKA_PERMISSION=unrestricted`, so under a `config.toml` whose `enabled`
+leaves `unrestricted` out it no longer starts: add the level to `enabled`. A session reopened
+whose recorded level has left the list is not refused; it still starts at the configured default,
+with a warning.
+
 ## 0.93 to 0.94
 
 The store moves forward on its first open, behind the automatic backup, so that a turn that fails

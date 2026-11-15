@@ -1069,6 +1069,122 @@ fn a_termination_mid_sweep_fires_no_further_job() {
     assert_eq!(jobs, 2, "both occurrences are there for the next start");
 }
 
+/// A followup still held when a termination lands is not sent: the turn the termination stops
+/// hands it over as it ends, while the listener waits on the background task it stopped, and the
+/// host, told to leave, opens no turn for it.
+#[test]
+fn a_held_followup_is_not_sent_once_the_process_is_terminated() {
+    const HELD_TURN: &str = r#"[
+ [{"type":"tool_use_start","id":"t1","name":"shell_execute"},
+  {"type":"tool_use_end","input":{"command":"sleep 60","background":true,"timeout_ms":600000}},
+  {"type":"message_end","stop_reason":"tool_use"}],
+ [{"type":"text","text":"TURN_HELD"},
+  {"type":"sleep","ms":60000},
+  {"type":"message_end","stop_reason":"end_turn"}],
+ [{"type":"text","text":"FOLLOWUP_ANSWERED"},
+  {"type":"message_end","stop_reason":"end_turn"}]
+]"#;
+    let install = screen_install(
+        "unrestricted",
+        "send_class = \"followup\"",
+        "\n[background]\nenabled = true\n",
+    );
+    install.write_script(HELD_TURN);
+    let mut master: RawFd = -1;
+    let size = libc::winsize {
+        ws_row: ROWS,
+        ws_col: COLUMNS,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let prepared = PreparedExec::meka(&install, &["-c"]);
+    // SAFETY: as in `drive_run`.
+    let pid = unsafe {
+        libc::forkpty(
+            &mut master,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &size as *const libc::winsize as *mut libc::winsize,
+        )
+    };
+    assert!(pid >= 0, "forkpty failed");
+    if pid == 0 {
+        // SAFETY: the child of a threaded process, so only what `PreparedExec::exec` promises.
+        unsafe { prepared.exec() }
+    }
+    keep_master_here(master);
+    // The last input sends nothing: it holds the driver until the followup is shown waiting.
+    let followup = format!("{AWAITED}TURN_HELD{AWAITED}HELD_FOLLOWUP_WORDS");
+    let until_it_waits = format!("{AWAITED}(followup, waiting){AWAITED}{KEYS_ONLY}");
+    let (.., rows) = pump(
+        master,
+        &["start it", &followup, &until_it_waits],
+        false,
+        COLUMNS,
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("(followup, waiting)")),
+        "the followup is held when the signal lands: {rows:#?}"
+    );
+    // SAFETY: as in `a_termination_mid_sweep_fires_no_further_job`.
+    let exit = unsafe {
+        libc::kill(pid, libc::SIGTERM);
+        let mut status = 0;
+        let mut written = [0u8; 65536];
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let exit = loop {
+            if libc::waitpid(pid, &mut status, libc::WNOHANG) == pid {
+                break Some(if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else {
+                    -1
+                });
+            }
+            if Instant::now() > deadline {
+                break None;
+            }
+            // The terminal is read while the screen leaves, as in the termination test above.
+            let mut poll = libc::pollfd {
+                fd: master,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if libc::poll(&mut poll, 1, 50) > 0 && poll.revents & libc::POLLIN != 0 {
+                libc::read(master, written.as_mut_ptr().cast(), written.len());
+            }
+        };
+        libc::close(master);
+        if exit.is_none() {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, &mut status, 0);
+        }
+        exit
+    };
+    assert_eq!(exit, Some(130), "the screen leaves on the signal");
+
+    let connection = rusqlite::Connection::open(install.database()).expect("open the store");
+    let turns: Vec<(String, Option<String>)> = connection
+        .prepare("SELECT status, cancel_reason FROM turns ORDER BY rowid")
+        .expect("prepare")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("the turns");
+    assert_eq!(
+        turns,
+        [("canceled".to_string(), Some("server_shutdown".to_string()))],
+        "the turn the signal stopped, and none opened after it"
+    );
+    let said: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE content LIKE '%HELD_FOLLOWUP_WORDS%'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count the messages");
+    assert_eq!(said, 0, "the followup reached no conversation");
+}
+
 /// A rewind takes its turn off the screen as well as out of the conversation: the turn before it
 /// stays, and one row says how many turns went, then and when the session is resumed.
 #[test]
@@ -2930,6 +3046,74 @@ fn resume_shows_the_checklist_the_session_was_left_with_past_its_first_page() {
         rows.iter()
             .any(|row| row.contains("» ask Sam (waiting on Sam)")),
         "and shows the list it was left with: {rows:#?}"
+    );
+    assert_eq!(run.exit, Some(0), "{rows:#?}");
+}
+
+/// `/resume` back to a session says a background report on its first page as the live run said
+/// it, naming the task and how it ended, as `meka -r` does.
+#[test]
+fn resume_names_the_task_a_report_on_the_first_page_came_from() {
+    let install = screen_install(
+        "unrestricted",
+        "",
+        "\n[background]\nenabled = true\n\n[schedule]\npoll_interval = \"200ms\"\n",
+    );
+    let other = seed_session(&install, &install.work_dir(), "the other session");
+    install.write_script(
+        r#"[
+ [{"type":"tool_use_start","id":"t1","name":"shell_execute"},
+  {"type":"tool_use_end","input":{"command":"echo REPORTED","background":true,"timeout_ms":60000}},
+  {"type":"message_end","stop_reason":"tool_use"}],
+ [{"type":"text","text":"Started it."},
+  {"type":"message_end","stop_reason":"end_turn"}],
+ [{"type":"text","text":"Noted the report."},
+  {"type":"message_end","stop_reason":"end_turn"}]
+]"#,
+    );
+    let live = drive_run_with(
+        &install,
+        &[],
+        &[
+            "start it",
+            &format!("{AWAITED}Noted the report.{AWAITED}/exit"),
+        ],
+        false,
+    );
+    let report_row = |rows: &[String]| -> Option<String> {
+        rows.iter()
+            .find(|row| row.starts_with("• Background task "))
+            .cloned()
+    };
+    let said = report_row(final_screen(&live.screens));
+    assert!(
+        said.as_ref()
+            .is_some_and(|row| row != "• Background task report"),
+        "the live run names the task: {:#?}",
+        live.screens
+    );
+    let reported: String = rusqlite::Connection::open(install.database())
+        .expect("open the store")
+        .query_row("SELECT session_id FROM background_tasks", [], |row| {
+            row.get(0)
+        })
+        .expect("the task's session");
+    let run = drive_run_with(
+        &install,
+        &["-r", &reported],
+        &[
+            &format!("{AWAITED}Noted the report.{AWAITED}/resume {other}"),
+            &format!("{AWAITED}Seeded.{AWAITED}/resume {reported}"),
+            &format!("{AWAITED}Noted the report.{AWAITED}/exit"),
+        ],
+        false,
+    );
+    assert_eq!(report_row(&run.screens[0]), said, "{:#?}", run.screens);
+    let rows = final_screen(&run.screens);
+    assert_eq!(
+        report_row(rows),
+        said,
+        "the first page after `/resume` says it as the live run did: {rows:#?}"
     );
     assert_eq!(run.exit, Some(0), "{rows:#?}");
 }

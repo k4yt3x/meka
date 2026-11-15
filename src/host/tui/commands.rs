@@ -23,6 +23,9 @@ pub(crate) struct HostCommandContext<'a> {
     pub(crate) shared: &'a crate::host::SharedDeps,
     /// Where a turn this command runs publishes its token for Ctrl+C.
     pub(crate) cancel: &'a crate::host::CancelCell,
+    /// Sampled when the command arrived, for the turn or the compaction it opens: what it fetches
+    /// first can wait, and a cancel meanwhile is that turn's.
+    pub(crate) admission: crate::host::Admission,
     pub(crate) config: &'a crate::config::ResolvedConfig,
     pub(crate) ui: &'a Ui,
     pub(crate) mcp_manager: &'a Option<Arc<mcp::McpClientManager>>,
@@ -149,6 +152,7 @@ pub(crate) async fn answer(
         agent,
         shared,
         cancel,
+        admission,
         config,
         ui,
         mcp_manager,
@@ -209,7 +213,7 @@ pub(crate) async fn answer(
             };
             match crate::host::terminal::compact_interruptible(
                 cancel,
-                cancel.admit(),
+                admission,
                 agent,
                 &mut session_id,
                 messages,
@@ -548,7 +552,7 @@ pub(crate) async fn answer(
                         match crate::host::terminal::run_turn_interruptible(
                             shared,
                             cancel,
-                            cancel.admit(),
+                            admission,
                             agent,
                             &mut session_id,
                             messages,
@@ -660,7 +664,7 @@ pub(crate) async fn answer(
             match crate::host::terminal::run_turn_interruptible(
                 shared,
                 cancel,
-                cancel.admit(),
+                admission,
                 agent,
                 &mut session_id,
                 messages,

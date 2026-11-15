@@ -456,6 +456,7 @@ pub(crate) async fn run_oneshot(
         }
     }
 
+    let mut wait_interrupted = false;
     // A one-shot run exits with the turn, so there is no later turn to deliver an outcome into.
     // Waiting here degrades a background call into a slow synchronous one, which is a worse deal
     // than the agent asked for but an honest one; exiting instead would leave a promise nothing can
@@ -479,7 +480,10 @@ pub(crate) async fn run_oneshot(
             let tasks = agent.background_tasks();
             tokio::select! {
                 _ = tasks.wait_for_session(id) => {}
-                _ = &mut pressed => tracing::warn!("stopped waiting for background tasks"),
+                _ = &mut pressed => {
+                    tracing::warn!("stopped waiting for background tasks");
+                    wait_interrupted = true;
+                }
             }
         }
         // Collected unconditionally, not only when this process started something. Resuming a
@@ -544,9 +548,9 @@ pub(crate) async fn run_oneshot(
     if let Some(error) = write_error {
         return Err(error);
     }
-    // A signal after the turn ended, during the wait for its background tasks or the way out,
-    // still told the run to leave, and the status says so.
-    if signaled.load(std::sync::atomic::Ordering::SeqCst) {
+    // A press that ended the wait for background tasks, or a signal after the turn ended, during
+    // that wait or the way out, still told the run to leave, and the status says so.
+    if wait_interrupted || signaled.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(crate::error::MekaError::Interrupted.into());
     }
 

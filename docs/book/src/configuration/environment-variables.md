@@ -10,12 +10,12 @@ These operational variables override config file values but are overridden by CL
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `MEKA_PERMISSION` | Default permission level | `none`, `read`, `workspace`, `unrestricted` |
+| `MEKA_PERMISSION` | Default permission level. A value that names no level, or a level outside `[permissions].enabled`, is refused at startup. An empty value is unset, and with `--permission` given the variable is not read. | `none`, `read`, `workspace`, `unrestricted` |
 | `MEKA_INSTRUCTIONS` | Standing instructions as a string, overriding the `instructions.md` file; files named under `[instructions]` still apply. Equivalent to `--instructions`. Used by the `mekabox` container wrapper, which mounts the config directory read-only and so cannot supply a file. | `Be terse.` |
 | `MEKA_INSTRUCTIONS_FILE` | Standing instructions read from this path (a file, or a directory of `*.md`); files named under `[instructions]` still apply. For a file you did not choose the location of, such as a Kubernetes ConfigMap. Conflicts with `MEKA_INSTRUCTIONS`. | `/run/secrets/meka-instructions` |
 | `MEKA_CONFIG_DIR` | Override the default config directory. Points at the `meka` directory itself (contains `config.toml` and `skills/`). The only isolation knob that works on every platform: `dirs::config_dir()` ignores `$XDG_CONFIG_HOME` on macOS/Windows. Must be absolute: a relative value is refused at startup, since falling back to the default would act on the real configuration and resolving it against the working directory would load whatever `./config.toml` is there. An empty value is unset. | `/tmp/meka-test/meka` |
 | `MEKA_DATA_DIR` | Override the default data directory (where `meka.db` lives). Same cross-platform escape hatch: `dirs::data_dir()` ignores `$XDG_DATA_HOME` on macOS/Windows. Useful for tests, portable installs, and per-project session isolation. Must be absolute, refused at startup otherwise, for the same reason as above and more sharply: `meka.db` holds every account credential. An empty value is unset. | `/tmp/meka-test/data/meka` |
-| `MEKA_SANDBOX_BACKEND` | Override `[shell].sandbox_backend`, with the same values per platform. Pinning a value also suppresses the warning the auto-pick prints when it falls back. Used by the `mekabox` wrapper to pin Landlock in the container without editing the read-only host config. | `landlock`, `appcontainer` |
+| `MEKA_SANDBOX_BACKEND` | Override `[shell].sandbox_backend`, with the same values per platform. Pinning a value also suppresses the warning the auto-pick prints when it falls back. Used by the `mekabox` wrapper to pin Landlock in the container without editing the read-only host config. A value that names no backend is refused at startup. An empty value is unset, and with `--sandbox-backend` given the variable is not read. | `landlock`, `appcontainer` |
 
 ## MCP variables
 

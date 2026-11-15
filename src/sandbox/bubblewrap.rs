@@ -110,12 +110,14 @@ pub(super) fn bwrap_on_path() -> Option<std::path::PathBuf> {
 }
 /// Run a `bwrap … /bin/true` smoke test with a short timeout.
 ///
-/// The flag set mirrors the production-path argv in `src/tools/shell.rs` so a host that succeeds
-/// here also succeeds at runtime; without it, a kernel that quietly rejects (say)
-/// `--unshare-cgroup-try` or `--die-with-parent` would pass the probe and blow past the lazy
-/// hard-error gate the first time `shell_execute` ran. `--unshare-net` is added on top so the
-/// probe stays self-contained (no outbound DNS / network calls), even though production keeps the
-/// host network namespace.
+/// It opens its sandbox with the flags a command's argv in `src/tools/shell.rs` opens one with
+/// (`--new-session`, `--die-with-parent`, `--proc /proc` and the `--unshare-*` set) over the root
+/// of a command that reads everywhere, `--ro-bind / /`, so a kernel that quietly rejects (say)
+/// `--unshare-cgroup-try` or `--die-with-parent` fails the probe rather than the first
+/// `shell_execute`. It mounts nothing else a command gets: no `--dev /dev`, no tmpfs masks, no
+/// binds, and not the empty root of a command whose reads are confined. `--unshare-net` is added on
+/// top so the probe stays self-contained (no outbound DNS / network calls), even though a command
+/// on the host network keeps the host's namespace.
 pub(super) fn smoke_test_bwrap(
     bwrap_path: &std::path::Path,
     timeout: std::time::Duration,

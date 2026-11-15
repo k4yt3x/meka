@@ -873,6 +873,35 @@ fn the_workspace_level_is_accepted_at_the_flag_and_in_the_config_file() {
     );
 }
 
+/// A `MEKA_PERMISSION` that names no level stops the run before it starts, naming the variable and
+/// the word, rather than running at the level the file names.
+#[test]
+fn a_misspelled_meka_permission_refuses_the_run_and_records_no_session() {
+    let install = Install::new();
+    write_provider_config(&install, "default", &["default"]);
+    let refused = scripted_command(&install, &["--oneshot", "-p", "hello"])
+        .env("MEKA_PERMISSION", "raed")
+        .output()
+        .expect("spawn meka");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        !refused.status.success(),
+        "the run must not start: {stderr}"
+    );
+    assert!(
+        stderr.contains("MEKA_PERMISSION") && stderr.contains("raed"),
+        "the refusal names the variable and the word: {stderr}"
+    );
+    let sessions: i64 = if install.database().exists() {
+        store(&install)
+            .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+            .expect("count sessions")
+    } else {
+        0
+    };
+    assert_eq!(sessions, 0, "a refused run records no session");
+}
+
 /// `--additional-workspace-directory` naming a path that does not exist warns, and does not fail
 /// the run.
 ///
@@ -1050,6 +1079,39 @@ fn an_unparseable_config_still_lets_the_commands_that_repair_it_run() {
     assert!(
         !output.status.success(),
         "`meka mcp list` must not answer out of a config it could not read"
+    );
+}
+
+/// A `[permissions]` whose `default` is outside `enabled` stops the commands that resolve a run's
+/// settings and no other: a listing reads no level and still answers, with the file's fault
+/// said, and a command that reads the settings refuses, naming the key.
+#[test]
+fn a_default_level_outside_the_enabled_ones_stops_only_what_reads_the_settings() {
+    let install = Install::new();
+    install.write_config(
+        "[permissions]\ndefault = \"unrestricted\"\nenabled = [\"read\", \"workspace\"]\n",
+    );
+
+    let listing = run_isolated(&install, &["session", "list"]);
+    let stderr = String::from_utf8_lossy(&listing.stderr);
+    assert!(
+        listing.status.success(),
+        "`meka session list` reads no level and must still answer: {stderr}"
+    );
+    assert!(
+        stderr.contains("[permissions].default"),
+        "what is wrong with the file is still said: {stderr}"
+    );
+
+    let reader = run_isolated(&install, &["mcp", "list"]);
+    let stderr = String::from_utf8_lossy(&reader.stderr);
+    assert!(
+        !reader.status.success(),
+        "`meka mcp list` must not answer out of settings Meka refuses: {stderr}"
+    );
+    assert!(
+        stderr.contains("[permissions].default"),
+        "the refusal names the key: {stderr}"
     );
 }
 
@@ -1368,7 +1430,7 @@ fn an_interrupted_json_oneshot_run_still_reports() {
 /// Ctrl+C while a one-shot run waits for a background task stops the task: the wait keeps the
 /// handles registered, the release on the way out cancels them, and the run waits for the cancel
 /// to land before leaving. Without them the command runs on untracked, its row saying `running`
-/// until a later open sweeps it.
+/// until a later open sweeps it. The run exits 130, as one interrupted during its turn does.
 ///
 /// The press is sent once the JSON report is on stdout, which the run writes after the turn and
 /// ahead of the wait: that is the window a press has to survive, and a press sent while the turn
@@ -1436,6 +1498,11 @@ fn an_interrupted_wait_stops_the_background_task_it_was_waiting_for() {
     assert!(
         stderr.contains("stopping 1 background task"),
         "the release names what it stopped: {stderr}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "the run exits as an interrupted one: {stderr}"
     );
     support::wait_until(
         "the command's end",

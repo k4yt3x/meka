@@ -728,8 +728,8 @@ impl Conversation {
     }
 
     /// The session's title, the same on every surface that labels one: the first words a user
-    /// said, their whitespace collapsed to single spaces, cut to [`TITLE_CHARS`] with an ellipsis.
-    /// Empty until a user has said something.
+    /// said, their whitespace collapsed to single spaces, cut to [`TITLE_CHARS`] characters, an
+    /// ellipsis the last of them. Empty until a user has said something.
     ///
     /// Read from the log rather than the view, because a compaction replaces the view's first user
     /// message with its summary and a label that changed when the session was reopened would name
@@ -766,7 +766,7 @@ impl Conversation {
                 if words.chars().count() <= chars {
                     words
                 } else {
-                    let kept: String = words.chars().take(chars).collect();
+                    let kept: String = words.chars().take(chars.saturating_sub(1)).collect();
                     format!("{}…", kept.trim_end())
                 }
             })
@@ -3764,7 +3764,7 @@ mod tests {
 
         let long = Conversation::from_vec(vec![Message::user("x".repeat(TITLE_CHARS + 20))]);
         let title = long.title();
-        assert_eq!(title.chars().count(), TITLE_CHARS + 1, "{title:?}");
+        assert_eq!(title.chars().count(), TITLE_CHARS, "{title:?}");
         assert!(title.ends_with('…'), "{title:?}");
     }
 

@@ -76,11 +76,8 @@ pub(crate) async fn sweep_expired_sessions(
     };
     let sweep = store.delete_expired_sessions(retention).await?;
     if sweep.deleted > 0 {
-        let deleted = sweep.deleted;
-        let window = humantime_serde::re::humantime::format_duration(retention);
-        tracing::warn!(
-            "deleted {deleted} session(s) not updated in {window} (`[session].retention`)"
-        );
+        let line = sweep.describe(retention);
+        tracing::warn!("{line}");
     }
     // Only turns bump `updated_at`, so a screen idle past the window looks expired while a human is
     // sitting in front of it. Saying nothing here would leave an operator wondering why their

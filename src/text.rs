@@ -939,7 +939,11 @@ pub(crate) fn format_duration_short(seconds: i64) -> String {
 /// rather than `"1 day 12 hours"`, `"90 minutes"`, and seconds for anything else. For a window the
 /// user wrote in one unit, which is how the model and the log read it back.
 pub(crate) fn format_duration_words(duration: std::time::Duration) -> String {
-    const UNITS: [(u64, &str); 4] = [
+    // A year and a month are humantime's, 365.25 and 30.44 days, since it parses the windows a
+    // configuration file states. Neither is a whole number of days.
+    const UNITS: [(u64, &str); 6] = [
+        (31_557_600, "year"),
+        (2_630_016, "month"),
         (86_400, "day"),
         (3_600, "hour"),
         (60, "minute"),
@@ -1675,11 +1679,19 @@ mod tests {
         }
     }
 
-    /// An elapsed time keeps its seconds under an hour, where they are what a reader watches, and
-    /// drops them past it.
+    /// A window reads in the largest unit that divides it. A month and a year are the lengths the
+    /// configuration's parser gives them, 30.44 and 365.25 days, so the test takes them from it.
     #[test]
     fn a_window_is_spelled_in_the_one_unit_that_divides_it() {
         use std::time::Duration;
+        let written = |window: &str| {
+            humantime_serde::re::humantime::parse_duration(window).expect("a duration")
+        };
+        assert_eq!(super::format_duration_words(written("6months")), "6 months");
+        assert_eq!(super::format_duration_words(written("1month")), "1 month");
+        assert_eq!(super::format_duration_words(written("1y")), "1 year");
+        assert_eq!(super::format_duration_words(written("2years")), "2 years");
+        assert_eq!(super::format_duration_words(written("2w")), "14 days");
         assert_eq!(
             super::format_duration_words(Duration::from_secs(90 * 86_400)),
             "90 days"
@@ -1724,6 +1736,8 @@ mod tests {
         assert!(absurd < now - chrono::TimeDelta::days(36_000), "{absurd}");
     }
 
+    /// An elapsed time keeps its seconds under an hour, where they are what a reader watches, and
+    /// drops them past it.
     #[test]
     fn an_elapsed_time_keeps_its_seconds_under_an_hour() {
         use std::time::Duration;

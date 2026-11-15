@@ -1355,11 +1355,9 @@ impl Agent {
                 // Saved where the call named, as a round's call's output is: the request offers the
                 // parameter, and the checkpoint is where material is put aside to outlast the
                 // window it replaces. Ahead of the bound, which is for what stays inline, so the
-                // entry holds the output whole. Never the acknowledgement of the summary, which
-                // would replace what an entry of that name holds.
+                // entry holds the output whole.
                 let mut content = output.content;
                 if output.is_output
-                    && !hands_in_the_summary
                     && let Some(entry) = crate::tools::scratchpad::requested_entry(&input)
                     && let Err(error) = crate::tools::scratchpad::save_to_named_entry(
                         &self.store,
@@ -2715,6 +2713,59 @@ mod tests {
         let text = ContentBlock::tool_result_text_content(content);
         assert!(
             text.contains("stub ran") && text.contains("inherited read-only"),
+            "{text}"
+        );
+    }
+
+    /// A checkpoint call whose tool keeps its result inline reads it inline whatever entry it
+    /// names: `scratchpad_write` leaves what it wrote in the entry it named and reads its own
+    /// acknowledgement.
+    #[tokio::test]
+    async fn a_checkpoint_call_whose_tool_keeps_its_result_inline_is_not_redirected() {
+        let provider = Arc::new(a_checkpoint_calling(
+            "write-1",
+            "scratchpad_write",
+            serde_json::json!({"name": "x", "content": "the real content", "scratchpad": "x"}),
+        ));
+        let (mut agent, store) =
+            agent_with_registry_and_checkpoint(provider, crate::tools::ToolRegistry::new()).await;
+        agent.tool_registry = crate::tools::ToolRegistry::build_default(
+            &crate::session::SessionMaterials {
+                skills: crate::skills::SkillCache::disabled(),
+                memories: crate::store::memory::MemoryStore::disabled(),
+                ..crate::session::SessionMaterials::for_test(store.clone())
+            },
+            agent.cells(),
+            &agent.options,
+        )
+        .expect("the production registry");
+        let mut messages = conversation();
+
+        let record = compact(
+            &agent,
+            &store,
+            &mut messages,
+            CompactRequest::new(CompactionTrigger::Requested),
+        )
+        .await;
+
+        assert_eq!(record.source, CompactionSource::Checkpoint);
+        let session_id = agent.session_id().expect("a session");
+        assert_eq!(
+            store
+                .load_scratchpad_entry(session_id, "x")
+                .await
+                .expect("read")
+                .as_deref(),
+            Some("the real content")
+        );
+        let results = checkpoint_results(&record, "write-1");
+        let [content] = results.as_slice() else {
+            panic!("one result for the call: {results:?}");
+        };
+        let text = ContentBlock::tool_result_text_content(content);
+        assert!(
+            text.contains("Stored 16 bytes") && !text.contains("Output saved"),
             "{text}"
         );
     }

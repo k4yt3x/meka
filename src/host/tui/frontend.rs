@@ -79,6 +79,8 @@ pub(crate) enum UiEvent {
         page: crate::store::LogPage,
         /// The session's recorded turns, which close each turn's rows on the replay.
         turns: Vec<crate::store::turns::TurnRecord>,
+        /// The session's task rows, as on [`Self::HistoryPage`].
+        tasks: Vec<crate::store::background::BackgroundTask>,
         /// The stretches of the log the session's conversation no longer holds, which the replay
         /// leaves out.
         rewound: Vec<crate::store::Rewound>,

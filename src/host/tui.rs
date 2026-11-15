@@ -469,6 +469,14 @@ pub(crate) async fn run_interactive(
     let mut interrupted_exit = false;
     while let Some(event) = host_receiver.recv().await {
         match event {
+            // Once told to leave, the process waits on the background tasks it stopped before it
+            // sends the exit, and a turn opened meanwhile would run whole first. Every command is
+            // refused, not only those that open a turn: the session is about to go.
+            HostEvent::UserInput { .. } | HostEvent::Command(_)
+                if INTERRUPT_RELAY.is_told_to_leave() =>
+            {
+                ui.done();
+            }
             // Recorded on the row, then nothing else: this is not a turn.
             HostEvent::PermissionChanged { session, level } => {
                 let Some(id) = session.get() else {
@@ -533,9 +541,10 @@ pub(crate) async fn run_interactive(
                             .write()
                             .await
                             .insert(entry.id, SessionEntry(entry.clone()));
-                        // The host is leaving, which here only a hangup or a termination says:
-                        // its listener sends the `Exit` that ends the loop as interrupted, once
-                        // the background tasks it stopped have had their moment.
+                        // The host is leaving, which here only a signal listener says (a hangup, a
+                        // termination, a SIGINT that is the ladder's last press): it sends the
+                        // `Exit` that ends the loop as interrupted, once the stopped background
+                        // tasks have had their moment.
                         if crate::host::scheduler::deliver_ready_outcomes(&hooks, &sessions)
                             .await
                             .is_break()
@@ -587,11 +596,15 @@ pub(crate) async fn run_interactive(
                 ui.done();
             }
             HostEvent::Command(command) => {
+                // Admitted here, as a prompt is: a command that opens a turn fetches what it sends
+                // first, and a Ctrl+C or a signal meanwhile counts against that turn.
+                let admission = cancel.admit();
                 let mut messages = conversation.lock().await;
                 let opened = commands::answer(command, commands::HostCommandContext {
                     agent: &agent,
                     shared: &shared,
                     cancel: &cancel,
+                    admission,
                     config: &config,
                     ui: &ui,
                     mcp_manager: &mcp_manager,
@@ -856,10 +869,10 @@ impl crate::host::scheduler::HostHooks for TuiHooks {
         &self.store
     }
 
-    /// From the hangup or the termination on, while its listener waits on the background tasks
-    /// before it sends the exit. A sweep in flight or served meanwhile would fire the occurrence
-    /// that stop handed back, the next job due, or the outcome of a task it stopped, each as a
-    /// turn nothing stops.
+    /// From the hangup, the termination or the SIGINT that ends the ladder on, while its listener
+    /// waits on the background tasks before it sends the exit. A sweep in flight or served
+    /// meanwhile would fire the occurrence that stop handed back, the next job due, or the outcome
+    /// of a task it stopped, each as a turn nothing stops.
     fn shutting_down(&self) -> bool {
         crate::host::terminal::INTERRUPT_RELAY.is_told_to_leave()
     }

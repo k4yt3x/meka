@@ -2181,8 +2181,11 @@ pub(crate) struct ResolvedConfig {
     /// Set when profile selection failed (no profiles, ambiguous, an unknown name, or a profile
     /// whose account is missing); surfaced by [`Self::validate`] with guidance.
     pub(crate) provider_error: Option<String>,
-    /// `config.toml` failed to read or parse. Raised by [`Self::validate`] before anything else,
-    /// since every other field is a default that silently ignores what the user wrote.
+    /// `config.toml` failed to read or parse, or the file, the environment or a flag asks for
+    /// something no run can start under: a `MEKA_PERMISSION` or `MEKA_SANDBOX_BACKEND` that names
+    /// no level or backend, a start level outside `[permissions].enabled`. Raised by
+    /// [`Self::validate`] before anything else, since every field it touches holds a placeholder
+    /// rather than what the user wrote.
     pub(crate) config_error: Option<String>,
     pub(crate) permission: Permission,
     pub(crate) enabled_permissions: EnabledPermissions,
@@ -2835,18 +2838,9 @@ pub(crate) fn load_config_file_or_err() -> crate::error::Result<ConfigFile> {
     ConfigRead::now().parse_or_err()
 }
 
-/// Resolve the runtime permission level and the set of enabled levels from the layered config
-/// sources. CLI > env > config file > built-in defaults. A level Meka does not have never reaches
-/// here, because [`PermissionsConfig`] is typed and serde refuses it at parse; out-of-set overrides
-/// (e.g. `--permission unrestricted` when it is disabled) warn and clamp to the configured default
-/// rather than refusing to start, mirroring the `[tools.tool_permissions]` warn-and-skip pattern.
-///
-/// The third element is the level the user asked for on this run and got, or `None` when the level
-/// came from the config file or the built-in default. Resuming needs the distinction: a session
-/// runs at the level it recorded, and only an explicit request overrides that. The level
-/// `config.toml` alone gives a new session, for what the store's ledger writes into rows. Unlike
-/// [`ResolvedConfig::resolve`] it reads no CLI flag and no environment variable, because those
-/// belong to one run and the row outlives it.
+/// The level `config.toml` alone gives a new session, for what the store's ledger writes into rows.
+/// Unlike [`ResolvedConfig::resolve`] it reads no CLI flag and no environment variable, because
+/// those belong to one run and the row outlives it.
 pub(crate) fn default_permission_on_disk() -> crate::error::Result<Permission> {
     let config_file = load_config_file_or_err()?;
     let permissions = config_file.permissions.unwrap_or_default();
@@ -2857,16 +2851,29 @@ pub(crate) fn default_permission_on_disk() -> crate::error::Result<Permission> {
         None,
         permissions.default,
         permissions.enabled.as_deref(),
-    );
+    )
+    .map_err(crate::error::MekaError::Config)?;
     Ok(permission)
 }
 
+/// The start level, the set of enabled levels and the level this run asked for, resolved CLI over
+/// environment over `config.toml` over the built-in default. A level Meka does not have never
+/// reaches here from the file, whose [`PermissionsConfig`] is typed and refused at parse.
+///
+/// Refuses rather than replaces, as every door that changes a level later does: a
+/// `MEKA_PERMISSION` that names no level, a requested level outside the enabled set, and a
+/// `default` outside it. A replacement would start the run at a level nobody asked for. A blank
+/// `MEKA_PERMISSION` is unset, and one `--permission` overrides is not read.
+///
+/// The third element is the level the user asked for on this run, or `None` when the level came
+/// from the file or the built-in default. Resuming needs the distinction: a session runs at the
+/// level it recorded, and only an explicit request overrides that.
 fn resolve_permission(
     cli_permission: Option<Permission>,
     env_permission: Option<&str>,
     file_default: Option<Permission>,
     file_enabled: Option<&[Permission]>,
-) -> (Permission, EnabledPermissions, Option<Permission>) {
+) -> Result<(Permission, EnabledPermissions, Option<Permission>), String> {
     let enabled = match file_enabled {
         Some(list) => match EnabledPermissions::from_levels(list.iter().copied()) {
             Some(set) => set,
@@ -2884,19 +2891,12 @@ fn resolve_permission(
         },
         None => EnabledPermissions::DEFAULT,
     };
+    let refused =
+        |source: &str, level: Permission| format!("`{source}`: {}", enabled.disabled_level(level));
 
     let resolved_default = match file_default {
         Some(level) if enabled.is_enabled(level) => level,
-        Some(level) => {
-            tracing::warn!(
-                "[permissions].default = '{level}' is not in [permissions].enabled; falling back"
-            );
-            if enabled.is_enabled(Permission::Read) {
-                Permission::Read
-            } else {
-                enabled.lowest()
-            }
-        }
+        Some(level) => return Err(refused("[permissions].default", level)),
         None => {
             if enabled.is_enabled(Permission::Read) {
                 Permission::Read
@@ -2906,30 +2906,25 @@ fn resolve_permission(
         }
     };
 
-    let env_override = env_permission.and_then(|raw| match raw.parse::<Permission>() {
-        Ok(level) => Some(level),
-        Err(error) => {
-            tracing::warn!("ignoring MEKA_PERMISSION='{raw}': {error}");
-            None
-        }
-    });
-
-    let raw_choice = cli_permission.or(env_override);
-    // A request that had to be clamped is not a request that was honored, so it does not suppress a
-    // resumed session's recorded level either.
-    let requested = match raw_choice {
-        Some(level) if enabled.is_enabled(level) => Some(level),
-        Some(level) => {
-            tracing::warn!(
-                "requested start level '{level}' is not in [permissions].enabled; using \
-                 '{resolved_default}'"
-            );
-            None
-        }
-        None => None,
+    let requested = match cli_permission {
+        Some(level) => Some(("--permission", level)),
+        None => env_permission
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+            .map(|raw| {
+                raw.parse::<Permission>()
+                    .map(|level| ("MEKA_PERMISSION", level))
+                    .map_err(|error| format!("`MEKA_PERMISSION`: {error}"))
+            })
+            .transpose()?,
     };
-
-    (requested.unwrap_or(resolved_default), enabled, requested)
+    if let Some((source, level)) = requested
+        && !enabled.is_enabled(level)
+    {
+        return Err(refused(source, level));
+    }
+    let requested = requested.map(|(_, level)| level);
+    Ok((requested.unwrap_or(resolved_default), enabled, requested))
 }
 
 /// Which tier the standing instructions come from, as [`Self::select`] decides it.
@@ -2993,8 +2988,7 @@ fn mock_provider_override() -> Option<MockProviderRequest> {
     })
 }
 
-/// `MEKA_MCP_TOOL_TIMEOUT` as a duration, with the same tolerance as [`sandbox_backend_override`]:
-/// a value Meka cannot use is warned about and ignored.
+/// `MEKA_MCP_TOOL_TIMEOUT` as a duration. A value Meka cannot use is warned about and ignored.
 fn mcp_tool_timeout_override() -> Option<std::time::Duration> {
     parse_mcp_tool_timeout(&std::env::var("MEKA_MCP_TOOL_TIMEOUT").ok()?)
 }
@@ -3024,28 +3018,26 @@ fn parse_mcp_tool_timeout(value: &str) -> Option<std::time::Duration> {
 
 /// `MEKA_SANDBOX_BACKEND` overrides `[shell].sandbox_backend` for non-interactive / containerized
 /// runs (the `mekabox` wrapper sets it to pin Landlock and silence the auto-resolve warning when
-/// it mounts the host config read-only). Takes the one spelling the file takes; an unrecognized
-/// value is warned about and ignored.
-fn sandbox_backend_override() -> Option<SandboxBackend> {
-    parse_sandbox_backend_override(&std::env::var("MEKA_SANDBOX_BACKEND").ok()?)
+/// it mounts the host config read-only). Takes the one spelling the file and the flag take; a value
+/// that is not one is refused, as it is there.
+fn sandbox_backend_override() -> Result<Option<SandboxBackend>, String> {
+    match std::env::var("MEKA_SANDBOX_BACKEND") {
+        Ok(value) => parse_sandbox_backend_override(&value),
+        Err(_) => Ok(None),
+    }
 }
 
-/// Parse a `MEKA_SANDBOX_BACKEND` value (trimmed). Empty or unrecognized values yield `None`;
-/// unrecognized ones also warn. Split from [`sandbox_backend_override`] so the parsing is
-/// unit-testable without mutating process env.
-fn parse_sandbox_backend_override(value: &str) -> Option<SandboxBackend> {
+/// Parse a `MEKA_SANDBOX_BACKEND` value (trimmed); blank is unset. Split from
+/// [`sandbox_backend_override`] so the parsing is unit-testable without mutating process env.
+fn parse_sandbox_backend_override(value: &str) -> Result<Option<SandboxBackend>, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return None;
+        return Ok(None);
     }
-    // Env tolerates a bad value (warn and ignore); the CLI path uses `FromStr` directly and errors.
-    match trimmed.parse() {
-        Ok(backend) => Some(backend),
-        Err(message) => {
-            tracing::warn!("ignoring MEKA_SANDBOX_BACKEND: {message}");
-            None
-        }
-    }
+    trimmed
+        .parse()
+        .map(Some)
+        .map_err(|message| format!("`MEKA_SANDBOX_BACKEND`: {message}"))
 }
 
 /// The `--eager-load-tool SERVER:TOOL` values, for the overlay the manager settles onto each
@@ -3099,7 +3091,7 @@ impl ResolvedConfig {
         let read_at = read.at;
         let started_on = read.sections().unwrap_or_default();
         let resolved_overrides = overrides.clone();
-        let (config_file, config_error) = read.parse();
+        let (config_file, mut config_error) = read.parse();
         // `--profile`, else `default_profile`, else the sole profile, followed through its
         // account: the one selection, made here and replaced on a host only by a write of its
         // own. A miss is a deferred error `validate()` raises, so `resolve` stays infallible.
@@ -3256,12 +3248,24 @@ impl ResolvedConfig {
         };
 
         let file_permissions = config_file.permissions.unwrap_or_default();
-        let (permission, enabled_permissions, requested_permission) = resolve_permission(
+        let (permission, enabled_permissions, requested_permission) = match resolve_permission(
             overrides.permission,
             std::env::var("MEKA_PERMISSION").ok().as_deref(),
             file_permissions.default,
             file_permissions.enabled.as_deref(),
-        );
+        ) {
+            Ok(resolved) => resolved,
+            // A placeholder that grants nothing, for a run `validate()` refuses.
+            Err(refusal) => {
+                config_error.get_or_insert(refusal);
+                (
+                    Permission::None,
+                    EnabledPermissions::from_levels([Permission::None])
+                        .unwrap_or(EnabledPermissions::DEFAULT),
+                    None,
+                )
+            }
+        };
 
         // After `resolve_permission`, because the fire-time gate check filters a row's recorded
         // level by the enabled set, which is the one thing an operator can narrow that a row
@@ -3270,10 +3274,17 @@ impl ResolvedConfig {
 
         // `--sandbox-backend` > `MEKA_SANDBOX_BACKEND` > `[shell].sandbox_backend`. Not probed
         // here: the host picks and probes at startup, and only when a shell can run.
-        let sandbox_backend = overrides
-            .sandbox_backend
-            .or_else(sandbox_backend_override)
-            .or(file_shell.sandbox_backend);
+        let sandbox_backend = match overrides.sandbox_backend {
+            Some(backend) => Some(backend),
+            None => match sandbox_backend_override() {
+                Ok(backend) => backend,
+                Err(refusal) => {
+                    config_error.get_or_insert(refusal);
+                    None
+                }
+            },
+        }
+        .or(file_shell.sandbox_backend);
 
         // A directory that does not resolve contributes nothing to either boundary, because
         // `usable_roots` drops what it cannot canonicalize. Silently, until an access is refused
@@ -3403,7 +3414,8 @@ impl ResolvedConfig {
         }
     }
 
-    /// Refuse to answer from empty defaults when `config.toml` did not parse.
+    /// Refuse to answer from empty defaults when `config.toml` did not parse, or from placeholders
+    /// where the file, the environment or a flag asked for what no run starts under.
     ///
     /// For the subcommands that never reach [`Self::validate`] but do read the parsed config:
     /// `meka mcp list` over a config full of servers would otherwise print "No MCP servers.", and
@@ -6790,28 +6802,31 @@ thinking = "budgeted"
         );
     }
 
+    /// One spelling per backend, as the flag and the file take it; anything else is refused
+    /// naming the variable and the backends, rather than dropped for the backend picked without
+    /// it. Blank is unset.
     #[test]
-    fn the_sandbox_backend_variable_takes_one_spelling_and_ignores_the_rest() {
+    fn the_sandbox_backend_variable_takes_one_spelling_and_refuses_the_rest() {
         assert_eq!(
             parse_sandbox_backend_override("landlock"),
-            Some(SandboxBackend::Landlock)
+            Ok(Some(SandboxBackend::Landlock))
         );
         assert_eq!(
             parse_sandbox_backend_override("  landlock  "),
-            Some(SandboxBackend::Landlock),
+            Ok(Some(SandboxBackend::Landlock)),
             "value is trimmed"
         );
-        assert_eq!(
-            parse_sandbox_backend_override("Bubblewrap"),
-            None,
-            "one spelling per backend: a case variant is ignored, not folded"
-        );
-        assert_eq!(parse_sandbox_backend_override(""), None);
-        assert_eq!(
-            parse_sandbox_backend_override("nonsense"),
-            None,
-            "unrecognized values are ignored, not fatal"
-        );
+        assert_eq!(parse_sandbox_backend_override(""), Ok(None));
+        assert_eq!(parse_sandbox_backend_override("   "), Ok(None));
+        for refused in ["Bubblewrap", "bubblewrap_landlock", "nonsense"] {
+            let refusal = parse_sandbox_backend_override(refused).expect_err("refused");
+            assert!(
+                refusal.contains("MEKA_SANDBOX_BACKEND")
+                    && refusal.contains(refused)
+                    && refusal.contains(&SandboxBackend::supported()),
+                "{refused}: {refusal}"
+            );
+        }
     }
 
     #[test]
@@ -7033,9 +7048,19 @@ thinking = "budgeted"
         EnabledPermissions::from_levels(levels.iter().copied()).unwrap()
     }
 
+    /// The refusal every door that sets a level gives for `level` outside `enabled`.
+    fn disabled_level_sentence(level: &str, enabled: &[&str]) -> String {
+        crate::error::MekaError::DisabledLevel {
+            level: level.to_string(),
+            enabled: enabled.iter().map(|name| name.to_string()).collect(),
+        }
+        .to_string()
+    }
+
     #[test]
     fn resolve_permission_no_config() {
-        let (permission, enabled, _requested) = resolve_permission(None, None, None, None);
+        let (permission, enabled, _requested) =
+            resolve_permission(None, None, None, None).expect("resolves");
         assert_eq!(permission, Permission::Read);
         assert_eq!(enabled, EnabledPermissions::DEFAULT);
     }
@@ -7048,7 +7073,8 @@ thinking = "budgeted"
             Permission::Workspace,
             Permission::Unrestricted,
         ];
-        let (_permission, enabled, _requested) = resolve_permission(None, None, None, Some(&list));
+        let (_permission, enabled, _requested) =
+            resolve_permission(None, None, None, Some(&list)).expect("resolves");
         assert!(enabled.is_enabled(Permission::Workspace));
         assert_eq!(enabled.iter().count(), 4);
     }
@@ -7079,7 +7105,8 @@ thinking = "budgeted"
     #[test]
     fn an_empty_enabled_list_falls_back_to_read_alone() {
         let list: [Permission; 0] = [];
-        let (permission, enabled, _requested) = resolve_permission(None, None, None, Some(&list));
+        let (permission, enabled, _requested) =
+            resolve_permission(None, None, None, Some(&list)).expect("resolves");
         assert_eq!(enabled, enabled_set(&[Permission::Read]));
         assert!(
             !enabled.is_enabled(Permission::Unrestricted),
@@ -7088,39 +7115,53 @@ thinking = "budgeted"
         assert_eq!(permission, Permission::Read);
     }
 
+    /// A `default` outside `enabled` is a file that contradicts itself, refused naming the key in
+    /// the words every door that sets a level uses, rather than replaced by another level.
     #[test]
-    fn resolve_permission_default_not_in_enabled_clamps() {
+    fn a_default_outside_the_enabled_list_is_refused() {
         let list = [Permission::Read];
-        let (permission, _enabled, _requested) =
-            resolve_permission(None, None, Some(Permission::Unrestricted), Some(&list));
-        // `unrestricted` is not enabled → fall back to Read because it is.
-        assert_eq!(permission, Permission::Read);
+        let refusal = resolve_permission(None, None, Some(Permission::Unrestricted), Some(&list))
+            .expect_err("refused, not replaced");
+        assert!(
+            refusal.contains("`[permissions].default`")
+                && refusal.contains(&disabled_level_sentence("unrestricted", &["read"])),
+            "{refusal}"
+        );
     }
 
     #[test]
-    fn resolve_permission_default_not_in_enabled_no_read_falls_to_lowest() {
+    fn resolve_permission_default_falls_to_the_lowest_level_when_read_is_not_enabled() {
         let list = [Permission::Workspace, Permission::Unrestricted];
         let (permission, _enabled, _requested) =
-            resolve_permission(None, None, Some(Permission::None), Some(&list));
-        // none isn't enabled, Read isn't either → lowest enabled is Workspace.
+            resolve_permission(None, None, None, Some(&list)).expect("resolves");
         assert_eq!(permission, Permission::Workspace);
     }
 
     #[test]
     fn resolve_permission_explicit_default_used() {
         let (permission, _enabled, _requested) =
-            resolve_permission(None, None, Some(Permission::Unrestricted), None);
+            resolve_permission(None, None, Some(Permission::Unrestricted), None).expect("resolves");
         assert_eq!(permission, Permission::Unrestricted);
     }
 
+    /// A start level asked for on the command line or in the environment and outside the enabled
+    /// set is refused, naming where it was asked, as `/permission` and `POST /v1/sessions` refuse
+    /// one, rather than started at the default.
     #[test]
-    fn resolve_permission_cli_override_disabled_clamps_to_default() {
-        // `unrestricted` not enabled → the CLI request warns and clamps to the configured default
-        // (Read).
-        let list = [Permission::Read];
-        let (permission, _enabled, _requested) =
-            resolve_permission(Some(Permission::Unrestricted), None, None, Some(&list));
-        assert_eq!(permission, Permission::Read);
+    fn a_requested_level_outside_the_enabled_list_is_refused() {
+        let list = [Permission::None, Permission::Read];
+        for (cli, env, source) in [
+            (Some(Permission::Workspace), None, "`--permission`"),
+            (None, Some("workspace"), "`MEKA_PERMISSION`"),
+        ] {
+            let refusal = resolve_permission(cli, env, Some(Permission::Read), Some(&list))
+                .expect_err("refused, not replaced");
+            assert!(
+                refusal.contains(source)
+                    && refusal.contains(&disabled_level_sentence("workspace", &["none", "read"])),
+                "{source}: {refusal}"
+            );
+        }
     }
 
     #[test]
@@ -7132,34 +7173,159 @@ thinking = "budgeted"
             Permission::Unrestricted,
         ];
         let (permission, _enabled, _requested) =
-            resolve_permission(Some(Permission::Workspace), None, None, Some(&list));
+            resolve_permission(Some(Permission::Workspace), None, None, Some(&list))
+                .expect("resolves");
         assert_eq!(permission, Permission::Workspace);
     }
 
     #[test]
     fn resolve_permission_env_override_used() {
         let (permission, _enabled, _requested) =
-            resolve_permission(None, Some("unrestricted"), None, None);
+            resolve_permission(None, Some("unrestricted"), None, None).expect("resolves");
         assert_eq!(permission, Permission::Unrestricted);
     }
 
+    /// A `MEKA_PERMISSION` that names no level is refused naming the variable, the word and the
+    /// levels, as `--permission` refuses one, rather than dropped for the file's default. Empty and
+    /// blank are unset, and a level is read trimmed.
     #[test]
-    fn resolve_permission_env_override_disabled_clamps() {
-        // env asks for `unrestricted`, which this config does not enable.
-        let list = [Permission::Read];
+    fn a_meka_permission_that_names_no_level_is_refused() {
+        let refusal = resolve_permission(None, Some("raed"), Some(Permission::Unrestricted), None)
+            .expect_err("refused, not dropped");
+        assert!(
+            refusal.contains("`MEKA_PERMISSION`")
+                && refusal.contains("'raed'")
+                && refusal.contains(&Permission::supported()),
+            "{refusal}"
+        );
+        for unset in ["", "  "] {
+            let (permission, _enabled, requested) =
+                resolve_permission(None, Some(unset), Some(Permission::Workspace), None)
+                    .expect("blank is unset");
+            assert_eq!(
+                (permission, requested),
+                (Permission::Workspace, None),
+                "{unset:?}"
+            );
+        }
         let (permission, _enabled, _requested) =
-            resolve_permission(None, Some("unrestricted"), None, Some(&list));
-        assert_eq!(permission, Permission::Read);
+            resolve_permission(None, Some(" unrestricted "), None, None).expect("trimmed");
+        assert_eq!(permission, Permission::Unrestricted);
     }
 
-    /// The env value has to be one Meka still accepts, or this proves nothing: an unparseable
-    /// `MEKA_PERMISSION` is dropped before the precedence rule is ever consulted, so the CLI wins
-    /// by default rather than by rule, and reversing the precedence leaves the test green.
+    /// The flag wins over a variable Meka accepts, and a variable the flag overrides is not read,
+    /// as `MEKA_SANDBOX_BACKEND` is not under `--sandbox-backend`: one that names no level stops
+    /// nothing then.
     #[test]
     fn resolve_permission_cli_beats_env() {
         let (permission, _enabled, _requested) =
-            resolve_permission(Some(Permission::None), Some("unrestricted"), None, None);
+            resolve_permission(Some(Permission::None), Some("unrestricted"), None, None)
+                .expect("resolves");
         assert_eq!(permission, Permission::None);
+        let (permission, _enabled, requested) =
+            resolve_permission(Some(Permission::Read), Some("raed"), None, None)
+                .expect("a variable the flag overrides is not read");
+        assert_eq!(
+            (permission, requested),
+            (Permission::Read, Some(Permission::Read))
+        );
+    }
+
+    /// Every place a start level or a sandbox backend is stated reaches `validate()` with its
+    /// refusal, and the level a refused config carries is `none`, for a reader that never asks
+    /// `validate()`.
+    #[test]
+    fn a_level_or_backend_no_run_can_start_on_is_refused_by_validate() {
+        use clap::Parser;
+        const CONSISTENT: &str = "default = \"unrestricted\"\nenabled = [\"workspace\", \
+                                  \"unrestricted\"]";
+        let _guard = CONFIG_DIR_ENV_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let resolve = |arguments: &[&str], permissions: &str, variable: Option<(&str, &str)>| {
+            std::fs::write(
+                dir.path().join("config.toml"),
+                format!("[permissions]\n{permissions}\n"),
+            )
+            .expect("write config");
+            // SAFETY: guarded above.
+            unsafe {
+                std::env::set_var("MEKA_CONFIG_DIR", dir.path());
+                if let Some((name, value)) = variable {
+                    std::env::set_var(name, value);
+                }
+            }
+            let resolved =
+                ResolvedConfig::resolve(crate::cli::Cli::parse_from(arguments).overrides());
+            unsafe {
+                std::env::remove_var("MEKA_CONFIG_DIR");
+                if let Some((name, _)) = variable {
+                    std::env::remove_var(name);
+                }
+            }
+            resolved
+        };
+
+        let read_is_disabled = disabled_level_sentence("read", &["workspace", "unrestricted"]);
+        for (arguments, permissions, variable, source) in [
+            (
+                &["meka"][..],
+                CONSISTENT,
+                Some(("MEKA_PERMISSION", "read")),
+                "`MEKA_PERMISSION`",
+            ),
+            (
+                &["meka", "--permission", "read"][..],
+                CONSISTENT,
+                None,
+                "`--permission`",
+            ),
+            (
+                &["meka"][..],
+                "default = \"read\"\nenabled = [\"workspace\", \"unrestricted\"]",
+                None,
+                "`[permissions].default`",
+            ),
+        ] {
+            let resolved = resolve(arguments, permissions, variable);
+            assert_eq!(resolved.permission, Permission::None, "{source}");
+            let refusal = resolved.validate().expect_err(source).to_string();
+            assert!(
+                refusal.contains(source) && refusal.contains(&read_is_disabled),
+                "{refusal}"
+            );
+        }
+
+        let resolved = resolve(&["meka"], CONSISTENT, Some(("MEKA_PERMISSION", "raed")));
+        assert_eq!(resolved.permission, Permission::None);
+        let refusal = resolved
+            .validate()
+            .expect_err("a word that is no level")
+            .to_string();
+        assert!(
+            refusal.contains("`MEKA_PERMISSION`") && refusal.contains("'raed'"),
+            "{refusal}"
+        );
+        let refusal = resolve(
+            &["meka"],
+            CONSISTENT,
+            Some(("MEKA_SANDBOX_BACKEND", "landlok")),
+        )
+        .validate()
+        .expect_err("a word that is no backend")
+        .to_string();
+        assert!(
+            refusal.contains("`MEKA_SANDBOX_BACKEND`") && refusal.contains("'landlok'"),
+            "{refusal}"
+        );
+
+        for variable in ["MEKA_PERMISSION", "MEKA_SANDBOX_BACKEND"] {
+            for unset in ["", "  "] {
+                let resolved = resolve(&["meka"], CONSISTENT, Some((variable, unset)));
+                assert_eq!(resolved.config_error, None, "{variable}={unset:?}");
+                assert_eq!(resolved.permission, Permission::Unrestricted);
+                assert_eq!(resolved.sandbox_backend, None);
+            }
+        }
     }
 
     #[test]

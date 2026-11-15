@@ -722,12 +722,13 @@ pub(crate) struct ToolOutput {
     /// where there is no fence to confuse it.
     pub(crate) structured: Option<serde_json::Value>,
     /// Whether this is the tool's output, which the `scratchpad` parameter may redirect, as
-    /// opposed to a word about the call, which stays inline whatever the call asked: Meka's own
-    /// (a refusal, an argument error, an interruption, a panic, a background start notice) or the
+    /// opposed to a word about the call, which stays inline whatever the call asked: Meka's own (a
+    /// refusal, an argument error, an interruption, a panic, a background start notice) or the
     /// tool's, a failure it reports, unless [`Tool::reports_failure_as_output`] makes that failure
-    /// its output. Set at
-    /// the one door a tool's result comes through, the dispatcher's `run_tool`: the caller asked
-    /// for the output, and a sentence about the call is neither large nor sensitive.
+    /// its output. Never set for a tool whose result has to come back inline
+    /// ([`Tool::keeps_result_inline`]). Set at the one door a tool's result comes through, the
+    /// dispatcher's `tool_result`: the caller asked for the output, and a sentence about the call
+    /// is neither large nor sensitive.
     pub(crate) is_output: bool,
 }
 
@@ -873,6 +874,13 @@ pub(crate) trait Tool: Send + Sync {
     fn reports_failure_as_output(&self) -> bool {
         false
     }
+    /// Whether this tool's result has to come back inline, so the `scratchpad` parameter does not
+    /// redirect it. True for a tool whose result reports on what the model keeps: the scratchpad,
+    /// where an entry the call named would take the place of what the call wrote, the checklist,
+    /// and the context. False, the default, for every other tool.
+    fn keeps_result_inline(&self) -> bool {
+        false
+    }
     /// The tool's start step, when its call can run in the background; `None`, the default, for
     /// every other tool. The one definition of "may this call detach": the registry offers
     /// `background` on exactly the tools that answer, and [`admit_arguments`] refuses it on the
@@ -969,6 +977,10 @@ impl Tool for DetachableForTest {
 
     fn reports_failure_as_output(&self) -> bool {
         self.0.reports_failure_as_output()
+    }
+
+    fn keeps_result_inline(&self) -> bool {
+        self.0.keeps_result_inline()
     }
 
     fn as_detachable(&self) -> Option<&dyn Detachable> {
@@ -1636,6 +1648,38 @@ mod tests {
             })
             .collect();
         assert_eq!(reporting, vec!["shell_execute".to_string()]);
+    }
+
+    /// Which built-ins keep their result inline, so the `scratchpad` redirect leaves it there:
+    /// the scratchpad's own tools, the checklist's and `context_replace`.
+    #[tokio::test]
+    async fn the_scratchpad_the_checklist_and_context_replace_keep_their_result_inline() {
+        let registry = registry_with_every_builtin().await;
+        let mut inline: Vec<String> = registry
+            .registered_tool_names()
+            .into_iter()
+            .filter(|name| {
+                registry
+                    .get(name)
+                    .is_some_and(|tool| tool.keeps_result_inline())
+            })
+            .collect();
+        inline.sort();
+        assert_eq!(inline, [
+            "checklist_add",
+            "checklist_edit",
+            "checklist_read",
+            "context_replace",
+            "scratchpad_delete",
+            "scratchpad_edit",
+            "scratchpad_list",
+            "scratchpad_load_file",
+            "scratchpad_merge",
+            "scratchpad_read",
+            "scratchpad_rename",
+            "scratchpad_save_file",
+            "scratchpad_write",
+        ]);
     }
 
     async fn registry_with_every_builtin() -> ToolRegistry {

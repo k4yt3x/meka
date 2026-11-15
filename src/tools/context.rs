@@ -466,6 +466,10 @@ impl Tool for ContextReplaceTool {
         Permission::Read
     }
 
+    fn keeps_result_inline(&self) -> bool {
+        true
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,

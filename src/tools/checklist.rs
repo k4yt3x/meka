@@ -165,6 +165,10 @@ impl Tool for ChecklistAddTool {
         Permission::Read
     }
 
+    fn keeps_result_inline(&self) -> bool {
+        true
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -255,6 +259,10 @@ impl Tool for ChecklistEditTool {
 
     fn required_permission(&self) -> Permission {
         Permission::Read
+    }
+
+    fn keeps_result_inline(&self) -> bool {
+        true
     }
 
     async fn execute(
@@ -360,6 +368,10 @@ impl Tool for ChecklistReadTool {
 
     fn required_permission(&self) -> Permission {
         Permission::Read
+    }
+
+    fn keeps_result_inline(&self) -> bool {
+        true
     }
 
     async fn execute(
