@@ -1531,8 +1531,9 @@ send_class = "followup"
 
 ### `display.mouse`
 
-Whether the interactive screen captures the mouse. With it on, the wheel scrolls the transcript and
-a click expands or collapses a block; the terminal's own click-and-drag then needs its modifier key
+Whether the interactive screen captures the mouse. With it on, the wheel scrolls the transcript, a
+click expands or collapses a block, and a click in the composer places its cursor; the terminal's
+own click-and-drag then needs its modifier key
 (Shift in most terminals, Option in iTerm2) to select text. With it off the mouse is the terminal's,
 and the keyboard still scrolls and toggles. See
 [Scrolling and the mouse](../usage/interactive-mode.md#scrolling-and-the-mouse).
@@ -1546,11 +1547,11 @@ mouse = false
 
 ### `display.wheel_rows`
 
-How many rows the transcript, or a panel under the pointer, moves for each wheel event the terminal
-sends. The terminal already decides how many events one notch of the wheel sends: Ghostty sends
-three, a trackpad sends one per few pixels, and VS Code's terminal sends one, so one row per event
-follows what the terminal meant. Raise it if your terminal sends one event per notch and scrolling
-feels slow. `0` is refused at startup.
+How many rows the transcript, or a panel or a composer scrolled inside under the pointer, moves for
+each wheel event the terminal sends. The terminal already decides how many events one notch of the
+wheel sends: Ghostty sends three, a trackpad sends one per few pixels, and VS Code's terminal sends
+one, so one row per event follows what the terminal meant. Raise it if your terminal sends one event
+per notch and scrolling feels slow. `0` is refused at startup.
 
 Default: `1`
 

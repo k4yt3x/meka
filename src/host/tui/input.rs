@@ -89,8 +89,13 @@ pub(crate) enum Action {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ComposerState {
     pub(crate) empty: bool,
-    pub(crate) at_first_line: bool,
-    pub(crate) at_last_line: bool,
+    /// The cursor is on the first row of the text as drawn, where a line that wraps is several.
+    pub(crate) at_first_row: bool,
+    /// The cursor is on the last row of the text as drawn.
+    pub(crate) at_last_row: bool,
+    /// The composer shows a recall entry as the walk put it there, so Up and Down walk on to the
+    /// entries beside it, whatever row the cursor is on.
+    pub(crate) walking: bool,
     /// An item is picked out, so Enter and Space act on it.
     pub(crate) cursor: bool,
     /// The host is answering something, so Esc stops it rather than backing out of the view.
@@ -174,8 +179,8 @@ pub(crate) fn action_for(key: &KeyEvent, focus: Focus, composer: ComposerState) 
             KeyCode::Esc => Action::Escape,
             KeyCode::Up if alt => Action::CursorPrevious,
             KeyCode::Down if alt => Action::CursorNext,
-            KeyCode::Up if composer.at_first_line => Action::RecallPrevious,
-            KeyCode::Down if composer.at_last_line => Action::RecallNext,
+            KeyCode::Up if composer.walking || composer.at_first_row => Action::RecallPrevious,
+            KeyCode::Down if composer.walking || composer.at_last_row => Action::RecallNext,
             KeyCode::Char('r') if ctrl => Action::RecallSearch,
             KeyCode::Tab => Action::Complete,
             KeyCode::PageUp => Action::ScrollUp,
@@ -424,6 +429,9 @@ struct Walk {
     entries: Vec<String>,
     /// Index into `entries`, or its length for the draft.
     index: usize,
+    /// The composer's text as the walk last put it there, which tells an entry that still stands
+    /// as recalled from one edited since.
+    shown: String,
 }
 
 /// The recall search Ctrl+R opens.
@@ -469,6 +477,17 @@ pub(crate) struct Attachment {
     pub(crate) label: String,
     /// What the transcript draws of it once it is sent.
     pub(crate) picture: crate::render::tui::Picture,
+}
+
+/// Where the composer's text went in a frame, and how much of it the frame left out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DrawnText {
+    /// The cells the text was drawn in, which [`Composer::place_cursor`] counts a click from.
+    pub(crate) area: Rect,
+    /// Rows of the text out of view over the first row shown.
+    pub(crate) above: usize,
+    /// Rows of the text out of view under the last row shown.
+    pub(crate) below: usize,
 }
 
 /// The text the user is typing, with its recall and the lists that open over it.
@@ -621,14 +640,39 @@ impl Composer {
     }
 
     pub(crate) fn state(&self) -> ComposerState {
-        let ratatui_textarea::DataCursor(row, _) = self.area.cursor();
+        let row = self.area.screen_cursor().row;
         ComposerState {
             empty: self.is_empty(),
-            at_first_line: row == 0,
-            at_last_line: row + 1 >= self.area.lines().len(),
+            at_first_row: row == 0,
+            // The text area keeps its count of rows to itself, and resolves a row past the last
+            // to the last: a next row that starts where this one does is no row.
+            at_last_row: self.area.screen_to_data(row + 1, 0) == self.area.screen_to_data(row, 0),
+            walking: self.is_walking(),
             cursor: false,
             busy: false,
         }
+    }
+
+    /// Whether the composer shows a recall entry as the walk put it there: the entry's text, the
+    /// cursor at its end. Up and Down then walk past it in one key, however many rows it takes;
+    /// an entry the cursor has moved into is text to move in.
+    fn is_walking(&self) -> bool {
+        let lines = self.area.lines();
+        let end = ratatui_textarea::DataCursor(
+            lines.len().saturating_sub(1),
+            lines.last().map_or(0, |line| line.chars().count()),
+        );
+        self.area.cursor() == end && self.walk_stands()
+    }
+
+    /// Whether a walk is under way and the composer still holds what it last put there. Text
+    /// changed since, by whichever door (a key, a paste, a line added, a completion or a
+    /// search's match taken), is a draft, and the walk that showed it is over. Asked where a
+    /// walk goes on, so no door has to remember to end one.
+    fn walk_stands(&self) -> bool {
+        self.walk
+            .as_ref()
+            .is_some_and(|walk| walk.shown == self.text())
     }
 
     pub(crate) fn focus(&self) -> Focus {
@@ -758,7 +802,7 @@ impl Composer {
             _ => {}
         }
         // A key that only moved the cursor keeps the walk: Up inside a recalled entry of several
-        // lines is a step within it, and the Up that reaches its first line goes on to the entry
+        // rows is a step within it, and the Up that reaches its first row goes on to the entry
         // before, not back to the newest.
         if self.area.lines() != before.as_slice() {
             self.walk = None;
@@ -774,19 +818,56 @@ impl Composer {
         self.area.insert_str(text);
     }
 
-    /// Rows the composer wants, between one and `most`, the chips' row included.
-    pub(crate) fn height(&self, width: u16, most: u16) -> u16 {
+    /// Put the cursor where a click landed, `row` and `column` counted from the top left of the
+    /// text as [`Self::draw`] placed it. Past the end of a row is the row's end, and under the
+    /// text is its last row.
+    pub(crate) fn place_cursor(&mut self, row: u16, column: u16) {
+        let (top, left) = self.area.scroll_offset();
+        let ratatui_textarea::DataCursor(line, character) = self.area.screen_to_data(
+            usize::from(row) + usize::from(top),
+            usize::from(column) + usize::from(left),
+        );
+        self.area.move_cursor(CursorMove::Jump(
+            u16::try_from(line).unwrap_or(u16::MAX),
+            u16::try_from(character).unwrap_or(u16::MAX),
+        ));
+    }
+
+    /// Scroll the text by `rows`, down for a positive count, within `shown`, the cells it was
+    /// last drawn in: as far as its first row at their top or its last at their bottom, where
+    /// the text area alone would scroll the last row up to the top. The cursor stays where it
+    /// is until it would leave the rows shown, and then comes along: the text area keeps its
+    /// cursor in view.
+    pub(crate) fn scroll_by(&mut self, rows: isize, shown: Rect) {
+        let top = i64::from(self.area.scroll_offset().0);
+        let last_top = self
+            .rows(shown.width)
+            .saturating_sub(usize::from(shown.height));
+        let last_top = i64::try_from(last_top).unwrap_or(i64::MAX);
+        let rows = i64::try_from(rows).unwrap_or(if rows < 0 { i64::MIN } else { i64::MAX });
+        let moved = top.saturating_add(rows).clamp(0, last_top) - top;
+        let moved = moved.clamp(i64::from(i16::MIN), i64::from(i16::MAX));
+        self.area.scroll((i16::try_from(moved).unwrap_or(0), 0));
+    }
+
+    /// Rows the text takes at `width`.
+    fn rows(&self, width: u16) -> usize {
         let width = width.max(1) as usize;
-        let rows: usize = self
-            .area
+        self.area
             .lines()
             .iter()
             .map(|line| wrapped_rows(line, width))
-            .sum();
-        (rows.max(1) as u16 + self.attachment_rows()).min(most.max(1))
+            .sum()
     }
 
-    pub(crate) fn draw(&self, frame: &mut Frame<'_>, area: Rect) {
+    /// Rows the composer wants, between one and `most`, the chips' row included.
+    pub(crate) fn height(&self, width: u16, most: u16) -> u16 {
+        (self.rows(width).max(1) as u16 + self.attachment_rows()).min(most.max(1))
+    }
+
+    /// Draw the composer in `area`. Returns where its text went and how much of it shows, when
+    /// there was text to draw.
+    pub(crate) fn draw(&self, frame: &mut Frame<'_>, area: Rect) -> Option<DrawnText> {
         // The block spans the whole row, typed or not: the text area paints only the cells it
         // has text for.
         frame.render_widget(
@@ -826,7 +907,7 @@ impl Composer {
             area
         };
         if area.height == 0 {
-            return;
+            return None;
         }
         if self.is_empty() && !self.placeholder.is_empty() {
             // The words start where typed text starts, with the cursor on their first character
@@ -844,9 +925,17 @@ impl Composer {
                 ])),
                 area,
             );
-            return;
+            return None;
         }
         frame.render_widget(&self.area, area);
+        // The text area settles its scroll as it renders, so this is the frame's own.
+        let above = usize::from(self.area.scroll_offset().0);
+        let shown = above + usize::from(area.height);
+        Some(DrawnText {
+            area,
+            above,
+            below: self.rows(area.width).saturating_sub(shown),
+        })
     }
 
     /// Store what was sent, so Up recalls it next time.
@@ -865,9 +954,10 @@ impl Composer {
     }
 
     fn begin_walk(&mut self) -> bool {
-        if self.walk.is_some() {
+        if self.walk_stands() {
             return true;
         }
+        self.walk = None;
         let Some(recall) = &self.recall else {
             return false;
         };
@@ -886,6 +976,7 @@ impl Composer {
             draft: self.text(),
             entries,
             index,
+            shown: String::new(),
         });
         true
     }
@@ -903,11 +994,24 @@ impl Composer {
         }
         walk.index -= 1;
         let text = walk.entries.get(walk.index).cloned().unwrap_or_default();
-        self.set_text(&text);
+        self.show_recalled(&text);
+    }
+
+    /// Put what the walk has reached into the composer, and keep it as shown.
+    fn show_recalled(&mut self, text: &str) {
+        self.set_text(text);
+        let shown = self.text();
+        if let Some(walk) = self.walk.as_mut() {
+            walk.shown = shown;
+        }
     }
 
     /// Down at the bottom of the composer: the entry after the one shown, or the draft.
     pub(crate) fn recall_next(&mut self) {
+        if !self.walk_stands() {
+            self.walk = None;
+            return;
+        }
         let Some(walk) = self.walk.as_mut() else {
             return;
         };
@@ -921,7 +1025,7 @@ impl Composer {
             walk.entries.get(walk.index).cloned().unwrap_or_default()
         };
         let finished = walk.index == walk.entries.len();
-        self.set_text(&text);
+        self.show_recalled(&text);
         if finished {
             self.walk = None;
         }
@@ -1243,8 +1347,9 @@ mod tests {
     fn idle() -> ComposerState {
         ComposerState {
             empty: true,
-            at_first_line: true,
-            at_last_line: true,
+            at_first_row: true,
+            at_last_row: true,
+            walking: false,
             cursor: false,
             busy: false,
         }
@@ -1344,13 +1449,15 @@ mod tests {
     }
 
     /// Ctrl+D leaves only on an empty composer; with text it is the editing key it always was.
-    /// Up and Down recall entries only at the composer's edges.
+    /// Up and Down recall entries only at the composer's edges, or from an entry that stands as
+    /// recalled, wherever its cursor is.
     #[test]
     fn the_keys_that_depend_on_the_composer_read_it() {
         let typing = ComposerState {
             empty: false,
-            at_first_line: false,
-            at_last_line: false,
+            at_first_row: false,
+            at_last_row: false,
+            walking: false,
             cursor: false,
             busy: false,
         };
@@ -1370,6 +1477,19 @@ mod tests {
             ),
             Action::Edit
         );
+        let walking = ComposerState {
+            walking: true,
+            ..typing
+        };
+        for (code, expected) in [
+            (KeyCode::Up, Action::RecallPrevious),
+            (KeyCode::Down, Action::RecallNext),
+        ] {
+            assert_eq!(
+                action_for(&key(code, KeyModifiers::NONE), Focus::Composer, walking),
+                expected
+            );
+        }
         let picked = ComposerState {
             cursor: true,
             ..idle()
@@ -1673,6 +1793,256 @@ mod tests {
         assert_eq!(composer.text(), "start!");
     }
 
+    /// Draw `composer` at `columns` and eight rows, which is what tells its text area where its
+    /// lines wrap; where its text went.
+    fn draw_at(composer: &Composer, columns: u16) -> Option<DrawnText> {
+        let backend = ratatui::backend::TestBackend::new(columns, 8);
+        let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
+        let mut text = None;
+        terminal
+            .draw(|frame| text = composer.draw(frame, frame.area()))
+            .expect("a frame");
+        text
+    }
+
+    /// Three rows at ten columns, in one line.
+    const THREE_ROWS: &str = "aaaa bbbb cccc dddd eeee ffff";
+
+    /// Up and Down move by the rows the text is drawn in, and recall only from the first and the
+    /// last of them: a line that wraps is several rows, and the cursor moves through them.
+    #[test]
+    fn up_and_down_recall_only_from_the_first_and_last_row_as_drawn() {
+        let up = key(KeyCode::Up, KeyModifiers::NONE);
+        let down = key(KeyCode::Down, KeyModifiers::NONE);
+        let mut composer = Composer::new(None);
+        composer.insert(THREE_ROWS);
+        draw_at(&composer, 10);
+        let actions = |composer: &Composer| {
+            let state = composer.state();
+            (
+                action_for(&up, Focus::Composer, state),
+                action_for(&down, Focus::Composer, state),
+            )
+        };
+        assert_eq!(
+            actions(&composer),
+            (Action::Edit, Action::RecallNext),
+            "typed, the cursor is on the last row"
+        );
+        composer.edit(up);
+        assert_eq!(
+            actions(&composer),
+            (Action::Edit, Action::Edit),
+            "Up moved it to the middle row of the one line"
+        );
+        composer.edit(up);
+        assert_eq!(
+            actions(&composer),
+            (Action::RecallPrevious, Action::Edit),
+            "and then to the first"
+        );
+    }
+
+    /// `l0` to `l11`, a line each.
+    fn twelve_lines() -> String {
+        (0..12)
+            .map(|line| format!("l{line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A composer holding more rows than it is drawn in says how many are out of view each way,
+    /// and scrolls through them as far as either end.
+    #[test]
+    fn a_composer_taller_than_its_rows_says_what_is_out_of_view_and_scrolls() {
+        let out_of_view = |composer: &Composer| {
+            let drawn = draw_at(composer, 10).expect("text to draw");
+            (drawn.above, drawn.below)
+        };
+        let mut short = Composer::new(None);
+        short.insert("ab");
+        assert_eq!(out_of_view(&short), (0, 0));
+        let mut composer = Composer::new(None);
+        composer.insert(&twelve_lines());
+        let shown = draw_at(&composer, 10).expect("text to draw").area;
+        assert_eq!(
+            out_of_view(&composer),
+            (4, 0),
+            "eight rows show the end, where the cursor is"
+        );
+        composer.scroll_by(-3, shown);
+        assert_eq!(out_of_view(&composer), (1, 3));
+        composer.scroll_by(-3, shown);
+        assert_eq!(
+            out_of_view(&composer),
+            (0, 4),
+            "no further than the first row"
+        );
+        // Two turns of the wheel between two frames, the second counted from where the first
+        // left the text.
+        composer.scroll_by(3, shown);
+        composer.scroll_by(3, shown);
+        assert_eq!(out_of_view(&composer), (4, 0), "nor past the last");
+        composer.scroll_by(100, shown);
+        assert_eq!(out_of_view(&composer), (4, 0));
+    }
+
+    /// A click puts the cursor on the cell it landed on, in the row as drawn: under the text it
+    /// lands on the last row, past a row's end at its end, and in a composer scrolled inside,
+    /// on the rows it shows. A composer with no text reports none to click in.
+    #[test]
+    fn a_click_puts_the_cursor_where_it_landed() {
+        let mut empty = Composer::new(None);
+        empty.set_placeholder("Steer the agent");
+        assert_eq!(draw_at(&empty, 10), None, "the placeholder is no text");
+        // What the composer holds after `text` is typed, drawn at ten columns and eight rows,
+        // clicked, and an `X` typed where the click put the cursor.
+        let clicked = |text: &str, row: u16, column: u16| {
+            let mut composer = Composer::new(None);
+            composer.insert(text);
+            assert!(draw_at(&composer, 10).is_some());
+            composer.place_cursor(row, column);
+            composer.edit(key(KeyCode::Char('X'), KeyModifiers::NONE));
+            composer.text()
+        };
+        assert_eq!(clicked(THREE_ROWS, 0, 0), "Xaaaa bbbb cccc dddd eeee ffff");
+        assert_eq!(clicked(THREE_ROWS, 1, 5), "aaaa bbbb cccc Xdddd eeee ffff");
+        assert_eq!(
+            clicked(THREE_ROWS, 7, 0),
+            "aaaa bbbb cccc dddd Xeeee ffff",
+            "under the text is its last row"
+        );
+        assert_eq!(
+            clicked("ab", 0, 7),
+            "abX",
+            "past the end of a row is its end"
+        );
+        assert!(
+            clicked(&twelve_lines(), 0, 0).contains("\nXl4\n"),
+            "eight rows show the last eight lines, and a click counts from the first shown"
+        );
+    }
+
+    /// An entry that stands as recalled is walked past in one key, however many rows it takes;
+    /// once the cursor moves into it, or its text changes, Up and Down are the text's.
+    #[tokio::test]
+    async fn an_entry_left_as_recalled_is_walked_past_in_one_key() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = recall_in(&temp).await;
+        let up = key(KeyCode::Up, KeyModifiers::NONE);
+        let mut composer = Composer::new(Some(store));
+        composer.remember("first");
+        composer.remember(THREE_ROWS);
+        composer.recall_previous();
+        draw_at(&composer, 10);
+        let state = composer.state();
+        assert!(
+            state.walking && !state.at_first_row,
+            "recalled at its end, on the last of its rows"
+        );
+        assert_eq!(
+            action_for(&up, Focus::Composer, state),
+            Action::RecallPrevious
+        );
+        composer.edit(key(KeyCode::Left, KeyModifiers::NONE));
+        let state = composer.state();
+        assert!(!state.walking, "the cursor moved into the entry");
+        assert_eq!(action_for(&up, Focus::Composer, state), Action::Edit);
+
+        composer.recall_previous();
+        assert_eq!(composer.text(), "first");
+        assert!(composer.state().walking);
+        composer.newline();
+        assert!(
+            !composer.state().walking,
+            "a line added to an entry makes it text of its own"
+        );
+    }
+
+    /// A walk is over once the text it showed has been changed, by whichever door: a line
+    /// added, a completion taken, a search's match taken. What stands then is a draft: Down has
+    /// no entry to go to, the next Up starts from the newest, and Down from there comes back to
+    /// the draft.
+    #[tokio::test]
+    async fn a_walk_ends_when_its_text_is_changed_by_any_door() {
+        type Door = fn(&mut Composer);
+        let doors: [(&str, Door, &str); 3] = [
+            (
+                "a line added",
+                |composer| {
+                    composer.edit(key(KeyCode::Home, KeyModifiers::NONE));
+                    composer.newline();
+                },
+                "\n/he",
+            ),
+            (
+                "a completion taken",
+                |composer| {
+                    composer.completion = Some(Completion {
+                        rows: vec![Suggestion {
+                            value: "/help".into(),
+                            description: None,
+                            append_whitespace: false,
+                            start: 0,
+                            end: 3,
+                        }],
+                        picked: 0,
+                    });
+                    composer.accept_completion();
+                },
+                "/help",
+            ),
+            (
+                "a search's match taken",
+                |composer| {
+                    composer.recall_search();
+                    composer.pick_next();
+                    composer.pick_next();
+                    composer.accept_search();
+                },
+                "first",
+            ),
+        ];
+        for (door, change, changed) in doors {
+            // Each key from where the change left the text, on a walk of its own.
+            for down_first in [true, false] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let store = recall_in(&temp).await;
+                let mut composer = Composer::new(Some(store));
+                for entry in ["first", "/he", "third"] {
+                    composer.remember(entry);
+                }
+                composer.recall_previous();
+                composer.recall_previous();
+                assert_eq!(composer.text(), "/he", "{door}");
+                change(&mut composer);
+                assert_eq!(composer.text(), changed, "{door}");
+                assert!(!composer.state().walking, "{door}");
+                if down_first {
+                    composer.recall_next();
+                    assert_eq!(
+                        composer.text(),
+                        changed,
+                        "{door}: Down has no entry to go to"
+                    );
+                    continue;
+                }
+                composer.recall_previous();
+                assert_eq!(
+                    composer.text(),
+                    "third",
+                    "{door}: Up starts again from the newest"
+                );
+                composer.recall_next();
+                assert_eq!(
+                    composer.text(),
+                    changed,
+                    "{door}: and Down comes back to it"
+                );
+            }
+        }
+    }
+
     /// Moving the cursor inside a recalled entry of several lines does not end the walk: the Up
     /// that reaches its first line goes on to the entry before it.
     #[tokio::test]
@@ -1684,9 +2054,9 @@ mod tests {
         composer.remember("a\nb");
         composer.recall_previous();
         assert_eq!(composer.text(), "a\nb");
-        assert!(!composer.state().at_first_line, "recalled at its end");
+        assert!(!composer.state().at_first_row, "recalled at its end");
         composer.edit(key(KeyCode::Up, KeyModifiers::NONE));
-        assert!(composer.state().at_first_line);
+        assert!(composer.state().at_first_row);
         composer.recall_previous();
         assert_eq!(
             composer.text(),

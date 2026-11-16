@@ -96,6 +96,18 @@ fn text_rows(text: &str, streaming: bool, width: usize, reasoning: bool) -> Vec<
     }
 }
 
+/// A document under its label: the label, a blank row, then the document at the text edge. The
+/// document starts in the label's own column, so with no row between them the label reads as the
+/// document's first line. A document of no rows is the label alone.
+fn rows_under_label(label: Line<'static>, document: Vec<draw::Row>) -> Vec<draw::Row> {
+    let mut rows = vec![(label, draw::RowCopy::Text)];
+    if !document.is_empty() {
+        rows.push((Line::default(), draw::RowCopy::Text));
+        rows.extend(draw::edge_copy_rows(document));
+    }
+    rows
+}
+
 /// The rows of an item some of whose rows do not copy as text, with how each copies: an answer,
 /// an opened thinking block and a compaction's summary, drawn as markdown, a prompt, whose
 /// padding copies as nothing, and a picture, whose half blocks are no text. `None` for any other
@@ -125,9 +137,10 @@ fn copied_rows_of(
             text, *streaming, inner, false,
         ))),
         Item::Thinking { text, ended, .. } if entry.expanded && !text.trim().is_empty() => {
-            let mut rows = vec![(draw::thinking_label_row(), draw::RowCopy::Text)];
-            rows.extend(draw::edge_copy_rows(text_rows(text, !*ended, inner, true)));
-            Some(rows)
+            Some(rows_under_label(
+                draw::thinking_label_row(),
+                text_rows(text, !*ended, inner, true),
+            ))
         }
         Item::Image(picture) => {
             let rows = draw::picture_rows(picture, inner)?;
@@ -143,9 +156,7 @@ fn copied_rows_of(
                 Span::styled(format!("{ACT_GLYPH:<TEXT_EDGE$}"), gray()),
                 Span::styled("Summary".to_string(), gray()),
             ]);
-            let mut rows = vec![(label, draw::RowCopy::Text)];
-            rows.extend(draw::edge_copy_rows(draw::markdown_rows(text, inner)));
-            Some(rows)
+            Some(rows_under_label(label, draw::markdown_rows(text, inner)))
         }
         _ => None,
     }
@@ -2251,6 +2262,45 @@ pub(crate) fn draw_back_to_bottom(
     pill
 }
 
+/// The thumb of a scroll bar down `rows` rows that show part of a text, `above` of its rows out
+/// of view over the first and `below` under the last: the thumb's first row and its length, or
+/// `None` when the whole text shows. It is as long as the share of the text in view, a row at
+/// least, and stands off an end that rows are out of view past, so that one row left out shows
+/// as surely as a hundred.
+pub(crate) fn scroll_thumb(rows: usize, above: usize, below: usize) -> Option<(usize, usize)> {
+    if rows == 0 || above + below == 0 {
+        return None;
+    }
+    let (clear_above, clear_below) = (usize::from(above > 0), usize::from(below > 0));
+    let length = (rows * rows / (above + rows + below))
+        .min(rows.saturating_sub(clear_above + clear_below))
+        .max(1);
+    let travel = rows - length;
+    let first = (above * travel + (above + below) / 2) / (above + below);
+    let last_start = travel.saturating_sub(clear_below);
+    Some((first.clamp(clear_above.min(last_start), last_start), length))
+}
+
+/// Draw [`scroll_thumb`] down `column`, a strip beside the rows it speaks for, dim on the
+/// composer's gray.
+pub(crate) fn draw_scroll_thumb(frame: &mut Frame<'_>, column: Rect, above: usize, below: usize) {
+    let column = column.intersection(frame.area());
+    let Some((first, length)) = scroll_thumb(usize::from(column.height), above, below) else {
+        return;
+    };
+    let style = Style::default()
+        .fg(draw::DIM_ON_SHADE)
+        .bg(COMPOSER_BACKGROUND);
+    let thumb: Vec<Line<'static>> = (0..length)
+        .map(|_| Line::from(Span::styled(draw::SCROLL_THUMB.to_string(), style)))
+        .collect();
+    frame.render_widget(Paragraph::new(Text::from(thumb)), Rect {
+        y: column.y + first as u16,
+        height: length as u16,
+        ..column
+    });
+}
+
 /// Whether the cell at `column`, `row` is on `pill`, the back-to-bottom pill of the last frame:
 /// what a press there and the pointer over it both ask.
 pub(crate) fn is_on_pill(pill: Option<Rect>, column: u16, row: u16) -> bool {
@@ -2825,7 +2875,38 @@ mod tests {
         assert!(too_wide.is_empty(), "{too_wide:#?}");
     }
 
-    /// A collapsed thinking block is one row; expanded it is the label and the text under it.
+    /// The scroll thumb is as long as the share of the text in view and stands where the view
+    /// does, off an end that rows are out of view past and against one they are not; a view of
+    /// the whole text has none.
+    #[test]
+    fn the_scroll_thumb_stands_where_the_view_does() {
+        assert_eq!(scroll_thumb(6, 0, 0), None, "the whole text shows");
+        assert_eq!(scroll_thumb(0, 3, 3), None, "no row to stand in");
+        for (rows, above, below, thumb) in [
+            // Half the text in view: at its end, at its start, and between.
+            (6, 6, 0, (3, 3)),
+            (6, 0, 6, (0, 3)),
+            (6, 3, 3, (2, 3)),
+            // One row out of view moves it as far as a row.
+            (11, 1, 0, (1, 10)),
+            (11, 0, 1, (0, 10)),
+            // A hundred times the rows: a row long, and off both ends in the middle.
+            (6, 300, 300, (3, 1)),
+            (6, 599, 1, (4, 1)),
+            (6, 1, 599, (1, 1)),
+            // Too few rows to stand off both ends.
+            (1, 3, 2, (0, 1)),
+        ] {
+            assert_eq!(
+                scroll_thumb(rows, above, below),
+                Some(thumb),
+                "{rows} rows, {above} above, {below} below"
+            );
+        }
+    }
+
+    /// A collapsed thinking block is one row; expanded it is the label, a blank row and the text,
+    /// and the label alone when the text lays out to no row.
     #[test]
     fn a_thinking_block_collapses_to_one_row() {
         let item = Item::Thinking {
@@ -2838,12 +2919,21 @@ mod tests {
             "• Thinking · First line. Second paragraph."
         ]);
         let expanded = plain(&lines_at(&entry(item, true), 60));
-        assert_eq!(expanded[0], "• Thinking");
-        assert_eq!(expanded[1], "  First line.", "{expanded:?}");
-        assert_eq!(
-            expanded.last().map(String::as_str),
-            Some("  Second paragraph.")
-        );
+        assert_eq!(expanded, vec![
+            "• Thinking",
+            "",
+            "  First line.",
+            "",
+            "  Second paragraph."
+        ]);
+        let nothing_drawn = Item::Thinking {
+            text: "[notes]: https://example.com".into(),
+            estimate: None,
+            ended: true,
+        };
+        assert_eq!(plain(&lines_at(&entry(nothing_drawn, true), 60)), vec![
+            "• Thinking"
+        ]);
     }
 
     /// A collapsed tool call is its row and a preview of its result under the connector;
@@ -4077,6 +4167,19 @@ mod tests {
             shown.last().map(String::as_str),
             Some("  Done: the release.")
         );
+        let label = open
+            .iter()
+            .position(|(text, _)| text == "• Summary")
+            .expect("the summary's label");
+        let under: Vec<&str> = open[label..label + 3]
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect();
+        assert_eq!(
+            under,
+            ["• Summary", "", "  Done: the release."],
+            "the summary stands a row under its label"
+        );
         let last = open
             .iter()
             .rposition(|(text, _)| text == "  Done: the release.")
@@ -4157,7 +4260,7 @@ mod tests {
             "the row stays where it was: {rows:?}"
         );
         assert!(
-            rows.get(row + 1).is_some_and(|below| below == "  line 1"),
+            rows.get(row + 2).is_some_and(|below| below == "  line 1"),
             "and the block opens under it: {rows:?}"
         );
     }

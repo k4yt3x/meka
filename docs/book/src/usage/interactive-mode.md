@@ -184,9 +184,10 @@ twenty lines rather than the three of plain output, so a small edit shows whole 
 its first lines and a count. A result keeps about 30 KB of a change's lines, and counts the rest.
 
 Either expands to the whole thing: the full reasoning, or every argument of the call wrapped in full
-and all of its output. The row drops its summary once the arguments are under it; they hang on a
-`│` bar from the row down to the `└` of the result, a shell command first, behind `$`, highlighted
-and wrapped whole. Nothing in an expanded block is cut.
+and all of its output. The reasoning stands a blank row under its `• Thinking` label. A call's row
+drops its summary once the arguments are under it; they hang on a `│` bar from the row down to the
+`└` of the result, a shell command first, behind `$`, highlighted and wrapped whole. Nothing in an
+expanded block is cut.
 
 A resumed session draws every call as it was drawn live: the diff, the code a command exited with
 and the checklist are recorded with each result. A command whose output was too large to keep
@@ -194,7 +195,8 @@ inline is the exception: live, its row keeps the end of what it streamed; resume
 opening the result keeps.
 
 - **Click** a block to toggle it. A block lights up under the mouse, which is the hint that it
-  opens.
+  opens. The light goes out once the mouse has rested for three seconds, or the terminal loses
+  focus: a terminal does not say when the mouse leaves its window.
 - **Ctrl+T** shows or hides every thinking block at once, the one streaming included; while they
   are shown, a new block stays open after it ends. **Ctrl+O** expands or collapses every tool call,
   and opens or folds every run of steps with them.
@@ -277,17 +279,20 @@ always shows the end of the history with this run's rows after it. Older history
 conversation the log records, with a row for each compaction that opens to what it did;
 the turns a [rewind](#rewind) dropped are left out, and one row in their place says how many went.
 
-The screen captures the mouse so that the wheel, a click and a drag reach it. Dragging over the
-transcript selects the text it covers, and releasing copies it: to the terminal's own clipboard
-through the OSC 52 sequence, which works over SSH and inside tmux where they allow it, and to the
-system clipboard where Meka can reach one. The row above the composer says how many rows went. What
+The screen captures the mouse so that the wheel, a click and a drag reach it. A click in the
+composer puts the cursor on the character under it, and one on its padding on the nearest. Dragging
+over the transcript selects the text it covers, and releasing copies it: to the terminal's own
+clipboard through the OSC 52 sequence, which works over SSH and inside tmux where they allow it,
+and to the system clipboard where Meka can reach one. The row above the composer says how many rows
+went. What
 is copied is the text, not the screen: each row from the text edge, without the gutter's marks, and a code
 block's code as it was written, a line folded at the edge coming back as one line, its indentation
 its own, and the block's shading adding nothing. The terminal's own selection still works with its modifier held (**Shift**; **Option** in iTerm2, **Fn** in
 Terminal.app). Set [`display.mouse = false`](../configuration/config-file.md#displaymouse) to
 leave the mouse to the terminal entirely; the keyboard still scrolls and toggles.
 
-Inside tmux, the wheel needs tmux's own mouse mode (`set -g mouse on`).
+Inside tmux, the wheel needs tmux's own mouse mode (`set -g mouse on`), and the screen hears of
+the terminal losing focus only with `set -g focus-events on`.
 
 ## Keys
 
@@ -298,7 +303,7 @@ Inside tmux, the wheel needs tmux's own mouse mode (`set -g mouse on`).
 | Shift+Tab | Cycle the permission level, skipping any not in `[permissions].enabled` (by default none &rarr; read &rarr; workspace &rarr; unrestricted &rarr; none) |
 | Alt+S | Cycle the send class |
 | Tab | Fill in the picked completion and keep typing; open the list again after Esc |
-| Up, Down | Move the pick while the completion list is open; otherwise recall what you sent before, at the first and last line of the composer |
+| Up, Down | Move the pick while the completion list is open; otherwise move the cursor a row, and from the composer's first and last row recall what you sent before |
 | Ctrl+R | Search what you sent before; Ctrl+R again steps to the next match |
 | Ctrl+V | Attach the image on the clipboard to the next prompt |
 | Ctrl+T, Ctrl+O | Show or hide every thinking block; expand or collapse every tool call and run |
@@ -311,7 +316,9 @@ Inside tmux, the wheel needs tmux's own mouse mode (`set -g mouse on`).
 
 The composer takes the usual editing keys: Ctrl+A and Ctrl+E for the ends of the line, Ctrl+K and
 Ctrl+U to kill to either end, Ctrl+W to kill a word, Alt+F and Alt+B to move by word, and the arrow
-keys. It grows as you type, up to a third of the screen, and scrolls inside after that.
+keys. It grows as you type, up to a third of the screen, and scrolls inside after that: a thumb in
+its right margin shows where its rows stand in the text, and the wheel over it scrolls the text. The
+cursor stays in view, so it comes along when the scroll would leave it behind.
 
 ### Recall
 
@@ -320,6 +327,12 @@ in **any previous run**. A brand-new `meka`, a resumed `meka -c`, and the curren
 one recall. Multi-line prompts are kept whole, and only the most recent entries are kept (older ones
 are pruned). Recall is separate from the conversation itself; [`meka recall`](sessions.md#recall)
 lists and clears it.
+
+Up recalls from the composer's first row and Down from its last, counting rows as they are drawn:
+in a prompt that wraps, the arrows move the cursor through its rows first. What you were typing
+comes back when Down passes the newest entry. A recalled prompt left as it came, the cursor at its
+end, is walked past with one key however many rows it takes; move the cursor into it, or edit it,
+and the arrows move inside it.
 
 ## Slash commands
 

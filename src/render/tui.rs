@@ -35,6 +35,9 @@ pub(crate) const RIGHT_MARGIN: usize = 1;
 /// The bar down the composer's left edge, and a sent prompt's, in the permission level's color,
 /// or red in the shell mode.
 pub(crate) const COMPOSER_BAR: &str = "▎";
+/// The thumb of the scroll bar in the composer's right margin, while it holds more rows than it
+/// shows.
+pub(crate) const SCROLL_THUMB: &str = "▐";
 /// The gutter glyph of an act: a tool call, a thinking block, a notice, a stage direction.
 pub(crate) const ACT_GLYPH: &str = "•";
 /// The gutter glyph of a warning.

@@ -97,6 +97,9 @@ fn drive(install: &Install, inputs: &[&str]) -> Screens {
 /// What one driven session came to.
 struct Run {
     screens: Screens,
+    /// The color of each row's first cell as each of `screens` stood, which is where the
+    /// transcript's glyphs are: a row lit under the pointer has its glyph in white.
+    glyph_colors: Vec<Vec<vt100::Color>>,
     /// The status the child exited with on its own by the time the driver gave up on it, or
     /// `None` when it had to be killed.
     exit: Option<i32>,
@@ -107,6 +110,8 @@ struct Run {
     clipboard: Option<String>,
     /// The terminal as the child left it, its screen given back: what it printed on the way out.
     left: Vec<String>,
+    /// Every byte the child wrote to the terminal.
+    output: Vec<u8>,
 }
 
 /// [`drive`], with the terminal answering the child's keyboard protocol query as one that speaks
@@ -155,10 +160,10 @@ fn drive_run_sized(
         unsafe { prepared.exec() }
     }
     keep_master_here(master);
-    let (screens, enhanced, clipboard, left) = pump(master, inputs, kitty, columns);
+    let mut run = pump(master, inputs, kitty, columns);
     // SAFETY: `master` is the fd `forkpty` handed back and is still open here, and `pid` is the
     // child it forked, reaped here and nowhere else.
-    let exit = unsafe {
+    run.exit = unsafe {
         libc::close(master);
         let mut status = 0;
         if libc::waitpid(pid, &mut status, libc::WNOHANG) == pid {
@@ -173,13 +178,7 @@ fn drive_run_sized(
             None
         }
     };
-    Run {
-        screens,
-        exit,
-        enhanced,
-        clipboard,
-        left,
-    }
+    run
 }
 
 /// Keep the pty's master out of every child this process forks from here on: `forkpty` hands it
@@ -298,14 +297,10 @@ impl PreparedExec {
 /// input whenever the child falls quiet. Answers the child's keyboard protocol query the way a
 /// terminal would, since crossterm waits two seconds for the answer, and reports whether the
 /// child then asked for the protocol.
-fn pump(
-    master: RawFd,
-    inputs: &[&str],
-    kitty: bool,
-    columns: u16,
-) -> (Screens, bool, Option<String>, Vec<String>) {
+fn pump(master: RawFd, inputs: &[&str], kitty: bool, columns: u16) -> Run {
     let mut parser = vt100::Parser::new(screen_size(ROWS), screen_size(columns), 0);
     let mut screens = Vec::new();
+    let mut glyph_colors = Vec::new();
     let mut enhanced = false;
     let mut raw: Vec<u8> = Vec::new();
     let mut pending: Vec<&str> = inputs.to_vec();
@@ -370,6 +365,7 @@ fn pump(
             match pending.pop() {
                 Some(line) => {
                     screens.push(rows_of(&parser));
+                    glyph_colors.push(glyph_colors_of(&parser));
                     let line = awaited(line).map_or(line, |(_, keys)| keys);
                     let (line, keys_only) = match line.strip_suffix(KEYS_ONLY) {
                         Some(keys) => (keys, true),
@@ -394,12 +390,15 @@ fn pump(
             }
         }
     }
-    (
+    Run {
         screens,
+        glyph_colors,
+        exit: None,
         enhanced,
-        last_clipboard_write(&raw),
-        rows_of(&parser),
-    )
+        clipboard: last_clipboard_write(&raw),
+        left: rows_of(&parser),
+        output: raw,
+    }
 }
 
 /// The text of the last OSC 52 clipboard write in `output`, as a terminal would have taken it.
@@ -443,6 +442,18 @@ fn is_working_row(row: &str) -> bool {
             .chars()
             .next()
             .is_some_and(|glyph| "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(glyph))
+}
+
+/// The color of the first cell of every row.
+fn glyph_colors_of(parser: &vt100::Parser) -> Vec<vt100::Color> {
+    (0..ROWS)
+        .map(|row| {
+            parser
+                .screen()
+                .cell(row, 0)
+                .map_or(vt100::Color::Default, vt100::Cell::fgcolor)
+        })
+        .collect()
 }
 
 fn rows_of(parser: &vt100::Parser) -> Vec<String> {
@@ -1055,7 +1066,7 @@ fn leaving_while_a_gate_runs_gives_its_schedule_back() {
     ));
     let (pid, master) = spawn_screen(&install, false);
     let until_set = format!("{AWAITED}WATCH_SET{AWAITED}{KEYS_ONLY}");
-    let (screens, ..) = pump(master, &["watch the deploy", &until_set], false, COLUMNS);
+    let screens = pump(master, &["watch the deploy", &until_set], false, COLUMNS).screens;
     let database = install.database();
     let claim = || -> Option<(bool, i64)> {
         rusqlite::Connection::open(&database)
@@ -1135,12 +1146,13 @@ fn a_held_followup_is_not_sent_once_the_process_is_terminated() {
     // The last input sends nothing: it holds the driver until the followup is shown waiting.
     let followup = format!("{AWAITED}TURN_HELD{AWAITED}HELD_FOLLOWUP_WORDS");
     let until_it_waits = format!("{AWAITED}(followup, waiting){AWAITED}{KEYS_ONLY}");
-    let (.., rows) = pump(
+    let rows = pump(
         master,
         &["start it", &followup, &until_it_waits],
         false,
         COLUMNS,
-    );
+    )
+    .left;
     assert!(
         rows.iter().any(|row| row.contains("(followup, waiting)")),
         "the followup is held when the signal lands: {rows:#?}"
@@ -1394,6 +1406,176 @@ fn a_streaming_thought_shows_open_until_the_answer_starts() {
             .any(|row| row == "• Thinking · Then the footer.")
             && !streaming.iter().any(|row| row == "  Then the footer."),
         "off, it streams as its row: {streaming:#?}"
+    );
+}
+
+/// A block lit under the mouse goes dark once the mouse has rested, and when the terminal says it
+/// lost focus: a terminal never says the mouse left, so the last place it reported is not kept.
+/// The screen asks for focus reports to hear the second, and gives them back when it leaves.
+#[test]
+fn a_block_s_light_goes_out_when_the_mouse_rests_or_the_focus_goes() {
+    const THOUGHT: &str = r#"[
+ [{"type":"thinking_delta","text":"Reading the stylesheet first."},
+  {"type":"thinking_complete"},
+  {"type":"text","text":"Fixed both."},
+  {"type":"message_end","stop_reason":"end_turn"}]
+]"#;
+    // The thinking row is the fifth of the screen: the prompt's three rows and a blank above it.
+    const THINKING_ROW: usize = 4;
+    const LIT: vt100::Color = vt100::Color::Rgb(255, 255, 255);
+    let onto_the_row = format!("\x1b[<35;10;{}M", THINKING_ROW + 1);
+    let moved = format!("{onto_the_row}{KEYS_ONLY}");
+    let moved_then_focus_lost = format!("{onto_the_row}\x1b[O{KEYS_ONLY}");
+    let install = screen_install("read", "", "");
+    install.write_script(THOUGHT);
+    // Each `\x0c` is sent a quiet spell after the input before it, so the screen read after two
+    // of them is the one a rested pointer has left, however slowly the suite runs. The focus
+    // goes in the same write as the move, so the screen after it is read before a rest would
+    // have put the light out anyway.
+    let run = drive_run(
+        &install,
+        &[
+            "fix the spacing",
+            &moved,
+            "\x0c",
+            "\x0c",
+            &moved_then_focus_lost,
+            "/exit",
+        ],
+        false,
+    );
+    for screen in [4, 5] {
+        assert!(
+            run.screens[screen][THINKING_ROW].starts_with("• Thinking · Reading"),
+            "the thinking row is where the pointer was sent: {:#?}",
+            run.screens[screen]
+        );
+    }
+    assert_ne!(
+        run.glyph_colors[4][THINKING_ROW], LIT,
+        "a pointer at rest lights nothing"
+    );
+    assert_ne!(
+        run.glyph_colors[5][THINKING_ROW], LIT,
+        "nor does one the focus left with"
+    );
+    let last = |mode: &[u8]| {
+        run.output
+            .windows(mode.len())
+            .rposition(|window| window == mode)
+    };
+    let asked = last(b"\x1b[?1004h").expect("the screen asks for focus reports");
+    assert!(
+        last(b"\x1b[?1004l").is_some_and(|given_back| given_back > asked),
+        "and gives them back when it leaves"
+    );
+}
+
+/// A click in the composer puts the cursor where it landed: on a cell of the text, and from the
+/// block's padding and gutter on the nearest cell of it. While the recall search stands in the
+/// text's place there is no text to click in, and the cursor stays where it was.
+#[test]
+fn a_click_in_the_composer_puts_the_cursor_there() {
+    // The first of the composer's two rows of text, counted from 1 as a mouse report counts: the
+    // status row is the screen's last, and a row of padding stands between it and the text.
+    const FIRST_ROW: u16 = ROWS - 3;
+    let text_rows = |screen: &[String]| -> Vec<String> {
+        screen
+            .iter()
+            .skip(usize::from(FIRST_ROW) - 1)
+            .take(2)
+            .cloned()
+            .collect()
+    };
+    let click = |column: u16, row: u16| {
+        format!("\x1b[<0;{column};{row}M\x1b[<0;{column};{row}m{KEYS_ONLY}")
+    };
+    let keys = |keys: &str| format!("{keys}{KEYS_ONLY}");
+    let install = screen_install("read", "", "");
+    let screens = run_screen(&install, "[]", &[
+        // Alt+Enter between the two lines.
+        &keys("hello world\x1b\rsecond"),
+        // On the `w`.
+        &click(9, FIRST_ROW),
+        &keys("X"),
+        // The padding row above the text, in the gutter.
+        &click(1, FIRST_ROW - 1),
+        &keys("Y"),
+        // Ctrl+R: the search takes the text's place, and Esc gives it back.
+        "\x12",
+        &click(9, FIRST_ROW),
+        "\x1b",
+        &keys("Z"),
+        "\x03",
+        "/exit",
+    ]);
+    assert_eq!(
+        text_rows(&screens[1]),
+        ["▎ hello world", "▎ second"],
+        "the text is on the rows the clicks are sent to: {:#?}",
+        screens[1]
+    );
+    assert_eq!(text_rows(&screens[3]), ["▎ hello Xworld", "▎ second"]);
+    assert_eq!(
+        text_rows(&screens[5]),
+        ["▎ Yhello Xworld", "▎ second"],
+        "from the padding and the gutter, the nearest cell"
+    );
+    assert_eq!(
+        text_rows(&screens[9]),
+        ["▎ YZhello Xworld", "▎ second"],
+        "a click on the search moved nothing"
+    );
+}
+
+/// A composer holding more rows than it shows marks where its view stands with a thumb in its
+/// right margin, and the wheel over it scrolls its text.
+#[test]
+fn a_tall_composer_shows_a_scroll_thumb_and_takes_the_wheel() {
+    // A third of the screen is the composer's at most: thirteen rows of forty, eleven of them
+    // text between the two rows of padding. The status row is the screen's last.
+    const TEXT_ROWS: usize = 11;
+    const LAST_TEXT_ROW: usize = ROWS as usize - 3;
+    let text_rows = |screen: &[String]| -> Vec<String> {
+        screen
+            .iter()
+            .skip(LAST_TEXT_ROW + 1 - TEXT_ROWS)
+            .take(TEXT_ROWS)
+            .cloned()
+            .collect()
+    };
+    // Each row's words, and whether the thumb stands in its margin.
+    let read = |row: &str| -> (String, bool) {
+        let words = row.trim_end_matches('▐').trim_end().to_string();
+        (words, row.ends_with('▐'))
+    };
+    // Fourteen lines, Alt+Enter between them.
+    let lines = (0..14)
+        .map(|line| format!("l{line}"))
+        .collect::<Vec<_>>()
+        .join("\x1b\r");
+    let wheel_up = format!("\x1b[<64;10;{LAST_TEXT_ROW}M");
+    let install = screen_install("read", "", "");
+    let screens = run_screen(&install, "[]", &[
+        &format!("{lines}{KEYS_ONLY}"),
+        &format!("{}{KEYS_ONLY}", wheel_up.repeat(3)),
+        "\x03",
+        "/exit",
+    ]);
+    let typed: Vec<(String, bool)> = text_rows(&screens[1]).iter().map(|row| read(row)).collect();
+    assert_eq!(
+        (typed[0].clone(), typed[TEXT_ROWS - 1].clone()),
+        (("▎ l3".to_string(), false), ("▎ l13".to_string(), true)),
+        "the end shows, and the thumb stands at the bottom, off the top: {:#?}",
+        screens[1]
+    );
+    let scrolled: Vec<(String, bool)> =
+        text_rows(&screens[2]).iter().map(|row| read(row)).collect();
+    assert_eq!(
+        (scrolled[0].clone(), scrolled[TEXT_ROWS - 1].clone()),
+        (("▎ l0".to_string(), true), ("▎ l10".to_string(), false)),
+        "three turns of the wheel brought the start, and the thumb with it: {:#?}",
+        screens[2]
     );
 }
 
@@ -2037,7 +2219,7 @@ fn leaving_during_an_inbox_turn_opens_no_turn_on_an_outcome_ready_meanwhile() {
     install.write_script(SCRIPT);
     let (pid, master) = spawn_screen(&install, false);
     let until_running = format!("{AWAITED}FIRST_RUNNING{AWAITED}{KEYS_ONLY}");
-    let (screens, ..) = pump(master, &[&until_running], false, COLUMNS);
+    let screens = pump(master, &[&until_running], false, COLUMNS).screens;
     // Ready once the drain's turn is past the last pause that would have read it.
     let connection = rusqlite::Connection::open(install.database()).expect("open the store");
     connection
@@ -2479,7 +2661,7 @@ fn a_terminal_that_dies_during_an_inbox_turn_leaves_its_item_waiting() {
     install.write_script(SCRIPT);
     let (pid, master) = spawn_screen(&install, true);
     let until_running = format!("{AWAITED}ITEM_WORDS{AWAITED}{KEYS_ONLY}");
-    let (screens, ..) = pump(master, &[&until_running], false, COLUMNS);
+    let screens = pump(master, &[&until_running], false, COLUMNS).screens;
     // SAFETY: closing the master takes the terminal away; nothing reads it after.
     unsafe {
         libc::close(master);
@@ -2655,7 +2837,7 @@ fn terminal_taken_away(detached: bool) -> (Option<i32>, Vec<i32>, Screens) {
         }
     }
     keep_master_here(master);
-    let (screens, ..) = pump(master, &[&format!("!{marker}")], false, COLUMNS);
+    let screens = pump(master, &[&format!("!{marker}")], false, COLUMNS).screens;
     assert!(
         !processes_running(marker).is_empty(),
         "the command runs before the terminal goes: {screens:#?}"
@@ -3337,12 +3519,13 @@ fn the_second_interrupt_from_outside_stops_the_resumed_session_s_tasks() {
     }
     keep_master_here(master);
     // The key is the ladder's first press, which the screen answers with a hint and no stop.
-    let (.., rows) = pump(
+    let rows = pump(
         master,
         &[&format!("/resume {other}"), "start it", "\x03"],
         false,
         COLUMNS,
-    );
+    )
+    .left;
     // The task's run starts the command, after the call that asked for it has returned, so the
     // command is waited for rather than expected the moment the screen settles.
     let deadline = Instant::now() + Duration::from_secs(30);

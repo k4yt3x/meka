@@ -15,7 +15,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, MouseButton, MouseEvent, MouseE
 use futures::StreamExt;
 use ratatui::{
     DefaultTerminal, Frame,
-    layout::Rect,
+    layout::{Position, Rect},
     style::Style,
     text::{Line, Span, Text},
     widgets::Paragraph,
@@ -25,7 +25,7 @@ use super::{
     commands::{Answerer, SlashCommand, parse_slash_command, unknown_command_message},
     frontend::{ApprovalDecision, ApprovalRequest, HostEvent, UiEvent},
     input::{
-        Action, Completer, Composer, ComposerState, Focus, action_for, handle_cd,
+        Action, Completer, Composer, ComposerState, DrawnText, Focus, action_for, handle_cd,
         shorten_path_with_tilde,
     },
     model::{Item, Transcript},
@@ -48,6 +48,10 @@ const LOG_RING_LINES: usize = 500;
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 /// How long a hint stands on the row above the composer.
 const HINT_LIFETIME: Duration = Duration::from_secs(6);
+/// How long the pointer is taken to be where the terminal last reported it. A terminal reports
+/// the pointer while it moves inside the window and says nothing when it leaves, so a report
+/// believed for longer keeps lit what a pointer long gone was over.
+const POINTER_REST: Duration = Duration::from_secs(3);
 /// The composer grows up to this share of the screen before it scrolls inside.
 const COMPOSER_SHARE: u16 = 3;
 /// A panel takes up to this share of the screen.
@@ -151,7 +155,8 @@ pub(crate) struct ScreenLaunch {
     pub(crate) cancel: crate::host::CancelCell,
     pub(crate) send_class: InboxClass,
     pub(crate) mouse: bool,
-    /// Resolved `[display].wheel_rows`: rows a wheel event moves the transcript or a panel.
+    /// Resolved `[display].wheel_rows`: rows a wheel event moves the transcript, a panel or a
+    /// composer scrolled inside.
     pub(crate) wheel_rows: usize,
     /// Whether a turn is already running when the screen opens: a prompt given on the command
     /// line is the first turn's input.
@@ -465,9 +470,10 @@ struct Screen {
     selection: Option<Selection>,
     /// Whether the pointer is on the stuck prompt's bar, which lights it.
     sticky_hovered: bool,
-    /// Where the pointer was at the last mouse event: the back-to-bottom pill lights when it is
-    /// drawn under it, wherever the pill has moved to since and whatever brought it out.
-    pointer: Option<(u16, u16)>,
+    /// Where the pointer was at the last mouse event, and when: the back-to-bottom pill lights
+    /// when it is drawn under it, wherever the pill has moved to since and whatever brought it
+    /// out. `None` once it is taken as gone; see [`Self::forget_pointer`].
+    pointer: Option<((u16, u16), Instant)>,
     /// The id the next image read for the composer answers under.
     next_attachment: u64,
     /// The last frame as drawn, which is what a selection copies: the text as shown, whatever
@@ -480,6 +486,10 @@ struct Screen {
     pill: Option<Rect>,
     /// The overlay's area in the last frame, when one was drawn.
     overlay_area: Option<Rect>,
+    /// The composer's block in the last frame and, within it, its text, when text was drawn: a
+    /// click in the block puts the cursor in the text, and the wheel over it scrolls a text that
+    /// has rows out of view.
+    composer_drawn: Option<(Rect, DrawnText)>,
     /// A page of the log is on its way; one read at a time, so two scrolls do not ask twice.
     history_loading: bool,
     /// The generation of the reload whose read is on its way, if one is: the command that asked
@@ -530,6 +540,7 @@ impl Screen {
             next_attachment: 0,
             drawn: ratatui::buffer::Buffer::default(),
             transcript_area: Rect::default(),
+            composer_drawn: None,
             pill: None,
             overlay_area: None,
             history_loading: false,
@@ -2672,6 +2683,15 @@ impl Screen {
         }
     }
 
+    /// The wheel over a composer with rows out of view. The scroll can carry the cursor off
+    /// the line the completion list reads, so the list is asked for again.
+    fn scroll_composer(&mut self, rows: isize) {
+        if let Some((_, text)) = self.composer_drawn {
+            self.composer.scroll_by(rows, text.area);
+            self.suggest();
+        }
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         let over_overlay = self
             .overlay_area
@@ -2692,16 +2712,22 @@ impl Screen {
         let on_pill = view::is_on_pill(self.pill, mouse.column, mouse.row);
         let was_on_pill = self
             .pointer
-            .is_some_and(|(column, row)| view::is_on_pill(self.pill, column, row));
+            .is_some_and(|((column, row), _)| view::is_on_pill(self.pill, column, row));
         if on_pill != was_on_pill {
             self.dirty = true;
         }
-        self.pointer = Some((mouse.column, mouse.row));
+        self.pointer = Some(((mouse.column, mouse.row), Instant::now()));
         if matches!(mouse.kind, MouseEventKind::Moved) {
             return;
         }
         self.dirty = true;
         let wheel = isize::try_from(self.launch.wheel_rows).unwrap_or(isize::MAX);
+        // A composer with every row in view has nothing to scroll, and the wheel over it is the
+        // transcript's, as it is everywhere else.
+        let over_scrolling_composer = self.composer_drawn.is_some_and(|(block, text)| {
+            (text.above > 0 || text.below > 0)
+                && block.contains(Position::new(mouse.column, mouse.row))
+        });
         match mouse.kind {
             MouseEventKind::ScrollUp => match self.overlay.as_mut() {
                 Some(Overlay::Panel { panel, .. }) if over_overlay => panel.scroll_by(-wheel),
@@ -2710,6 +2736,7 @@ impl Screen {
                 {
                     elicitation.scroll.scroll_by(-wheel);
                 }
+                _ if over_scrolling_composer => self.scroll_composer(-wheel),
                 _ => self.viewport.scroll_by(-wheel),
             },
             MouseEventKind::ScrollDown => match self.overlay.as_mut() {
@@ -2719,6 +2746,7 @@ impl Screen {
                 {
                     elicitation.scroll.scroll_by(wheel);
                 }
+                _ if over_scrolling_composer => self.scroll_composer(wheel),
                 _ => self.viewport.scroll_by(wheel),
             },
             // A press starts a selection; whether it was a click is known at the release.
@@ -2732,6 +2760,21 @@ impl Screen {
                 if on_sticky && let Some((_, start)) = self.viewport.sticky_prompt() {
                     self.viewport.scroll_to(start.saturating_sub(1));
                     self.selection = None;
+                    return;
+                }
+                // Anywhere in the composer's block: its padding and its gutter are the text's
+                // margin, and a press there means the nearest cell of the text.
+                if let Some((block, DrawnText { area: text, .. })) = self.composer_drawn
+                    && block.contains(Position::new(mouse.column, mouse.row))
+                {
+                    let last_row = (text.y + text.height).saturating_sub(1).max(text.y);
+                    self.selection = None;
+                    self.viewport.set_cursor(None);
+                    self.composer.place_cursor(
+                        mouse.row.clamp(text.y, last_row) - text.y,
+                        mouse.column.saturating_sub(text.x),
+                    );
+                    self.suggest();
                     return;
                 }
                 self.selection = over_transcript.map(|_| Selection {
@@ -2993,6 +3036,26 @@ impl Screen {
         }
     }
 
+    /// Take the pointer as gone from the screen: what it lit goes dark until the terminal reports
+    /// it again.
+    fn forget_pointer(&mut self) {
+        if self.pointer.take().is_none() {
+            return;
+        }
+        self.viewport.set_hover_row(None);
+        self.sticky_hovered = false;
+        self.dirty = true;
+    }
+
+    /// Forget a pointer the terminal has not reported for [`POINTER_REST`].
+    fn rest_pointer(&mut self) {
+        if let Some((_, reported)) = &self.pointer
+            && reported.elapsed() > POINTER_REST
+        {
+            self.forget_pointer();
+        }
+    }
+
     /// Read back how much work runs beside the turn, once a second: the session's background
     /// tasks from the store, the sub-agents from the process. A change is a reason to draw.
     async fn poll_work(&mut self) {
@@ -3067,6 +3130,7 @@ impl Screen {
     }
 
     fn draw(&mut self, frame: &mut Frame<'_>) {
+        self.composer_drawn = None;
         let area = frame.area();
         if area.height < 4 || area.width < 4 {
             return;
@@ -3170,7 +3234,7 @@ impl Screen {
         let pointer = self.pointer;
         self.pill = (gap > 0 && !self.viewport.is_following()).then(|| {
             let pill = view::draw_back_to_bottom(frame, pill_row, taken, false);
-            if pointer.is_some_and(|(column, row)| view::is_on_pill(Some(pill), column, row)) {
+            if pointer.is_some_and(|((column, row), _)| view::is_on_pill(Some(pill), column, row)) {
                 view::draw_back_to_bottom(frame, pill_row, taken, true)
             } else {
                 pill
@@ -3284,7 +3348,19 @@ impl Screen {
                     } else {
                         ""
                     });
-                    self.composer.draw(frame, field);
+                    self.composer_drawn = self
+                        .composer
+                        .draw(frame, field)
+                        .map(|text| (composer_area, text));
+                    if let Some((_, text)) = self.composer_drawn {
+                        // In the margin the text stops short of, beside the rows it has.
+                        let margin = Rect {
+                            x: text.area.x + text.area.width,
+                            width: draw::RIGHT_MARGIN as u16,
+                            ..text.area
+                        };
+                        view::draw_scroll_thumb(frame, margin, text.above, text.below);
+                    }
                     if let Some(completion) = &self.composer.completion {
                         let rows: Vec<view::ListRow> = completion
                             .rows
@@ -3737,7 +3813,11 @@ fn give_back_terminal_modes() {
         tracing::debug!("failed to disable the keyboard enhancement: {error}");
     }
     if MOUSE_TAKEN.swap(false, Ordering::SeqCst)
-        && let Err(error) = crossterm::execute!(out, crossterm::event::DisableMouseCapture)
+        && let Err(error) = crossterm::execute!(
+            out,
+            crossterm::event::DisableFocusChange,
+            crossterm::event::DisableMouseCapture
+        )
     {
         tracing::debug!("failed to disable mouse capture: {error}");
     }
@@ -3781,7 +3861,12 @@ fn enter_terminal(mouse: bool) -> std::io::Result<std::mem::ManuallyDrop<Default
         tracing::debug!("failed to enable bracketed paste: {error}");
     }
     if mouse {
-        match crossterm::execute!(out, crossterm::event::EnableMouseCapture) {
+        // Focus reports come and go with the mouse: the pointer's light is all that reads them.
+        match crossterm::execute!(
+            out,
+            crossterm::event::EnableMouseCapture,
+            crossterm::event::EnableFocusChange
+        ) {
             Ok(()) => MOUSE_TAKEN.store(true, Ordering::SeqCst),
             Err(error) => tracing::debug!("failed to enable mouse capture: {error}"),
         }
@@ -3840,6 +3925,9 @@ pub(crate) async fn run_screen(launch: ScreenLaunch) -> anyhow::Result<()> {
                 Some(Ok(Event::Key(key))) => screen.handle_key(key, &mut terminal).await,
                 Some(Ok(Event::Mouse(mouse))) => screen.handle_mouse(mouse),
                 Some(Ok(Event::Paste(text))) => screen.paste(text),
+                // Focus going to another window is the one sign a terminal gives that the
+                // pointer went with it; a pointer still here says so with its next move.
+                Some(Ok(Event::FocusLost)) => screen.forget_pointer(),
                 // Drawn at once rather than at the next tick, while the terminal shows its own
                 // idea of the old rows at the new size; but only at the size the window has: a
                 // drag sends one event a step, and a step it has moved past is left to the tick.
@@ -3863,6 +3951,7 @@ pub(crate) async fn run_screen(launch: ScreenLaunch) -> anyhow::Result<()> {
             _ = tick.tick() => {
                 screen.drain_logs();
                 screen.expire_hint();
+                screen.rest_pointer();
                 screen.tick_working();
                 screen.poll_work().await;
                 screen.withdraw_stopped_questions();

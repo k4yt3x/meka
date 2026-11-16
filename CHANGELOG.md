@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The screen and an editor say when a failed inbox item will be tried again, or was given up.
 - `GET /v1/sessions/{id}/inbox` lists a waiting fire with its `schedule_id` and `occurrences`.
 - The session feed carries `schedule.fired`.
+- On the screen, a click in the composer puts the cursor where it landed.
+- A composer with more rows than it shows marks its place with a thumb, and the wheel scrolls it.
 
 ### Changed
 
@@ -59,6 +61,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Canceling a schedule withdraws its unread fires; a server that cancels it says `inbox.withdrawn`.
 - `meka serve` leaves the inbox of a session another process holds to that process.
 - On the screen, a steer typed too late for its turn is answered as soon as that turn ends.
+- On the screen, a blank row sits between the `Thinking` or `Summary` label and what is under it.
+- In the composer, Up and Down move by rows as drawn; recall starts from the first or last row.
+- A recalled prompt left as it came is walked past with one Up or Down, whatever its length.
 
 ### Removed
 
@@ -144,6 +149,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A Ctrl+C or SIGTERM while `/mcp <server>:<prompt>` fetches its prompt stops the turn it opens.
 - After `/resume` or a pick in `meka -r`, a background report on the first page names its task.
 - An MCP form's answer to an integer field reaches the server as an integer, not a float.
+- On the screen, a lit block goes dark when the mouse rests 3 s or the terminal loses focus.
+- A recalled prompt changed by a new line, a completion or a search is no longer lost to Up.
 
 ## [0.94.0] - 2026-11-12
 
