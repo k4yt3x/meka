@@ -107,6 +107,7 @@ impl ServerState {
             connection,
             session_id,
             client_state: self.client_state.clone(),
+            client_filesystem: self.shared.config.acp.client_filesystem,
             transport_dead: Arc::clone(&self.transport_dead),
         }
     }

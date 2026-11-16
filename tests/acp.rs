@@ -2410,9 +2410,10 @@ enabled = ["read", "workspace"]
     );
 }
 
-/// when the client advertises `fs.read_text_file` and takes writes, a `file_read` tool call
-/// delegates to `fs/read_text_file` rather than touching the disk. The mock provider scripts the
-/// tool use; the test harness intercepts the outgoing fs request and answers with canned content.
+/// With `[acp].client_filesystem` on, when the client advertises `fs.read_text_file` and takes
+/// writes, a `file_read` tool call delegates to `fs/read_text_file` rather than touching the disk.
+/// The mock provider scripts the tool use; the test harness intercepts the outgoing fs request and
+/// answers with canned content.
 #[test]
 fn acp_fs_read_text_file_is_delegated_when_capability_offered() {
     let config_toml = r#"
@@ -2422,6 +2423,9 @@ backend = "anthropic-messages"
 [profiles.mock]
 account = "mock"
 model = "claude-sonnet-4-5"
+
+[acp]
+client_filesystem = true
 "#;
     let mut harness = AcpTestHarness::builder()
         .config(config_toml)
@@ -2477,9 +2481,9 @@ model = "claude-sonnet-4-5"
     assert_eq!(std::fs::read_to_string(&target).expect("read"), "ON DISK\n");
 }
 
-/// when the client advertises `fs.write_text_file`, a `file_write` tool call delegates to
-/// `fs/write_text_file` and does NOT touch the local disk. The test harness intercepts the request,
-/// replies ok, and asserts no local file was created.
+/// With `[acp].client_filesystem` on, when the client advertises `fs.write_text_file`, a
+/// `file_write` tool call delegates to `fs/write_text_file` and does NOT touch the local disk. The
+/// test harness intercepts the request, replies ok, and asserts no local file was created.
 #[test]
 fn acp_fs_write_text_file_is_delegated_when_capability_offered() {
     let content_to_write = "hello from delegated write";
@@ -2496,6 +2500,9 @@ model = "claude-sonnet-4-5"
 [permissions]
 default = "unrestricted"
 enabled = ["read", "unrestricted"]
+
+[acp]
+client_filesystem = true
 "#;
     let mut harness = AcpTestHarness::builder()
         .config(config_toml)
@@ -3445,8 +3452,9 @@ model = "claude-sonnet-4-5"
     );
 }
 
-/// when the client advertises both `fs.readTextFile` and `fs.writeTextFile`, `file_edit` delegates
-/// both halves and does not touch the local disk: the delegated read+write composition.
+/// With `[acp].client_filesystem` on, when the client advertises both `fs.readTextFile` and
+/// `fs.writeTextFile`, `file_edit` delegates both halves and does not touch the local disk: the
+/// delegated read+write composition.
 #[test]
 fn acp_edit_file_delegates_when_both_fs_capabilities_offered() {
     let config_toml = r#"
@@ -3460,6 +3468,9 @@ model = "claude-sonnet-4-5"
 [permissions]
 default = "unrestricted"
 enabled = ["read", "unrestricted"]
+
+[acp]
+client_filesystem = true
 "#;
     // file_edit canonicalizes the target before reaching the delegation seam, so the path must
     // exist on disk. Seed it with a *different* content from what the delegate will serve; this
@@ -3540,6 +3551,77 @@ enabled = ["read", "unrestricted"]
     assert_eq!(
         on_disk, disk_content,
         "file_edit modified the local file despite delegating to fs/write_text_file"
+    );
+}
+
+/// Without `[acp].client_filesystem`, a client that offers both `fs/*` methods is asked for
+/// neither: `file_read` and `file_edit` work on the disk, as they do on every other host.
+#[test]
+fn the_file_tools_stay_on_the_disk_unless_client_filesystem_is_on() {
+    let config_toml = r#"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
+model = "claude-sonnet-4-5"
+
+[permissions]
+default = "unrestricted"
+enabled = ["read", "unrestricted"]
+"#;
+    let mut harness = AcpTestHarness::builder()
+        .config(config_toml)
+        .capabilities(serde_json::json!({
+            "fs": { "readTextFile": true, "writeTextFile": true }
+        }))
+        .pre_spawn(|config_dir| {
+            let target = fixture_beside(config_dir, "on-disk.txt");
+            std::fs::write(&target, "alpha\nbeta\n").expect("seed the file");
+            let path = target.to_str().unwrap();
+            serde_json::json!([
+                [
+                    { "type": "tool_use_start", "id": "call_read", "name": "file_read" },
+                    { "type": "tool_use_end", "input": { "path": path } },
+                    { "type": "message_end", "stop_reason": "tool_use" }
+                ],
+                [
+                    { "type": "tool_use_start", "id": "call_edit", "name": "file_edit" },
+                    {
+                        "type": "tool_use_end",
+                        "input": { "path": path, "old_string": "beta", "new_string": "GAMMA" }
+                    },
+                    { "type": "message_end", "stop_reason": "tool_use" }
+                ],
+                [
+                    { "type": "text", "text": "done" },
+                    { "type": "message_end", "stop_reason": "end_turn" }
+                ]
+            ])
+        })
+        .build();
+    let target = harness.work_dir().join("on-disk.txt");
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "edit it");
+
+    // Answered as an editor holding other text would answer, so a request that is sent anyway
+    // fails the assertions below instead of holding the turn.
+    let mut asked = Vec::new();
+    let _ = harness.await_response_with_dispatch(id, |value| {
+        let result = match value["method"].as_str()? {
+            "fs/read_text_file" => serde_json::json!({ "content": "EDITOR BUFFER\n" }),
+            "fs/write_text_file" => serde_json::json!({}),
+            _ => return None,
+        };
+        asked.push(value["method"].clone());
+        Some(serde_json::json!({ "jsonrpc": "2.0", "id": value["id"].clone(), "result": result }))
+    });
+
+    assert!(asked.is_empty(), "the client was asked for {asked:?}");
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("read the file"),
+        "alpha\nGAMMA\n",
+        "the edit is computed from the disk and lands there"
     );
 }
 
@@ -5237,8 +5319,8 @@ enabled = ["read", "unrestricted"]
 
 // === fs/read_text_file line + limit =================================
 
-/// `file_read` asks the editor for the whole document even when the model passed `start`/`end`,
-/// and windows what comes back locally.
+/// With `[acp].client_filesystem` on, `file_read` asks the editor for the whole document even when
+/// the model passed `start`/`end`, and windows what comes back locally.
 ///
 /// Pushing the window down to `fs/read_text_file` looked tidier and cost two things. The freshness
 /// stamp recorded the slice rather than the document, so the next `file_edit` compared a slice
@@ -5249,8 +5331,9 @@ enabled = ["read", "unrestricted"]
 fn acp_fs_read_text_file_fetches_the_whole_document_and_windows_locally() {
     let on_disk_marker = "DO-NOT-READ-ME-FROM-DISK\n".repeat(100);
     let on_disk_marker_for_seed = on_disk_marker.clone();
+    let config_toml = format!("{ACP_INVALID_PARAMS_CONFIG}\n[acp]\nclient_filesystem = true\n");
     let mut harness = AcpTestHarness::builder()
-        .config(ACP_INVALID_PARAMS_CONFIG)
+        .config(&config_toml)
         .capabilities(serde_json::json!({
             "fs": { "readTextFile": true, "writeTextFile": true }
         }))

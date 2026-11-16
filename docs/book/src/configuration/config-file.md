@@ -33,7 +33,7 @@ Everything in that directory is content you put there, so it is safe to keep und
 
 Windows still writes both, because its file locks are mandatory rather than advisory: a lock held on `config.toml` would make the file unreadable to the command holding it, and `LockFileEx` refuses a directory handle outright. If you keep a Meka config directory under version control on Windows, ignore `.config.toml.lock` and `skills/.meka-store.lock`.
 
-The sections below are in the order a file is best written in: the blocks with many entries first (`default_profile`, accounts, profiles, MCP servers), then each single table from the most to the least consequential, and `[serve]` last.
+The sections below are in the order a file is best written in: the blocks with many entries first (`default_profile`, accounts, profiles, MCP servers), then each single table from the most to the least consequential, and the tables of one host each, `[acp]` and `[serve]`, last.
 
 ## Accounts and profiles
 
@@ -1573,6 +1573,29 @@ Default: `true`
 [display]
 stream = false
 ```
+
+## `[acp]`
+
+Settings for `meka acp`, the [ACP](../usage/acp.md) agent an editor runs. No other host reads them.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `client_filesystem` | bool | `false` | Read and write files through the client where it offers to |
+
+```toml
+[acp]
+client_filesystem = true
+```
+
+By default the file tools read and write the disk whatever the client offers, as they do on the screen and as `shell_execute` always does: the file holds what the agent wrote, and the editor learns of the change as it learns of any other program's. A file with unsaved changes in the editor is read as it was last saved, and written on disk beneath them.
+
+With `client_filesystem` on, `file_read`, `file_edit` and `file_write` go through the client's `fs/read_text_file` and `fs/write_text_file` where it advertises both. The agent reads what the editor holds for a file, unsaved changes included, and the editor applies each write to its own copy, which is what lets it keep the change in its undo history, offer it for review and format it on save. What the file holds afterwards is the editor's to decide, so it can differ from what the agent wrote. See [What Meka consumes](../usage/acp.md#what-meka-consumes-clientcapabilities).
+
+`meka acp` reads `config.toml` once, when it starts, so restart the agent in your editor after changing this.
+
+One `[serve]` key governs `meka acp` as well: [`relay_provider_errors`](#serverelay_provider_errors).
+
+Config-only: no environment variable, no CLI flag.
 
 ## `[serve]`
 

@@ -65,6 +65,7 @@ pub(crate) struct ConfigFile {
     pub(crate) thinking: Option<ThinkingConfig>,
     pub(crate) web: Option<WebConfig>,
     pub(crate) display: Option<DisplayConfig>,
+    pub(crate) acp: Option<AcpConfig>,
     pub(crate) serve: Option<ServeConfig>,
 }
 
@@ -800,6 +801,33 @@ pub(crate) struct DisplayConfig {
 /// and either saying no wins.
 pub(crate) fn streaming_enabled(no_stream_flag: bool, configured: Option<bool>) -> bool {
     !no_stream_flag && configured.unwrap_or(true)
+}
+
+/// `[acp]` table: what `meka acp` alone reads.
+///
+/// Config-only, like `[display]`: a standing preference about one host, not a property of a run.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AcpConfig {
+    /// Whether the file tools read and write through the client's `fs/*` methods where it offers
+    /// them, so an editor serves its buffers and records each change as its own. Default `false`:
+    /// the offer is unused and the tools work on the disk, as on every other host.
+    pub(crate) client_filesystem: Option<bool>,
+}
+
+/// [`AcpConfig`] with every default filled in.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedAcpConfig {
+    /// `[acp].client_filesystem`.
+    pub(crate) client_filesystem: bool,
+}
+
+impl ResolvedAcpConfig {
+    fn resolve(raw: Option<AcpConfig>) -> Self {
+        Self {
+            client_filesystem: raw.unwrap_or_default().client_filesystem.unwrap_or(false),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -2313,6 +2341,8 @@ pub(crate) struct ResolvedConfig {
     pub(crate) mcp_stdio_concurrency: usize,
     /// How many HTTP servers the startup connector connects at once.
     pub(crate) mcp_http_concurrency: usize,
+    /// `[acp]` with defaults filled; see [`AcpConfig`].
+    pub(crate) acp: ResolvedAcpConfig,
     /// Raw `[serve]` section. Resolved (defaults filled, env vars substituted, token files read)
     /// at `meka serve` startup by [`crate::host::http::config::ResolvedServeConfig::resolve`], not
     /// here, so [`ResolvedConfig::resolve`] can stay infallible.
@@ -2752,6 +2782,7 @@ const SECTIONS_READ_AT_STARTUP: &[&str] = &[
     "session",
     "web",
     "display",
+    "acp",
     "serve",
 ];
 
@@ -3141,6 +3172,7 @@ impl ResolvedConfig {
             .unwrap_or(true);
         let background = ResolvedBackgroundConfig::resolve(config_file.background);
         let subagents = ResolvedSubagentsConfig::resolve(config_file.subagents);
+        let acp = ResolvedAcpConfig::resolve(config_file.acp);
         let file_mcp = config_file.mcp.unwrap_or_default();
         let mcp_servers = file_mcp.servers.unwrap_or_default();
         let mcp_default_required = file_mcp.default_required.unwrap_or(false);
@@ -3375,6 +3407,7 @@ impl ResolvedConfig {
             mcp_tool_timeout,
             mcp_stdio_concurrency,
             mcp_http_concurrency,
+            acp,
             serve: config_file.serve,
             request: RunRequest {
                 additional_workspace_directories: overrides.additional_workspace_directories,

@@ -153,6 +153,22 @@ leaves `unrestricted` out it no longer starts: add the level to `enabled`. A ses
 whose recorded level has left the list is not refused; it still starts at the configured default,
 with a warning.
 
+**`meka acp` reads and writes files on disk.** Where an editor offered `fs/read_text_file` and
+`fs/write_text_file`, `file_read`, `file_edit` and `file_write` used to go through them: the agent
+read the editor's copy of a file, unsaved changes included, and the editor applied each write. Now
+they work on the disk unless `config.toml` says otherwise, as `shell_execute` always has, so a file
+holds what the agent wrote. An unsaved change in the editor is no longer what the agent reads, and
+a write lands on disk beneath it. To have the file tools go through the editor again, which is
+what lets an editor keep the agent's changes in its undo history and offer them for review, set:
+
+```toml
+[acp]
+client_filesystem = true
+```
+
+and restart the agent in the editor. A client that counted on receiving `fs/*` requests receives
+none without the key. See [`[acp]`](../configuration/config-file.md#acp).
+
 ## 0.93 to 0.94
 
 The store moves forward on its first open, behind the automatic backup, so that a turn that fails

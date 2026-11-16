@@ -525,8 +525,9 @@ uses inline captures (`{name}`), and a failure reads "failed to <verb>", never "
   (`default_profile`, `[accounts.*]`, `[profiles.*]`, `[mcp]`), then each flat table from the most
   to the least consequential (`[permissions]`, `[shell]`, `[tools]`, `[subagents]`,
   `[instructions]`, `[skills]`, `[memory]`, `[schedule]`, `[background]`, `[session]`, `[thinking]`,
-  `[web]`, `[display]`), and `[serve]` last. A new section is placed by that rule in both, never
-  appended, and a note that is not a key goes in the page's intro, never between sections.
+  `[web]`, `[display]`), and the tables of one host each last (`[acp]`, `[serve]`). A new section
+  is placed by that rule in both, never appended, and a note that is not a key goes in the page's
+  intro, never between sections.
 
 ## A profile is indivisible
 

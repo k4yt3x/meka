@@ -45,8 +45,8 @@ These are returned in `InitializeResponse.agentCapabilities`:
 
 The client advertises these in `InitializeRequest.clientCapabilities`; Meka stashes them and lets the built-in tools route accordingly:
 
-- **`fs.readTextFile: true`**: `file_read` issues `fs/read_text_file { sessionId, path, line?, limit? }` so the client serves the *in-buffer* view of the file, when the client also takes writes. A regex read fetches the file the same way and filters it; an image read has no `fs/*` analog and stays local.
-- **`fs.writeTextFile: true`**: `file_write` and `file_edit`'s apply step issue `fs/write_text_file { sessionId, path, content }`. Meka still attaches diff metadata to the `tool_call_update` so clients with an apply-diff UI can render it, as it does for `skill_write`, whose file is in Meka's store; a memory write, which has no file, and a delete, which leaves no text after, carry their change as a unified diff in a `diff` code block instead.
+- **`fs.readTextFile: true`**: used only with [`[acp].client_filesystem`](../configuration/config-file.md#acp) on. `file_read` then issues `fs/read_text_file { sessionId, path, line?, limit? }` so the client serves the *in-buffer* view of the file, when the client also takes writes. A regex read fetches the file the same way and filters it; an image read has no `fs/*` analog and stays local.
+- **`fs.writeTextFile: true`**: used only under the same key. `file_write` and `file_edit`'s apply step then issue `fs/write_text_file { sessionId, path, content }`. Meka attaches diff metadata to the `tool_call_update` either way so clients with an apply-diff UI can render it, as it does for `skill_write`, whose file is in Meka's store; a memory write, which has no file, and a delete, which leaves no text after, carry their change as a unified diff in a `diff` code block instead.
 - **`terminal`**: not consumed. It means "I implement `terminal/*`", i.e. the agent may run commands *in the client*, which Meka never does. See [Shell commands stay inside Meka](#shell-commands-stay-inside-meka).
 - **`_meta.terminal_output: true`**: the client renders agent-owned terminals, so `shell_execute` output is streamed into a real terminal instead of a code block. A *rendering* choice only: Meka still spawns and sandboxes the process either way. Advertised by Zed; independent of the `terminal` capability above.
 - **`elicitation.form` / `elicitation.url`**: when an MCP server asks the user for input mid-tool-call, Meka issues `elicitation/create` so the prompt renders in the editor. The two are advertised independently and checked separately: a server asking for a form when only `url` is advertised is declined rather than sent. Without the capability Meka declines every elicitation, which is what it did unconditionally before. The request's `message` opens with `MCP server '<name>': ` ahead of the server's words on one line, since the protocol has no field for who asks, and a URL is only ever an `http` or `https` one. Elicitations raised inside a sub-agent forward to the parent session, like permission prompts.
@@ -54,6 +54,8 @@ The client advertises these in `InitializeRequest.clientCapabilities`; Meka stas
 - **`session.notices`**: the client presents notices outside the transcript, so an advisory Meka raises goes out as a `notice`; without it, as a `[Meka]` chunk. Advertised by Zed.
 
 If the client omits a capability, the matching tool falls back to local syscalls; the user-visible behavior is the same as `meka` on the screen.
+
+Without [`[acp].client_filesystem`](../configuration/config-file.md#acp), which is off by default, the two `fs` capabilities go unused: `file_read`, `file_edit` and `file_write` work on the disk whatever the client advertises, and send no `fs/*` request.
 
 ## Shell commands stay inside Meka
 
@@ -76,6 +78,8 @@ The terminal path uses an extension rather than ACP proper: `_meta.terminal_info
 This is deliberately temporary. ACP v2 standardizes agent-owned terminals as `terminal_update` / `terminal_output_chunk`, and Meka should move to those once a client implements them; v2 is still a draft schema (`v2.0.0-alpha.N`, behind an off-by-default feature flag) that nothing speaks yet.
 
 ### When the client won't serve a path
+
+This applies with [`[acp].client_filesystem`](../configuration/config-file.md#acp) on; without it Meka asks the client for no path.
 
 Editors differ in which paths they will serve: Zed answers only for the project it has open, another client may serve any absolute path. Meka models none of these rules. It asks per path and routes on the answer:
 
@@ -260,7 +264,7 @@ When the user picks one from the palette, the client typically inserts `/<name> 
 
 ## Sub-agents
 
-`agent_spawn` and skill-based delegation produce a sub-agent that runs through `PermissionForwardingFrontend`. The sub-agent's own output isn't streamed to the client (its final report flows back through the parent's `tool_call_update`), but its permission prompts and `fs/*` requests forward through the parent's connection, so the editor's apply-diff UI sees a sub-agent's writes the same as the root agent's. A forwarded prompt opens a card of its own; see [Permission levels](#permission-levels).
+`agent_spawn` and skill-based delegation produce a sub-agent that runs through `PermissionForwardingFrontend`. The sub-agent's own output isn't streamed to the client (its final report flows back through the parent's `tool_call_update`), but its permission prompts forward through the parent's connection, and so do its `fs/*` requests with [`[acp].client_filesystem`](../configuration/config-file.md#acp) on, so the editor's apply-diff UI then sees a sub-agent's writes the same as the root agent's. A forwarded prompt opens a card of its own; see [Permission levels](#permission-levels).
 
 Meka does not implement ACP's sub-agent sessions, an unstable [RFD](https://agentclientprotocol.com/rfds/subagents), so a sub-agent is one tool call, and its progress is that call's content. While it runs, each tool call it starts is appended to a rolling list (the last 20) and pushed as a `tool_call_update` on the parent's `agent_spawn` call, so a long delegated task shows what it is currently doing instead of an opaque spinner. A sub-agent started with `background: true` shows nothing there, its call having returned. The whole list is resent on each update because clients replace a tool call's content rather than appending to it. A nested sub-agent's list is not forwarded further up: it already appears as an `agent_spawn` line in its parent's list, and two writers on one tool call's content would overwrite each other.
 
@@ -305,6 +309,6 @@ This method is marked **unstable** in the protocol: it is not part of the spec y
 - **A reopened session's file diffs are code blocks.** A session reopened with `session/load` shows a file edit's change as a unified diff in a `diff` code block rather than the protocol's `diff`, which the live run sends: a result records its change as numbered hunks, not as the two texts the protocol's `diff` carries. The on-disk content is unaffected.
 - **Calls of one round under one id.** A provider that gives two calls of one round the same id, or none, has an approval prompt or a command's live output for either shown on the first one's card, and two such sub-agents' activity possibly on each other's; each result reaches its own.
 - **`terminal/*` is never used**: Meka owns every process it spawns, so no command runs in the client's terminal. Output streams into the tool call instead, as an agent-owned terminal where the client advertises `_meta.terminal_output` and a `console` block otherwise. See [Shell commands stay inside Meka](#shell-commands-stay-inside-meka).
-- **Image `file_read`**: stays local. The `fs/read_text_file` request carries only text, so there's no protocol surface to delegate it. A regex `file_read` fetches the whole document through the delegate and filters it locally.
+- **Image `file_read`**: stays local with `[acp].client_filesystem` on too. The `fs/read_text_file` request carries only text, so there's no protocol surface to delegate it. A regex `file_read` fetches the whole document through the delegate and filters it locally.
 - **`audio` prompts**: not supported; `audio` content blocks produce `InvalidParams`.
 - **No client-side model gate for images**: when `vision` is on, Meka forwards images to whatever model the profile names; a non-vision model returns a provider error rather than Meka refusing up front. Set `vision = false` for text-only endpoints.

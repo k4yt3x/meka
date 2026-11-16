@@ -120,6 +120,8 @@ pub(crate) struct AcpFrontend {
     /// `AcpFrontend` per session); not persisted.
     pub(super) sticky: crate::frontend::StickyApprovals,
     pub(super) client_state: SharedClientState,
+    /// `[acp].client_filesystem`: whether the file tools use the `fs/*` methods the client offers.
+    pub(super) client_filesystem: bool,
     /// Stdio-level "transport is dead" latch, shared across every per-session `AcpFrontend` in the
     /// process. When `send_notification` fails on any session, the latch is set so every other
     /// session's agent loop short-circuits on its next iteration instead of burning provider
@@ -196,6 +198,7 @@ pub(super) struct AcpClientLink {
     pub(super) connection: ConnectionTo<Client>,
     pub(super) session_id: SessionId,
     pub(super) client_state: SharedClientState,
+    pub(super) client_filesystem: bool,
     pub(super) transport_dead: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -379,6 +382,7 @@ impl AcpFrontend {
             connection,
             session_id,
             client_state,
+            client_filesystem,
             transport_dead,
         } = link;
         Self {
@@ -387,12 +391,23 @@ impl AcpFrontend {
             cwd,
             sticky: crate::frontend::StickyApprovals::default(),
             client_state,
+            client_filesystem,
             transport_dead,
             live_output: std::sync::Mutex::new(std::collections::HashMap::new()),
             prompted: std::sync::Mutex::new(std::collections::HashSet::new()),
             call_ids: std::sync::Mutex::new(CallIds::new(thread)),
             cancel,
             after_thought: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// The `fs/*` methods this session's file tools use: the ones the client advertised, or none
+    /// with `[acp].client_filesystem` off.
+    fn filesystem_in_use(&self) -> agent_client_protocol::v1::schema::FileSystemCapabilities {
+        if self.client_filesystem {
+            self.client_state.capabilities().fs
+        } else {
+            agent_client_protocol::v1::schema::FileSystemCapabilities::default()
         }
     }
 
@@ -1121,8 +1136,7 @@ impl Frontend for AcpFrontend {
         line: Option<u32>,
         limit: Option<u32>,
     ) -> Delegation<String> {
-        let caps = self.client_state.capabilities();
-        if !caps.fs.read_text_file {
+        if !self.filesystem_in_use().read_text_file {
             return Delegation::Local;
         }
         let connection = self.connection.clone();
@@ -1175,7 +1189,7 @@ impl Frontend for AcpFrontend {
     }
 
     fn accepts_fs_writes(&self) -> bool {
-        self.client_state.capabilities().fs.write_text_file
+        self.filesystem_in_use().write_text_file
     }
 
     async fn handle_elicitation(

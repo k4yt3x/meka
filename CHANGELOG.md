@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The session feed carries `schedule.fired`.
 - On the screen, a click in the composer puts the cursor where it landed.
 - A composer with more rows than it shows marks its place with a thumb, and the wheel scrolls it.
+- `[acp].client_filesystem = true` has `meka acp` read and write files through the editor.
 
 ### Changed
 
@@ -34,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `meka skill get --format json` and `show --format json` print the description as the file has it.
 - **Breaking:** `tool_call.completed` gives a large result as history does; see the upgrade guide.
 - An ACP `tool_call_update` no longer carries a large result whole; see the upgrade guide.
+- **Breaking:** `meka acp` reads and writes files on disk by default; see the upgrade guide.
 - MCP tools follow the built-in ones in a request, sorted by name, whichever server answers first.
 - On the screen, a large result that did not stream shows its opening, as a resumed session does.
 - After the screen's `/resume`, the context gauge shows the session's own last measurement.
