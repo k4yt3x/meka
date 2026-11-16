@@ -7,65 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.95.0] - 2026-11-16
+
 ### Added
 
 - The screen and `meka acp` open a turn when a session's inbox has an item waiting.
 - The screen and an editor say when a failed inbox item will be tried again, or was given up.
-- `GET /v1/sessions/{id}/inbox` lists a waiting fire with its `schedule_id` and `occurrences`.
-- The session feed carries `schedule.fired`.
-- On the screen, a click in the composer puts the cursor where it landed.
-- A composer with more rows than it shows marks its place with a thumb, and the wheel scrolls it.
-- `[acp].client_filesystem = true` has `meka acp` read and write files through the editor.
+- An editor shows what each finished background task returned, on a card a reopened session keeps.
+- In the composer, a click places the cursor, and a tall draft scrolls with the wheel.
+- The session feed carries `schedule.fired`, and the inbox listing shows a waiting fire.
 
 ### Changed
 
-- **Breaking:** An import takes this installation's level and approvals; see the upgrade guide.
-- **Breaking:** An import leaves out an archive's directory that is not a directory here.
-- `meka --permission <level> session import` brings an archive's sessions in at that level.
-- **Breaking:** A gate on an MCP tool sees repeated structured content once; see the upgrade guide.
-- `file_search` skips a file it finds a NUL byte in, and says how many it skipped.
-- A fire's gate output and a background report's task output are quoted with `> `.
-- A schedule's gate output has terminal control characters removed.
-- An MCP image in a format providers do not take, such as BMP or TIFF, arrives converted to PNG.
-- On Unix a `!command` has no terminal, so one that asks for a password fails at once.
-- A shell gate whose command exits while something it started holds its output answers 2 s later.
-- A `PATCH /v1/sessions/{id}` naming a level, approvals or directory refuses a bad body first.
-- Session archives are `format_version` 30; older archives are brought forward on import.
-- A memory export lists tags and references one per line and quotes only what YAML requires.
-- `meka skill get --format json` and `show --format json` print the description as the file has it.
-- **Breaking:** `tool_call.completed` gives a large result as history does; see the upgrade guide.
-- An ACP `tool_call_update` no longer carries a large result whole; see the upgrade guide.
-- **Breaking:** `meka acp` reads and writes files on disk by default; see the upgrade guide.
-- MCP tools follow the built-in ones in a request, sorted by name, whichever server answers first.
-- On the screen, a large result that did not stream shows its opening, as a resumed session does.
-- After the screen's `/resume`, the context gauge shows the session's own last measurement.
-- **Breaking:** A misspelled `MEKA_PERMISSION` or `MEKA_SANDBOX_BACKEND` stops the run at startup.
-- **Breaking:** A start level outside `[permissions].enabled` is refused; see the upgrade guide.
-- With `--permission` given, `MEKA_PERMISSION` is not read, so a misspelled one stops nothing.
-- `MEKA_PERMISSION` is read trimmed, and an empty one is unset without a warning.
-- The `scratchpad_*` and `checklist_*` tools and `context_replace` ignore a `scratchpad` argument.
 - **Breaking:** Scheduled jobs are schedules: `/v1/jobs` is `/v1/schedules`; see the upgrade guide.
 - **Breaking:** A schedule's `schedule` field is `timing`, and every `job_id` is `schedule_id`.
-- **Breaking:** `[schedule].max_jobs` is `max_schedules`; the old key is refused by name.
 - **Breaking:** `meka schedule list --format json` prints `schedules`; its table says "Timing".
-- Meka says "schedule" for a scheduled job in its tools, its context block, messages and help.
+- **Breaking:** `[schedule].max_jobs` is `max_schedules`; the old key is refused by name.
 - **Breaking:** A schedule fires when due, mid-turn or not; its fire waits in the session's inbox.
+- **Breaking:** `schedule.fired` is sent when a fire is queued, names its item and has no `status`.
+- **Breaking:** `turn.started` names `item_ids` and `schedule_ids` for a turn opened on fires.
+- **Breaking:** `meka acp` reads and writes files on disk unless `[acp].client_filesystem = true`.
+- **Breaking:** ACP sends a background report as tool calls, not a notice; see the upgrade guide.
+- **Breaking:** `tool_call.completed`, and ACP's call updates, give a large result as history does.
+- **Breaking:** A start level outside `[permissions].enabled` is refused; see the upgrade guide.
+- **Breaking:** A misspelled `MEKA_PERMISSION` or `MEKA_SANDBOX_BACKEND` stops the run at startup.
+- **Breaking:** An import takes this installation's level and approvals, or `--permission`'s level.
+- **Breaking:** An import leaves out an archive's directory that is not a directory here.
+- **Breaking:** A gate on an MCP tool sees repeated structured content once; see the upgrade guide.
 - A running turn reads a fire at its next pause; an idle session gets a turn for it at once.
 - A schedule has one waiting fire: a later occurrence joins it, and it says how many it stands for.
-- **Breaking:** `schedule.fired` is sent when a fire is queued, and names its inbox item.
-- **Breaking:** `schedule.fired` has no `status`; see the upgrade guide.
-- **Breaking:** `turn.started` names `item_ids` and `schedule_ids` for a turn opened on fires.
-- An inbox turn opens on the items `turn.started` names; later ones wait for a pause or its end.
-- A turn opened on a fire posts `turn.finished` or `turn.failed` to webhooks.
 - A fire whose turn fails in a way waiting can change is tried again, as an inbox item is.
 - After a restart, `meka serve` no longer reruns a fire whose turn the model had begun to answer.
-- A host killed during a fire's turn no longer fires it again; the session's next turn reads it.
 - Canceling a schedule withdraws its unread fires; a server that cancels it says `inbox.withdrawn`.
-- `meka serve` leaves the inbox of a session another process holds to that process.
-- On the screen, a steer typed too late for its turn is answered as soon as that turn ends.
-- On the screen, a blank row sits between the `Thinking` or `Summary` label and what is under it.
+- A turn opened on a fire posts `turn.finished` or `turn.failed` to webhooks.
 - In the composer, Up and Down move by rows as drawn; recall starts from the first or last row.
-- A recalled prompt left as it came is walked past with one Up or Down, whatever its length.
+- On the screen, a steer typed too late for its turn is answered as soon as that turn ends.
+- On Unix a `!command` has no terminal, so one that asks for a password fails at once.
+- `file_search` skips a file it finds a NUL byte in, and says how many it skipped.
+- An MCP image in a format providers do not take, such as BMP or TIFF, arrives converted to PNG.
+- MCP tools follow the built-in ones in a request, sorted by name, whichever server answers first.
+- Session archives are `format_version` 30; older archives are brought forward on import.
 
 ### Removed
 
@@ -73,86 +54,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- The approval prompt scrolls long arguments with PgUp, PgDn, Ctrl+Home, Ctrl+End and the wheel.
-- A panel's footer names the keys that scroll it and counts the rows above as well as below.
-- An approval prompt with tens of thousands of rows of arguments is drawn instead of left blank.
-- An MCP server's question keeps its name in view and scrolls a message longer than its rows.
-- A URL an MCP server asks to have opened shows ahead of its message, which can no longer hide it.
-- An MCP server's URL that is not `http` or `https` is refused, in a question and in a login.
-- A URL an MCP server asks to have opened is shown and opened in its parsed form.
-- Opening a server's URL in the browser no longer holds up the screen until the browser starts.
-- A sub-agent's approval prompt names the sub-agent on the screen and in ACP clients.
-- An MCP server's question reaches an ACP editor under the server's name.
+- The approval prompt and an MCP server's question scroll what is longer than their rows.
+- An approval prompt names the sub-agent asking, and a question its MCP server, in an editor too.
+- An MCP server's URL shows ahead of its message, and one that is not `http` or `https` is refused.
 - A reply that nests thousands of quotes or lists no longer crashes the screen.
 - A command's live output goes on past a byte that is not UTF-8.
-- Command output with a code fence in it stays inside its block in an ACP editor.
-- An HTTP import refusing an unknown profile or project names the route that adds it.
-- An MCP tool call cut off before its answer fails saying it may have run; it is not sent again.
-- An MCP server whose tool listing fails on connect shows as failed until a retry lists its tools.
-- A required MCP server whose tools cannot be listed refuses turns until they can be.
-- An MCP server with no tools no longer warns that its tool listing failed.
-- The first MCP tool listing after a connect honors an `[mcp].connect_timeout` above 30 seconds.
-- MCP results that repeat their structured content as text reach the model once.
-- An MCP image that does not decode is replaced by a note instead of breaking later requests.
-- An MCP `headers_helper` that leaves a process holding its output no longer hangs the connect.
-- `file_search` skips a file with a line over 16 MiB instead of reading the line into memory.
-- `file_search` stops at its 60-second budget, or when interrupted, inside one large file too.
-- `file_find` answers at its 60-second budget with what it found, even when few paths match.
-- A schedule gate that times out or prints past its limit stops every process it started.
-- The screen's `!command` shows what it printed when something it started keeps its output open.
-- A one-shot run sent SIGTERM or SIGHUP stops its command, saves its turn and prints its answer.
-- A write over HTTP runs to its end when its client hangs up; `POST /turns` keeps its own rule.
-- A background outcome is no longer lost when the client of the turn it rides hangs up.
-- `meka serve` waits on shutdown for a write whose client hung up before it ended.
-- A session whose load was cut short no longer answers `session-locked` until a restart.
-- A refused `PATCH /v1/sessions/{id}` no longer loads the session and holds its lock.
-- `session.created` and `session.updated` carry the record `GET /v1/sessions/{id}` answers.
-- A rename that moves a running sub-agent no longer announces it as idle.
-- Building or moving a session over HTTP answers each refusal with its own status, not a 500.
-- An account with no stored credential answers 422 naming `POST /v1/accounts/{name}/login`.
-- A subscription login that must be redone answers HTTP 422 naming its login route, not a 502.
-- Over ACP, a subscription login that must be redone is an `InvalidParams` naming the command.
-- A turn or compaction that failed on a login to redo names the login wherever it is read back.
-- A schedule whose session or profile cannot be loaded is not parked; its fire waits in the inbox.
-- A fire cut short before a reply waits, as `meka acp` exits or the screen is signaled or cut off.
-- `/exit` during the screen's scheduled turn no longer starts a turn for a finished task.
-- The screen sent SIGTERM or SIGHUP starts no further scheduled or background-outcome turn.
-- `meka schedule cancel` cancels a schedule this build cannot read, as its warning says.
-- A refused store upgrade no longer leaves a new copy of the store on every retry.
-- A compaction on `openai-chat-completions` streams when the session's turns do.
-- A Chat Completions reply that is not a completion is reported with what the endpoint sent.
-- An error inside a Chat Completions or Responses stream shows the whole error object sent.
-- Past 100 images, a Claude request redacts down to 80, so later rounds keep the cached prefix.
-- Claude subscription requests name their conversation's session; a sub-agent's names its root's.
-- A subscription's usage, profile and statistics reads are abandoned after 30 seconds.
-- A memory export whose values hold commas or brackets, or read as YAML numbers, imports back.
-- A memory export keeps a control character in a description or a source.
-- `memory_write` clears `source` when given `""`, as its schema says.
-- `GET /v1/skills/{name}` returns the description as the file has it, not a stripped copy.
-- The screen's `/resume` and `/fork` are refused while a background task runs, keeping its report.
-- The screen's `/resume` runs the session under its own directory's `[instructions].files`.
-- After the screen's `/resume`, the context block no longer counts the last session's compactions.
-- A schedule whose session is mid-turn no longer holds back other sessions' schedules.
-- An inbox turn whose items were all withdrawn as it opened no longer shows as a failed turn.
-- `meka serve` no longer keeps every event of a running turn in memory until the turn ends.
-- An MCP server listing its tools again keeps their place, so a reconnect keeps the prompt cache.
-- A server's deferred tools no longer reach one request undeferred while its listing is applied.
-- Spawning or following up a sub-agent no longer asks every connected MCP server for its tools.
-- A compaction's checkpoint saves a call's output to the entry its `scratchpad` argument names.
-- Stopping a turn ends an automatic compaction's summary request instead of waiting it out.
-- A Claude subscription request after a rewind that removed every reply names no previous one.
-- A one-shot run interrupted with Ctrl+C while waiting for background tasks exits 130.
-- Bubblewrap commands run where a masked directory, such as `$XDG_RUNTIME_DIR`, does not exist.
-- A write that meets another Meka process mid-write waits up to 5 seconds, not failing at once.
-- A session title taken from a long first prompt is at most 200 characters and can be set back.
-- A retention window is said in whole units wherever it shows, such as "90 days" or "6 months".
-- `scratchpad_write` with `scratchpad` keeps what it wrote; a checklist call returns its list.
-- On the screen, a followup still held when a hangup or a SIGTERM ends Meka is not sent.
-- A Ctrl+C or SIGTERM while `/mcp <server>:<prompt>` fetches its prompt stops the turn it opens.
-- After `/resume` or a pick in `meka -r`, a background report on the first page names its task.
-- An MCP form's answer to an integer field reaches the server as an integer, not a float.
 - On the screen, a lit block goes dark when the mouse rests 3 s or the terminal loses focus.
 - A recalled prompt changed by a new line, a completion or a search is no longer lost to Up.
+- The screen's `/resume` gives the session its own instructions files, gauge and compaction count.
+- The screen's `/resume` and `/fork` are refused while a background task runs, keeping its report.
+- The screen starts no further turn once it is told to leave, by `/exit` or a signal.
+- Command output with a code fence in it stays inside its block in an ACP editor.
+- Over HTTP, an account with no credential or a login to redo answers 422 naming its login route.
+- Over ACP, a subscription login that must be redone is an `InvalidParams` naming the command.
+- Building or moving a session over HTTP answers each refusal with its own status, not a 500.
+- A write over HTTP other than `POST /turns` runs to its end when its client hangs up.
+- A session load cut short or a refused session `PATCH` no longer leaves the session locked.
+- `session.created` and `session.updated` carry the record `GET /v1/sessions/{id}` answers.
+- `meka serve` no longer keeps every event of a running turn in memory until the turn ends.
+- A schedule whose session is mid-turn no longer holds back other sessions' schedules.
+- A schedule gate that times out or prints past its limit stops every process it started.
+- A `!command`, shell gate or MCP `headers_helper` answers when a child still holds its output.
+- An MCP tool call cut off before its answer fails saying it may have run; it is not sent again.
+- An MCP server whose tools cannot be listed shows as failed, and a required one refuses turns.
+- MCP results that repeat their structured content as text reach the model once.
+- An MCP image that does not decode is replaced by a note instead of breaking later requests.
+- An MCP server listing its tools again keeps their place, so a reconnect keeps the prompt cache.
+- `file_search` and `file_find` stop at their 60-second budget, inside one large file too.
+- `file_search` skips a file with a line over 16 MiB instead of reading the line into memory.
+- A memory export whose values hold commas or brackets, or read as YAML numbers, imports back.
+- A compaction on `openai-chat-completions` streams when the session's turns do.
+- A Chat Completions reply that is not a completion, or an error inside a stream, is shown as sent.
+- Past 100 images, a Claude request redacts down to 80, so later rounds keep the cached prefix.
+- A subscription's usage, profile and statistics reads are abandoned after 30 seconds.
+- Stopping a turn ends an automatic compaction's summary request instead of waiting it out.
+- A one-shot run sent SIGTERM or SIGHUP stops its command, saves its turn and prints its answer.
+- Bubblewrap commands run where a masked directory, such as `$XDG_RUNTIME_DIR`, does not exist.
+- A write that meets another Meka process mid-write waits up to 5 seconds, not failing at once.
+- A refused store upgrade no longer leaves a new copy of the store on every retry.
 
 ## [0.94.0] - 2026-11-12
 
@@ -3450,7 +3389,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.94.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.95.0...HEAD
+[0.95.0]: https://github.com/k4yt3x/meka/compare/0.94.0...0.95.0
 [0.94.0]: https://github.com/k4yt3x/meka/compare/0.93.0...0.94.0
 [0.93.0]: https://github.com/k4yt3x/meka/compare/0.92.0...0.93.0
 [0.92.0]: https://github.com/k4yt3x/meka/compare/0.91.0...0.92.0

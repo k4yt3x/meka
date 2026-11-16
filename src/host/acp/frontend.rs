@@ -174,8 +174,8 @@ pub(super) const META_COMPACTION: &str = "compaction";
 /// The title of the card a running compaction is for a client without the protocol's compaction
 /// entry: the screen's words for the same moment.
 const COMPACTION_CARD_TITLE: &str = "Compacting the conversation";
-/// The `_meta` key under which the notice for a background report carries the tasks that reported,
-/// each as the HTTP API's task object.
+/// The `_meta` key under which the card for a reported background task carries the task, as the
+/// HTTP API's task object.
 pub(super) const META_BACKGROUND: &str = "background";
 /// Build the `_meta` map for one agent-owned-terminal frame.
 ///
@@ -894,9 +894,13 @@ impl Frontend for AcpFrontend {
             }
             // The protocol has no place for the level a turn opened under.
             FrontendEvent::TurnOpened { .. } => return,
-            // What reported is said as the screen says it; the report is the model's to read.
+            // What reported is said as the screen says it, on a card for each task; the report
+            // is the model's to read.
             FrontendEvent::BackgroundReported { tasks, .. } => {
-                background_report_update(&tasks, self.client_state.renders_notices())
+                for task in &tasks {
+                    self.send_update(SessionUpdate::ToolCall(background_report_call(task)));
+                }
+                return;
             }
             // Inbox items added behind a round, a nudge or a cut prompt, a fire among them: the
             // editor did not type them, so they are shown as the user turn they are, as an
@@ -921,11 +925,12 @@ impl Frontend for AcpFrontend {
             } => {
                 for block in &message.content {
                     let text = match block {
-                        crate::conversation::ContentBlock::BackgroundReport { .. } => {
-                            self.send_update(background_report_update(
-                                &outcomes,
-                                self.client_state.renders_notices(),
-                            ));
+                        crate::conversation::ContentBlock::BackgroundReport {
+                            task_ids, ..
+                        } => {
+                            for call in background_report_calls(&outcomes, task_ids) {
+                                self.send_update(SessionUpdate::ToolCall(call));
+                            }
                             continue;
                         }
                         crate::conversation::ContentBlock::Scheduled { text, .. }
@@ -1317,53 +1322,73 @@ pub(super) fn notice_update(
         agent_client_protocol::v1::schema::TextContent::new(text),
     )))
 }
-/// The update that says what reported, in the screen's words. A `notice` when the client renders
-/// one: the stage direction as its title, the tasks' labels as its description, and the tasks
-/// themselves under `_meta.background`, so a client that wants the outcome has it without the
-/// transcript carrying it. Otherwise the direction as a stage-direction chunk, as a nudge is said
-/// and as a replay says it. The report the model read stays out of the transcript either way, as
-/// every tool's output does.
-pub(super) fn background_report_update(
-    tasks: &[crate::store::background::BackgroundTask],
-    client_renders_notices: bool,
-) -> SessionUpdate {
-    let direction = crate::background::report_direction(tasks);
-    if !client_renders_notices {
-        return notice_update(
-            &crate::frontend::Notice::stage_direction(
-                crate::frontend::NoticeLevel::Info,
-                direction,
-            ),
-            false,
-        );
+/// One reported background task as a finished tool call: the screen's stage direction as its
+/// title, what was started and then what it returned as its content, and the task itself under
+/// `_meta.background`. A card rather than a `notice`, which the protocol keeps for what is neither
+/// a task's completion nor session history: a report is both, and the replay sends the same card.
+/// A card has no canceled status, so a task that did not complete closes as failed and its title
+/// says how it ended. The report the model read stays out of the transcript.
+///
+/// What was started is said in the words its own call was titled with, cut to the task's label. A
+/// command and its output are console blocks, since an editor renders a text block as markdown,
+/// which a command line is not.
+pub(super) fn background_report_call(task: &crate::store::background::BackgroundTask) -> ToolCall {
+    let is_command = tool_kind_for(&task.tool) == ToolKind::Execute;
+    let label = crate::background::shown_label(task);
+    let mut content = vec![if is_command {
+        console_content_block(&label)
+    } else {
+        text_content_block(tool_call_title(&task.tool, Some(&label)))
+    }];
+    let outcome = task
+        .outcome
+        .as_deref()
+        .map(crate::text::sanitize_text)
+        .filter(|outcome| !outcome.trim().is_empty());
+    if let Some(outcome) = outcome {
+        content.push(if is_command {
+            console_content_block(&outcome)
+        } else {
+            text_content_block(outcome)
+        });
     }
-    let description = match tasks {
-        [task] => crate::background::shown_label(task),
-        _ => tasks
-            .iter()
-            .map(|task| {
-                format!(
-                    "{} {}",
-                    task.short_id(),
-                    crate::background::shown_label(task)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
+    let status = if task.status == crate::store::background::TaskStatus::Completed {
+        ToolCallStatus::Completed
+    } else {
+        ToolCallStatus::Failed
     };
-    let views: Vec<crate::view::BackgroundTaskView> = tasks
-        .iter()
-        .cloned()
-        .map(crate::view::BackgroundTaskView::from)
-        .collect();
-    SessionUpdate::Notice(
-        agent_client_protocol::v1::schema::Notice::new(NoticeSeverity::Info, direction)
-            .description(description)
-            .meta(terminal_meta(
-                META_BACKGROUND,
-                serde_json::json!({ "tasks": views }),
-            )),
+    ToolCall::new(
+        format!("background/{}", task.id),
+        crate::background::report_direction(std::slice::from_ref(task)),
     )
+    .kind(ToolKind::Other)
+    .status(status)
+    .content(content)
+    .meta(terminal_meta(
+        META_BACKGROUND,
+        serde_json::json!({ "task": crate::view::BackgroundTaskView::from(task.clone()) }),
+    ))
+}
+
+/// The cards a report block is: one for each task `task_ids` names among `known`, or a bare one
+/// when the store holds none of them, which is all that is left to say of a report whose rows are
+/// gone.
+pub(super) fn background_report_calls(
+    known: &[crate::store::background::BackgroundTask],
+    task_ids: &[String],
+) -> Vec<ToolCall> {
+    let tasks = crate::background::reported_tasks(known, task_ids);
+    if tasks.is_empty() {
+        return vec![
+            ToolCall::new(
+                format!("background/{}", task_ids.join("+")),
+                crate::background::replayed_report_direction(known, task_ids),
+            )
+            .kind(ToolKind::Other)
+            .status(ToolCallStatus::Completed),
+        ];
+    }
+    tasks.iter().map(background_report_call).collect()
 }
 /// Every argument of a call awaiting approval, as a fenced block for the prompt's content.
 ///
@@ -2087,8 +2112,8 @@ pub(super) fn checkpoint_call(
 /// full history into its UI.
 ///
 /// A user turn's context block is not replayed, so the client sees only what the user typed. A
-/// background report is said as the stage direction the live run showed, from the session's task
-/// rows in `tasks`, never as the words the model read.
+/// background report is the cards the live run showed, from the session's task rows in `tasks`,
+/// never the words the model read.
 ///
 /// Tool calls track open `tool_use_id`s; any tool that never received a matching `ToolResult` (e.g.
 /// a crashed turn) is closed out with a `failed` `tool_call_update` so the client doesn't render a
@@ -2191,22 +2216,16 @@ pub(super) fn replay_session_updates(
                                 );
                             }
                         }
-                        // What reported, as the live run said it: a stage direction in the
-                        // transcript rather than a notice, which is a live event and not history.
+                        // What reported, as the live run said it: the same cards, from the
+                        // task rows.
                         MekaContentBlock::BackgroundReport { task_ids, .. } => {
-                            send_session_update(
-                                connection,
-                                session_id,
-                                notice_update(
-                                    &crate::frontend::Notice::stage_direction(
-                                        crate::frontend::NoticeLevel::Info,
-                                        crate::background::replayed_report_direction(
-                                            tasks, task_ids,
-                                        ),
-                                    ),
-                                    false,
-                                ),
-                            );
+                            for call in background_report_calls(tasks, task_ids) {
+                                send_session_update(
+                                    connection,
+                                    session_id,
+                                    SessionUpdate::ToolCall(call),
+                                );
+                            }
                         }
                         // A skill by the command an editor invokes it with; an MCP prompt, which
                         // an editor has no command for, by the stage direction the screen says.

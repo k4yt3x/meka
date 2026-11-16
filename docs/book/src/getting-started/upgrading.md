@@ -169,6 +169,15 @@ client_filesystem = true
 and restart the agent in the editor. A client that counted on receiving `fs/*` requests receives
 none without the key. See [`[acp]`](../configuration/config-file.md#acp).
 
+**An ACP editor is shown a background report as tool calls.** A client that advertised
+`session.notices` used to get one `notice` per report, its tasks under `_meta.background.tasks`, and
+any other client a parenthesized line in the reply, which is also what a reopened session showed.
+Now every client gets one `tool_call` per task where the report landed, live and on `session/load`:
+already closed, `completed` or `failed`, titled with the same words (`Background task 7f3a1c22
+finished after 12m 4s`), holding what was started and what the task returned, with the task under
+`_meta.background.task` and the id `background/<task id>`. A client that read the notice reads the
+card instead; one that draws tool calls needs nothing. An advisory is still a `notice`.
+
 ## 0.93 to 0.94
 
 The store moves forward on its first open, behind the automatic backup, so that a turn that fails

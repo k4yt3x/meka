@@ -328,11 +328,11 @@ pub(crate) fn shown_label(task: &BackgroundTask) -> String {
     elide(&crate::text::sanitize_text(&task.label), LABEL_MAX_CHARS)
 }
 
-/// The stage direction for a replayed report: the tasks `task_ids` name among `known`, said as
-/// the live run said them. A converted row names a task by its short id, so a prefix matches; a
-/// task the store no longer holds leaves the direction bare.
-pub(crate) fn replayed_report_direction(known: &[BackgroundTask], task_ids: &[String]) -> String {
-    let tasks: Vec<BackgroundTask> = task_ids
+/// The tasks a report's `task_ids` name among `known`, in the report's order. A converted row
+/// names a task by its short id, so a prefix matches; a task the store no longer holds is left
+/// out.
+pub(crate) fn reported_tasks(known: &[BackgroundTask], task_ids: &[String]) -> Vec<BackgroundTask> {
+    task_ids
         .iter()
         .filter_map(|id| {
             known
@@ -340,7 +340,13 @@ pub(crate) fn replayed_report_direction(known: &[BackgroundTask], task_ids: &[St
                 .find(|task| task.id.starts_with(id.as_str()))
                 .cloned()
         })
-        .collect();
+        .collect()
+}
+
+/// The stage direction for a replayed report: the tasks [`reported_tasks`] finds, said as the
+/// live run said them, or a bare direction when the store holds none of them.
+pub(crate) fn replayed_report_direction(known: &[BackgroundTask], task_ids: &[String]) -> String {
+    let tasks = reported_tasks(known, task_ids);
     if tasks.is_empty() {
         "Background task report".to_string()
     } else {

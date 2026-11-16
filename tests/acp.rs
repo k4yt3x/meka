@@ -9061,19 +9061,85 @@ enabled = true
 /// A terminal, undelivered, unannounced task on `session_id`: exactly what `/task cancel` leaves
 /// behind, seeded straight into the store rather than run for real.
 fn seed_canceled_task(harness: &AcpTestHarness, session_id: &str) {
-    let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
+    seed_task(
+        &harness.database(),
+        session_id,
+        "shell_execute",
+        "sleep 900",
+        "canceled",
+        None,
+    );
+}
+
+/// A terminal, undelivered, unannounced task of `tool` on `session_id`, seeded straight into the
+/// store at `database` rather than run for real.
+fn seed_task(
+    database: &Path,
+    session_id: &str,
+    tool: &str,
+    label: &str,
+    status: &str,
+    outcome: Option<&str>,
+) {
+    let connection = rusqlite::Connection::open(database).expect("open the store");
     connection
         .execute(
             "INSERT INTO background_tasks \
              (id, session_id, tool, label, status, outcome, started_at, finished_at) \
-             VALUES (?1, ?2, 'shell_execute', 'sleep 900', 'canceled', NULL, ?3, ?3)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
             rusqlite::params![
                 uuid::Uuid::new_v4().to_string(),
                 session_id,
+                tool,
+                label,
+                status,
+                outcome,
                 chrono::Utc::now().to_rfc3339(),
             ],
         )
-        .expect("seed the canceled task");
+        .expect("seed the task");
+}
+
+/// The cards among `updates` that say a background task reported.
+fn report_cards(updates: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    updates
+        .iter()
+        .filter(|update| {
+            update["sessionUpdate"] == "tool_call"
+                && update["toolCallId"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("background/"))
+        })
+        .cloned()
+        .collect()
+}
+
+/// `card` without the two stamps a delivery writes to the task's row once the live card is sent.
+fn without_delivery_stamps(card: &serde_json::Value) -> serde_json::Value {
+    let mut card = card.clone();
+    if let Some(task) = card
+        .pointer_mut("/_meta/background/task")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        task.remove("announced_at");
+        task.remove("delivered_at");
+    }
+    card
+}
+
+/// The text of each block of `card`'s content.
+fn card_texts(card: &serde_json::Value) -> Vec<String> {
+    card["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|block| {
+            block["content"]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
 }
 
 /// The `session/update` payloads among `lines` of the kind `kind`.
@@ -9087,8 +9153,8 @@ fn updates_of_kind(lines: &[String], kind: &str) -> Vec<serde_json::Value> {
 }
 
 /// A canceled task rides the editor's next prompt, in ACP as it does in `meka serve`, and the
-/// editor is told what reported in the screen's words: live as a stage direction, since this
-/// client renders no notice, and again on a replay. The report the model read is shown nowhere.
+/// editor is told what reported in the screen's words: live as a card, and as the same card on a
+/// replay. The report the model read is shown nowhere.
 ///
 /// ACP has no other test for the background-outcome path, so every guard in it -- the poller's
 /// `wakes_a_host` branch, this fold, the `PromptRetention` it runs under -- could be deleted with
@@ -9129,20 +9195,26 @@ fn a_canceled_task_rides_the_editors_next_prompt() {
         "neither the report nor the editor's own words are shown as a user turn; transcript:\n{}",
         lines.join("")
     );
-    let directions: Vec<String> = updates_of_kind(&lines, "agent_message_chunk")
-        .iter()
-        .filter_map(|update| update["content"]["text"].as_str().map(str::to_string))
-        .filter(|text| text.contains("Background task"))
-        .collect();
+    let cards = report_cards(&updates_of_kind(&lines, "tool_call"));
     assert_eq!(
-        directions.len(),
+        cards.len(),
         1,
-        "what reported is said once, as a stage direction; transcript:\n{}",
+        "what reported is said once, as a card; transcript:\n{}",
         lines.join("")
     );
+    let title = cards[0]["title"].as_str().unwrap_or_default();
     assert!(
-        directions[0].contains("(Background task") && directions[0].contains("was canceled"),
-        "in the screen's words: {directions:?}"
+        title.starts_with("Background task ") && title.contains("was canceled"),
+        "in the screen's words: {cards:?}"
+    );
+    assert!(
+        !updates_of_kind(&lines, "agent_message_chunk")
+            .iter()
+            .any(|update| update["content"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Background task"))),
+        "and not among the reply's words; transcript:\n{}",
+        lines.join("")
     );
     assert!(
         !lines.iter().any(|line| line.contains("[Background task")),
@@ -9150,7 +9222,7 @@ fn a_canceled_task_rides_the_editors_next_prompt() {
         lines.join("")
     );
 
-    // The replay says the same direction where the report landed, from the task rows.
+    // The replay sends the same card where the report landed, from the task rows.
     harness.close_session(&session_id);
     let cwd = harness.work_dir();
     let id = harness.send_request(
@@ -9159,21 +9231,16 @@ fn a_canceled_task_rides_the_editors_next_prompt() {
     );
     let (updates, response) = harness.collect_updates(&session_id, id);
     assert!(response["result"].is_object(), "{response}");
-    let replayed: Vec<&serde_json::Value> = updates
+    let replayed: Vec<serde_json::Value> = updates
         .iter()
-        .map(|value| &value["params"]["update"])
-        .filter(|update| {
-            update["content"]["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("Background task"))
-        })
+        .map(|value| value["params"]["update"].clone())
         .collect();
+    let replayed = report_cards(&replayed);
     assert_eq!(replayed.len(), 1, "updates:\n{updates:#?}");
-    assert_eq!(replayed[0]["sessionUpdate"], "agent_message_chunk");
     assert_eq!(
-        replayed[0]["content"]["text"].as_str().unwrap_or_default(),
-        directions[0],
-        "live and replayed, one wording"
+        without_delivery_stamps(&replayed[0]),
+        without_delivery_stamps(&cards[0]),
+        "live and replayed, one card"
     );
 
     let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
@@ -9207,11 +9274,11 @@ fn a_canceled_task_rides_the_editors_next_prompt() {
     );
 }
 
-/// A client that advertised `session.notices` is told what reported as a `notice`: the stage
-/// direction as its title, the task's label as its description, and the task itself under
-/// `_meta.background`, so the outcome is in the client's hands without the transcript carrying it.
+/// A report is a card to a client that advertised `session.notices` too, and never a `notice`:
+/// the stage direction as its title, what was started as its content, and the task itself under
+/// `_meta.background`. A task that did not complete closes its card as failed.
 #[test]
-fn a_background_report_is_a_notice_to_a_client_that_renders_one() {
+fn a_background_report_is_a_card_and_never_a_notice() {
     let script = serde_json::json!([[
         { "type": "text", "text": "answered" },
         { "type": "message_end", "stop_reason": "end_turn" }
@@ -9228,33 +9295,257 @@ fn a_background_report_is_a_notice_to_a_client_that_renders_one() {
     let (updates, response) = harness.collect_updates(&session_id, id);
     assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
 
-    let notices: Vec<&serde_json::Value> = updates
+    let updates: Vec<serde_json::Value> = updates
         .iter()
-        .map(|value| &value["params"]["update"])
-        .filter(|update| update["sessionUpdate"] == "notice")
+        .map(|value| value["params"]["update"].clone())
         .collect();
-    assert_eq!(notices.len(), 1, "updates:\n{updates:#?}");
-    let notice = notices[0];
-    assert_eq!(notice["severity"], "info");
-    let title = notice["title"].as_str().unwrap_or_default();
+    assert!(
+        !updates
+            .iter()
+            .any(|update| update["sessionUpdate"] == "notice"),
+        "a report is no notice: {updates:#?}"
+    );
+    let cards = report_cards(&updates);
+    assert_eq!(cards.len(), 1, "updates:\n{updates:#?}");
+    let card = &cards[0];
+    let title = card["title"].as_str().unwrap_or_default();
     assert!(
         title.starts_with("Background task ") && title.contains("was canceled"),
-        "the title is the screen's direction: {notice}"
+        "the title is the screen's direction: {card}"
     );
-    assert_eq!(notice["description"], "sleep 900", "{notice}");
-    let task = &notice["_meta"]["background"]["tasks"][0];
-    assert_eq!(task["status"], "canceled", "{notice}");
-    assert_eq!(task["label"], "sleep 900", "{notice}");
-    assert_eq!(task["tool"], "shell_execute", "{notice}");
+    assert_eq!(
+        card["status"], "failed",
+        "a card has no canceled status: {card}"
+    );
+    assert_eq!(
+        card_texts(card),
+        ["```console\nsleep 900\n```"],
+        "what was started, and no outcome where the task left none: {card}"
+    );
+    let task = &card["_meta"]["background"]["task"];
+    assert_eq!(task["status"], "canceled", "{card}");
+    assert_eq!(task["label"], "sleep 900", "{card}");
+    assert_eq!(task["tool"], "shell_execute", "{card}");
     assert!(
-        !updates.iter().any(|value| {
-            let update = &value["params"]["update"];
+        !updates.iter().any(|update| {
             update["sessionUpdate"] == "user_message_chunk"
                 || update["content"]["text"]
                     .as_str()
                     .is_some_and(|text| text.contains("Background task"))
         }),
-        "the notice replaces every chunk: {updates:#?}"
+        "the card replaces every chunk: {updates:#?}"
+    );
+}
+
+/// Each task of a report has a card of its own, closed as the task ended and holding what the
+/// task returned: a command's output as a console block, any other tool's as its text. A replay
+/// after the store let the task rows go has one bare card to say a report landed there.
+#[test]
+fn a_report_card_holds_what_each_task_returned() {
+    let script = serde_json::json!([[
+        { "type": "text", "text": "answered" },
+        { "type": "message_end", "stop_reason": "end_turn" }
+    ]]);
+    let mut harness = AcpTestHarness::spawn(ACP_BACKGROUND_CONFIG, Some(script));
+    let session_id = harness.new_session();
+    let database = harness.database();
+    seed_task(
+        &database,
+        &session_id,
+        "agent_spawn",
+        "summarize the log",
+        "completed",
+        Some("# Findings\n\nAll **good**."),
+    );
+    seed_task(
+        &database,
+        &session_id,
+        "shell_execute",
+        "make check",
+        "failed",
+        Some("error: boom\n\nExit code: 2"),
+    );
+
+    let id = harness.prompt(&session_id, "carry on");
+    let (updates, response) = harness.collect_updates(&session_id, id);
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    let updates: Vec<serde_json::Value> = updates
+        .iter()
+        .map(|value| value["params"]["update"].clone())
+        .collect();
+    let cards = report_cards(&updates);
+    assert_eq!(cards.len(), 2, "one card per task: {updates:#?}");
+    let card_of = |tool: &str| {
+        cards
+            .iter()
+            .find(|card| card["_meta"]["background"]["task"]["tool"] == tool)
+            .unwrap_or_else(|| panic!("no card for the {tool} task: {cards:#?}"))
+    };
+
+    let report = card_of("agent_spawn");
+    assert_eq!(report["status"], "completed", "{report}");
+    assert!(
+        report["title"]
+            .as_str()
+            .is_some_and(|title| title.contains("finished")),
+        "{report}"
+    );
+    assert_eq!(
+        card_texts(report),
+        [
+            "agent_spawn summarize the log",
+            "# Findings\n\nAll **good**."
+        ],
+        "what was started, in its call's words, then what it returned: {report}"
+    );
+
+    let command = card_of("shell_execute");
+    assert_eq!(command["status"], "failed", "{command}");
+    assert!(
+        command["title"]
+            .as_str()
+            .is_some_and(|title| title.contains("failed")),
+        "{command}"
+    );
+    assert_eq!(
+        card_texts(command),
+        [
+            "```console\nmake check\n```",
+            "```console\nerror: boom\n\nExit code: 2\n```"
+        ],
+        "a command and its output are console blocks: {command}"
+    );
+
+    harness.close_session(&session_id);
+    rusqlite::Connection::open(&database)
+        .expect("open the store")
+        .execute(
+            "DELETE FROM background_tasks WHERE session_id = ?1",
+            rusqlite::params![&session_id],
+        )
+        .expect("let the task rows go");
+    let cwd = harness.work_dir();
+    let id = harness.send_request(
+        "session/load",
+        serde_json::json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
+    );
+    let (updates, response) = harness.collect_updates(&session_id, id);
+    assert!(response["result"].is_object(), "{response}");
+    let replayed: Vec<serde_json::Value> = updates
+        .iter()
+        .map(|value| value["params"]["update"].clone())
+        .collect();
+    let replayed = report_cards(&replayed);
+    assert_eq!(
+        replayed.len(),
+        1,
+        "one bare card for the report: {updates:#?}"
+    );
+    assert_eq!(
+        replayed[0]["title"], "Background task report",
+        "{replayed:?}"
+    );
+    assert_eq!(replayed[0]["status"], "completed", "{replayed:?}");
+    assert!(card_texts(&replayed[0]).is_empty(), "{replayed:?}");
+}
+
+/// A report a running turn reads at a round boundary is a card where it landed: behind the
+/// round's own calls and ahead of the reply. The task ends while the turn waits on an approval
+/// prompt, which is what puts the report at that boundary and nowhere else.
+#[test]
+fn a_report_read_mid_turn_is_a_card_where_it_landed() {
+    let config_toml = r#"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
+model = "claude-sonnet-4-5"
+
+[permissions]
+default = "read"
+approvals = true
+enabled = ["read", "unrestricted"]
+
+[background]
+enabled = true
+"#;
+    let mut harness = AcpTestHarness::builder()
+        .config(config_toml)
+        .pre_spawn(|config_dir| {
+            let target = work_dir_beside(config_dir).join("written.txt");
+            serde_json::json!([
+                [
+                    { "type": "tool_use_start", "id": "call_write", "name": "file_write" },
+                    {
+                        "type": "tool_use_end",
+                        "input": { "path": target.to_str().unwrap(), "content": "x" }
+                    },
+                    { "type": "message_end", "stop_reason": "tool_use" }
+                ],
+                [
+                    { "type": "text", "text": "carried on" },
+                    { "type": "message_end", "stop_reason": "end_turn" }
+                ]
+            ])
+        })
+        .build();
+    let session_id = harness.new_session();
+    let database = harness.database();
+    let id = harness.prompt(&session_id, "write it");
+
+    let mut prompted = false;
+    let (updates, response) = harness.collect_updates_with_dispatch(&session_id, id, |value| {
+        if value["method"] != "session/request_permission" {
+            return None;
+        }
+        prompted = true;
+        seed_task(
+            &database,
+            &session_id,
+            "agent_spawn",
+            "summarize the log",
+            "completed",
+            Some("all good"),
+        );
+        Some(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": value["id"].clone(),
+            "result": { "outcome": { "outcome": "selected", "optionId": "allow_once" } }
+        }))
+    });
+    assert!(prompted, "the premise: the write asks first; {updates:#?}");
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+
+    let updates: Vec<serde_json::Value> = updates
+        .iter()
+        .map(|value| value["params"]["update"].clone())
+        .collect();
+    let place = |found: &dyn Fn(&serde_json::Value) -> bool, what: &str| {
+        updates
+            .iter()
+            .position(found)
+            .unwrap_or_else(|| panic!("no {what}: {updates:#?}"))
+    };
+    let written = place(
+        &|update| update["toolCallId"] == "call_write" && update["status"] == "completed",
+        "completed write",
+    );
+    let card = place(
+        &|update| !report_cards(std::slice::from_ref(update)).is_empty(),
+        "report card",
+    );
+    let reply = place(&|update| update["content"]["text"] == "carried on", "reply");
+    assert!(
+        written < card && card < reply,
+        "the card sits behind the round's call and ahead of the reply: {updates:#?}"
+    );
+    assert_eq!(report_cards(&updates).len(), 1, "{updates:#?}");
+    assert_eq!(updates[card]["status"], "completed", "{updates:#?}");
+    assert_eq!(
+        card_texts(&updates[card]),
+        ["agent_spawn summarize the log", "all good"],
+        "{updates:#?}"
     );
 }
 

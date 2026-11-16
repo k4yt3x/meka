@@ -77,9 +77,9 @@ can pass for the report's own header, another task's, or a prompt after it. The 
 echo it, any more than it prints a tool's output:
 a stage direction above the reply says what reported, `Background task 7f3a1c22 finished after
 12m 4s`, and the reply carries the result. Under `meka serve` the message reaches the feed as
-`message.appended` with a `background_report` block. An ACP editor is told the same direction as a
-`notice`, with the tasks and their outcomes under `_meta.background`, or as a parenthesized chunk
-when it renders no notices; the prompt itself is shown to no editor.
+`message.appended` with a `background_report` block. An ACP editor is shown a card for each task,
+titled with the same direction and holding what the task returned, with the task under
+`_meta.background`; the prompt itself is shown to no editor.
 
 When the task ends while a turn is running, the outcome lands inside that turn instead, at its next
 round boundary: behind the results of the round that was running, in the same message, or after the
@@ -87,8 +87,9 @@ reply that would have ended the turn, which then goes on, the way a message sent
 does. The header is the same, and the trailer tells the model to carry on rather than to answer.
 Nothing cuts a reply for a report: the outcome waits for the reply to end. The screen says the same
 stage direction, `meka serve` puts a `task.reported` event on the turn with the text the model read,
-and an ACP editor gets the same notice. A resumed session replays the direction where the report
-landed, since the log records a report as a block of its own rather than as words.
+and an ACP editor gets the same cards. A resumed session replays the direction where the report
+landed, and a session reopened in an editor the cards, since the log records a report as a block of
+its own rather than as words.
 
 Running tasks also appear in the per-turn context under `[Background]`, so the agent can see what it already started and does not launch a second copy:
 

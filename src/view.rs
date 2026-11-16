@@ -808,7 +808,7 @@ impl ToolView {
 }
 
 /// One background task as every JSON surface reports it: the task routes, and the `_meta` of the
-/// ACP notice that says what reported. `status` is the spelling of
+/// ACP card that says the task reported. `status` is the spelling of
 /// [`crate::store::background::TaskStatus`].
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
