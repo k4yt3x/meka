@@ -425,10 +425,15 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
         cli.prompt.as_deref(),
         &config.skill_roots(),
     ))?;
-    // `--bind` on `meka serve` overrides the config-file `[serve].bind`. Apply here so
+    // `meka serve`'s own flags. `--bind` overrides the config-file `[serve].bind`, applied here so
     // `async_main` sees a single resolved binding without re-parsing the CLI.
-    if let Some(cli::Command::Serve { bind: Some(bind) }) = cli.command.as_ref() {
-        config.request.serve_bind_override = Some(bind.clone());
+    if let Some(cli::Command::Serve {
+        bind,
+        exit_on_stdin_close,
+    }) = cli.command.as_ref()
+    {
+        config.request.serve_bind_override.clone_from(bind);
+        config.request.serve_exit_on_stdin_close = *exit_on_stdin_close;
     }
     // Before anything renders. The renderers read this rather than taking it as a parameter because
     // the one-shot's approval refusal sits several call sites below `run_oneshot`, which takes flat

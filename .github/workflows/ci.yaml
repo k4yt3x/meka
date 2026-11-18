@@ -29,6 +29,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # The linkage `release.yaml` ships the Windows binary with, so the suite runs on it.
+  CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}

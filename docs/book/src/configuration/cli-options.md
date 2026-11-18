@@ -199,12 +199,14 @@ meka acp
 ### `serve`
 
 Run Meka as a long-lived [HTTP service](../usage/http-api.md). `--bind <ADDR>` overrides
-`[serve].bind`. Like `acp`, it refuses `-c`, `-r` and `--project`: the host creates a session per
-request.
+`[serve].bind`. `--exit-on-stdin-close` shuts the server down when its standard input reaches end
+of file, for [a parent process that manages it](../usage/http-api.md#graceful-shutdown). Like
+`acp`, it refuses `-c`, `-r` and `--project`: the host creates a session per request.
 
 ```bash
 meka serve
 meka serve --bind 0.0.0.0:8080
+meka serve --exit-on-stdin-close
 ```
 
 ## Options

@@ -378,7 +378,7 @@ pub(crate) async fn ensure_session_loaded_holding(
     // propagate `current_dir()` failure as 500 so the operator can fix it.
     let cwd_path = match summary.cwd.clone() {
         Some(path) => path,
-        None => std::env::current_dir().map_err(|error| {
+        None => super::handlers::sessions::default_working_directory().map_err(|error| {
             ProblemDetail::new(
                 ErrorKind::Internal,
                 StatusCode::INTERNAL_SERVER_ERROR,

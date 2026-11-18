@@ -7,9 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.96.0] - 2026-11-18
+
+### Added
+
+- `meka serve --exit-on-stdin-close` shuts the server down when its standard input closes.
+- `GET /v1/info` reports `default_working_directory`, where a session works when none is named.
+
+### Changed
+
+- **Breaking:** A working directory whose path is not valid Unicode is refused, not misrecorded.
+- On Windows, Ctrl+Break and a closing console end a run or a server cleanly, as SIGTERM does.
+
 ### Fixed
 
 - Answers stream as they are written on endpoints that close reasoning late, such as llama.cpp.
+- On Windows, `meka.exe` starts without the Visual C++ Redistributable installed.
 
 ## [0.95.0] - 2026-11-16
 
@@ -3393,7 +3406,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.95.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.96.0...HEAD
+[0.96.0]: https://github.com/k4yt3x/meka/compare/0.95.0...0.96.0
 [0.95.0]: https://github.com/k4yt3x/meka/compare/0.94.0...0.95.0
 [0.94.0]: https://github.com/k4yt3x/meka/compare/0.93.0...0.94.0
 [0.93.0]: https://github.com/k4yt3x/meka/compare/0.92.0...0.93.0

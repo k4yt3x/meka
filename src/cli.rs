@@ -91,6 +91,13 @@ pub(crate) enum Command {
         /// Address to bind
         #[arg(long, value_name = "ADDR")]
         bind: Option<String>,
+        /// Drain and exit when standard input reaches end of file
+        ///
+        /// For a parent process that manages this server: it holds a pipe to the server's standard
+        /// input, and the server shuts down as on a termination signal when the pipe closes,
+        /// whether the parent closed it or ended.
+        #[arg(long)]
+        exit_on_stdin_close: bool,
     },
     /// Run a command inside the sandbox's Landlock layer (internal)
     ///

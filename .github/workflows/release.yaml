@@ -18,6 +18,12 @@ on:
 permissions:
   contents: write
 
+env:
+  # The Windows binary links the C runtime statically, so it starts on a machine without the
+  # Visual C++ Redistributable. Named for the one target, so the other builds ignore it; `ci.yaml`
+  # sets the same, so the suite runs on the linkage that ships.
+  CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
+
 jobs:
   build:
     strategy:

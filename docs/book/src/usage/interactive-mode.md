@@ -550,7 +550,7 @@ You can leave Meka in any of these ways:
 Leaving while the agent is working stops the turn first, so nothing keeps running once the screen
 is gone; a `!command` still running is killed, and background tasks are stopped on the way out,
 with how many said. A followup still held is not sent, whether Meka is left this way or ended by a
-hangup or SIGTERM.
+hangup or SIGTERM. On Windows, Ctrl+Break and closing the console window end Meka as those do.
 
 The screen hands the terminal back as it found it. The session's id is printed on the way out
 when [`display.show_session_id_on_exit`](../configuration/config-file.md#displayshow_session_id_on_exit)

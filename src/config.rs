@@ -2134,6 +2134,10 @@ pub(crate) struct RunRequest {
     /// CLI-flag override for `[serve].bind` (`meka serve --bind ...`). Wins over the config file
     /// when set.
     pub(crate) serve_bind_override: Option<String>,
+    /// `meka serve --exit-on-stdin-close`: the server drains when its standard input reaches end
+    /// of file. CLI-only: what a process's standard input is belongs to the launch that wired it,
+    /// and a file that set this would end a server started with no input at all.
+    pub(crate) serve_exit_on_stdin_close: bool,
     /// Set for `meka serve`, whose sessions each name their profile on `POST /v1/sessions` or
     /// take the default there: the default is asked for per creation, so its absence refuses that
     /// creation and not the process, which an installation managed over the API brings up before
@@ -3423,6 +3427,7 @@ impl ResolvedConfig {
                 oneshot: overrides.oneshot,
                 output_format: overrides.output_format,
                 serve_bind_override: None,
+                serve_exit_on_stdin_close: false,
                 profile_named_per_session: overrides.serve,
             },
             #[cfg(any(debug_assertions, feature = "mock-provider"))]

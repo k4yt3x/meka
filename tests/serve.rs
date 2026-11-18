@@ -40,6 +40,17 @@ account = "mock"
 model = "claude-sonnet-4-5"
 "#;
 
+/// What one spawn adds to a plain `meka serve`.
+#[derive(Clone, Copy, Default)]
+struct ServeLaunch<'a> {
+    /// Root flags, ahead of `serve`.
+    flags: &'a [&'a str],
+    /// `serve`'s own flags, after it.
+    serve_flags: &'a [&'a str],
+    /// A last change to the command before it is spawned.
+    prepare: Option<&'a dyn Fn(&mut std::process::Command)>,
+}
+
 struct ServeTestHarness {
     /// The server's directories. Exposed so a test can reach the session lock directory under the
     /// data dir, which is the only way to create the cross-process lock contention that
@@ -160,6 +171,50 @@ impl ServeTestHarness {
         environment: impl Fn(&Install) -> Vec<(String, String)>,
         flags: &[&str],
     ) -> Self {
+        Self::spawn_launched(
+            profiles,
+            prelude,
+            extra_config,
+            script,
+            token,
+            scopes,
+            environment,
+            ServeLaunch {
+                flags,
+                ..ServeLaunch::default()
+            },
+        )
+    }
+
+    /// [`Self::spawn`] started as `launch` says.
+    fn spawn_as(script: serde_json::Value, launch: ServeLaunch<'_>) -> Self {
+        Self::spawn_launched(
+            MOCK_PROFILE,
+            "",
+            "",
+            script,
+            "sk_test_token",
+            &["sessions:r", "sessions:w"],
+            |_| Vec::new(),
+            launch,
+        )
+    }
+
+    /// [`Self::spawn_configured`] started as `launch` says.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the spawn's seven inputs and the launch; the callers name each"
+    )]
+    fn spawn_launched(
+        profiles: &str,
+        prelude: &str,
+        extra_config: &str,
+        script: serde_json::Value,
+        token: &str,
+        scopes: &[&str],
+        environment: impl Fn(&Install) -> Vec<(String, String)>,
+        launch: ServeLaunch<'_>,
+    ) -> Self {
         let install = Install::new();
         install.write_script(&script);
 
@@ -203,16 +258,24 @@ scopes = [{scopes_str}]
             );
             install.write_config(&config);
 
-            let arguments: Vec<&str> = flags.iter().copied().chain(["serve"]).collect();
-            let mut child = install
-                .meka(&arguments)
+            let arguments: Vec<&str> = launch
+                .flags
+                .iter()
+                .copied()
+                .chain(["serve"])
+                .chain(launch.serve_flags.iter().copied())
+                .collect();
+            let mut command = install.meka(&arguments);
+            command
                 .env("RUST_LOG", "meka=info")
                 .envs(environment(&install))
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("spawn meka serve");
+                .stderr(Stdio::piped());
+            if let Some(prepare) = launch.prepare {
+                prepare(&mut command);
+            }
+            let mut child = command.spawn().expect("spawn meka serve");
 
             // The server writes nothing to stdout; stderr carries the announcement and the logs.
             support::drain(child.stdout.take().expect("stdout"));
@@ -3075,8 +3138,7 @@ fn max_concurrent_turns_returns_429_across_sessions() {
 /// Graceful shutdown: an in-flight streaming turn receives a final
 /// `turn.canceled{reason:"server_shutdown"}` SSE event when the server is SIGTERM'd.
 ///
-/// Unix-only (uses `kill` to send SIGTERM); skipped on Windows since the server's shutdown path
-/// there only listens for Ctrl+C and we can't deliver that to a child process easily.
+/// Unix-only: it sends SIGTERM with `kill`, which Windows has no counterpart of.
 #[cfg(unix)]
 #[test]
 fn graceful_shutdown_emits_server_shutdown_canceled() {
@@ -3220,6 +3282,113 @@ fn graceful_shutdown_waits_for_a_detached_turn_to_unwind() {
         "shutdown must wait for the detached turn: the process exited {elapsed:?} after SIGTERM while \
          the turn still had most of its {STALL_MS}ms left to run",
     );
+}
+
+/// The script of a turn still running when its server is told to stop.
+fn stalled_turn() -> serde_json::Value {
+    serde_json::json!([
+        [
+            { "type": "sleep", "ms": 5000 },
+            { "type": "text", "text": "would-be-text" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ])
+}
+
+/// Start a streaming turn on `harness`, whose script is [`stalled_turn`], tell the server to stop
+/// through `stop`, and hold it to the drain: the turn is canceled as a shutdown on its own stream,
+/// and the process exits 0.
+fn assert_a_stop_drains_a_running_turn(
+    mut harness: ServeTestHarness,
+    stop: impl FnOnce(&mut ServeTestHarness),
+) {
+    let id = create_session_id(&harness);
+    let streaming = std::thread::spawn({
+        let base_url = harness.base_url.clone();
+        let token = harness.token.clone();
+        let id = id.clone();
+        move || {
+            reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .build()
+                .expect("client")
+                .post(format!("{base_url}/v1/sessions/{id}/turns"))
+                .header("Authorization", format!("Bearer {token}"))
+                .json(&serde_json::json!({"message": "stall me", "stream": true}))
+                .send()
+                .expect("stream send")
+                .text()
+                .expect("body")
+        }
+    });
+    // Admitted first, or there is nothing for the drain to cancel.
+    harness.wait_until_in_flight(&id);
+    stop(&mut harness);
+    let body = streaming.join().expect("stream join");
+    assert!(
+        body.contains("event: turn.canceled") && body.contains("\"reason\":\"server_shutdown\""),
+        "a server told to stop cancels its turn as a shutdown; body was:\n{body}",
+    );
+    let mut status = None;
+    support::wait_until("the server's exit", Duration::from_secs(60), || {
+        status = harness.child.try_wait().expect("poll the server");
+        status.is_some()
+    });
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "a drain that completes exits 0; got {status:?}",
+    );
+}
+
+/// With `--exit-on-stdin-close`, the end of standard input drains the server as a termination
+/// signal does: how a parent process stops the server it manages, and what stops the server when
+/// that parent is gone. Held on every system, since each lets a parent close a pipe.
+#[test]
+fn closing_standard_input_drains_a_server_told_to_exit_on_it() {
+    let mut harness = ServeTestHarness::spawn_as(stalled_turn(), ServeLaunch {
+        serve_flags: &["--exit-on-stdin-close"],
+        ..ServeLaunch::default()
+    });
+    // Only the pipe's end stops the server; what it carries before that is read as nothing.
+    {
+        use std::io::Write;
+        let stdin = harness.child.stdin.as_mut().expect("stdin is piped");
+        stdin.write_all(b"not a command\n").expect("write");
+        stdin.flush().expect("flush");
+    }
+    assert_a_stop_drains_a_running_turn(harness, |harness| drop(harness.child.stdin.take()));
+}
+
+/// Without the flag the server never reads its standard input, so one started with none, as a
+/// service manager starts it, keeps serving: the pipe is closed under a running server, which then
+/// runs a whole turn.
+#[test]
+fn a_server_not_told_to_exit_on_standard_input_outlives_it() {
+    let mut harness = ServeTestHarness::spawn("", mock_simple_turn());
+    drop(harness.child.stdin.take());
+    let id = create_session_id(&harness);
+    let turn = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turns"))
+        .json(&serde_json::json!({"message": "hi"}))
+        .send()
+        .expect("turn");
+    assert_eq!(turn.status(), 200, "the server still serves");
+    let body: serde_json::Value = turn.json().expect("parse");
+    assert_eq!(assistant_text(&body), "hello from agent", "{body}");
+}
+
+/// On Windows, Ctrl+Break drains the server as SIGTERM does elsewhere. The server leads a console
+/// process group of its own, which is what lets the event reach it and not the test runner.
+#[cfg(windows)]
+#[test]
+fn ctrl_break_drains_the_server() {
+    let harness = ServeTestHarness::spawn_as(stalled_turn(), ServeLaunch {
+        prepare: Some(&support::in_own_console_group),
+        ..ServeLaunch::default()
+    });
+    assert_a_stop_drains_a_running_turn(harness, |harness| {
+        support::send_ctrl_break(&harness.child);
+    });
 }
 
 /// Mid-turn permission flow: a session at `read` with approvals on scripts a tool call,
@@ -4427,6 +4596,99 @@ fn info_reports_the_scopes_the_calling_token_holds() {
         .json()
         .expect("parse");
     assert_eq!(body["scopes"], serde_json::json!(["mcp:r", "sessions:r"]));
+}
+
+/// `/v1/info` states the directory a session works in when its creation names none, which a client
+/// could otherwise learn only by creating one.
+#[test]
+fn info_states_the_directory_a_session_created_without_one_works_in() {
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let info: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/info")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let created: serde_json::Value = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({}))
+        .send()
+        .expect("create")
+        .json()
+        .expect("parse");
+    assert!(info["default_working_directory"].is_string(), "{info}");
+    assert_eq!(
+        info["default_working_directory"], created["working_directory"],
+        "what `/v1/info` states is what a creation takes: {created}"
+    );
+}
+
+/// A server started in a directory whose path is not valid Unicode has no default to give: a
+/// creation that names no directory is refused with a problem detail before a row exists,
+/// `/v1/info` states none, and a creation that names a directory is served.
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+fn a_server_in_a_directory_that_is_not_unicode_gives_no_default_directory() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let directory = temp.path().join(support::not_unicode_name());
+    std::fs::create_dir(&directory).expect("mkdir");
+    let harness = ServeTestHarness::spawn_as(mock_simple_turn(), ServeLaunch {
+        prepare: Some(&|command: &mut std::process::Command| {
+            command.current_dir(&directory);
+        }),
+        ..ServeLaunch::default()
+    });
+
+    let refused = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({}))
+        .send()
+        .expect("create");
+    assert_eq!(refused.status(), 500);
+    let problem: serde_json::Value = refused.json().expect("a problem detail, not bare text");
+    assert!(
+        problem["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("not valid Unicode")),
+        "{problem}"
+    );
+    let listed: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/sessions")
+        .send()
+        .expect("list")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        listed["sessions"],
+        serde_json::json!([]),
+        "refused before a row exists"
+    );
+
+    let info = harness
+        .request(reqwest::Method::GET, "/v1/info")
+        .send()
+        .expect("info");
+    assert_eq!(info.status(), 200);
+    let info: serde_json::Value = info.json().expect("parse");
+    assert!(info.get("default_working_directory").is_none(), "{info}");
+
+    // Names a directory of its own, so the server's is not asked for.
+    create_session_id(&harness);
+}
+
+/// A token with no `sessions` scope is not told where sessions work: only those scopes show a
+/// session's directory anywhere else.
+#[test]
+fn info_keeps_the_default_directory_from_a_token_with_no_sessions_scope() {
+    let harness =
+        ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &["memory:r"]);
+    let response = harness
+        .request(reqwest::Method::GET, "/v1/info")
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 200);
+    let info: serde_json::Value = response.json().expect("parse");
+    assert!(info.get("default_working_directory").is_none(), "{info}");
 }
 
 /// `/v1/info` carries no provider or model, and `/v1/profiles` answers both.

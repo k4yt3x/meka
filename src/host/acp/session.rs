@@ -589,8 +589,12 @@ pub(super) async fn handle_list_sessions(
     // Fallback for a row carrying no `cwd`, which an import produces when the archive omits it or
     // names one that is not a directory here. The process cwd matches what the agent would use for
     // relative-path resolution if the client picked one of these to load. That is better than
-    // refusing to surface them.
-    let fallback_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // refusing to surface them. One whose path is not valid Unicode cannot be sent, and falls back
+    // as one that cannot be read does.
+    let fallback_cwd = std::env::current_dir()
+        .ok()
+        .filter(|directory| crate::workspace::is_unicode(directory))
+        .unwrap_or_else(|| PathBuf::from("."));
 
     let sessions = rows
         .into_iter()

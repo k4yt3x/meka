@@ -217,10 +217,7 @@ pub(crate) async fn run_oneshot(
         Some(frontend) => Arc::clone(frontend) as Arc<dyn crate::frontend::Frontend>,
         None => Arc::clone(&plain_frontend) as Arc<dyn crate::frontend::Frontend>,
     };
-    let launch_cwd = std::env::current_dir().unwrap_or_else(|error| {
-        tracing::warn!("failed to read the process working directory at startup: {error}");
-        std::path::PathBuf::from(".")
-    });
+    let launch_cwd = crate::workspace::launch_directory()?;
     // Resolved before the agent is built, not after: which session this is decides which provider
     // profile the agent runs on, which level it runs at and which directory it opens in, and the
     // agent carries all three.

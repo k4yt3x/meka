@@ -59,6 +59,27 @@ pub(crate) fn resolve_serve(
     Ok(serve)
 }
 
+/// Resolve when standard input reaches end of file, for a server whose parent holds it open for as
+/// long as the server should run. What arrives before that is discarded: the pipe carries a
+/// lifetime, not a protocol. A read that fails resolves too, since a server that can no longer see
+/// its parent go would outlive it.
+async fn wait_for_stdin_to_close() {
+    use tokio::io::AsyncReadExt;
+    let mut stdin = tokio::io::stdin();
+    let mut discarded = [0_u8; 256];
+    loop {
+        match stdin.read(&mut discarded).await {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                tracing::warn!("failed to read standard input: {error}");
+                return;
+            }
+        }
+    }
+}
+
 /// Run Meka as an HTTP server until the listener stops accepting (e.g. on SIGTERM after the
 /// graceful-shutdown drain completes). The signature mirrors [`crate::host::acp::run_acp`] for
 /// consistency with the existing dispatch in `main::async_main`.
@@ -71,6 +92,7 @@ pub(crate) async fn run_serve(
     if let Some(bind_override) = config.request.serve_bind_override.take() {
         serve.bind = bind_override;
     }
+    let exit_on_stdin_close = config.request.serve_exit_on_stdin_close;
     for advisory in serve.advisories() {
         tracing::warn!("{advisory}");
     }
@@ -159,7 +181,12 @@ pub(crate) async fn run_serve(
         .into_future();
     let serve_handle = tokio::spawn(serve_future);
 
-    crate::host::wait_for_shutdown_signal().await;
+    tokio::select! {
+        () = crate::host::wait_for_shutdown_signal() => {}
+        () = wait_for_stdin_to_close(), if exit_on_stdin_close => {
+            tracing::info!("standard input closed, draining");
+        }
+    }
     state.shutdown.cancel();
     // Each pending login's completion request waits on its flow, an exchange in flight included,
     // and would hold the drain for as long as that takes: ended here, it is answered at once.

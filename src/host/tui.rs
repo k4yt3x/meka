@@ -35,10 +35,7 @@ pub(crate) async fn run_interactive(
     let config = Arc::new(config);
     // Where the shell was. Kept apart from the per-session `cwd` below because the two part
     // company the moment a resumed session opens somewhere else, and a bare `/cd` returns here.
-    let launch_cwd = std::env::current_dir().unwrap_or_else(|error| {
-        tracing::warn!("failed to read the process working directory at startup: {error}");
-        std::path::PathBuf::from(".")
-    });
+    let launch_cwd = crate::workspace::launch_directory()?;
 
     // From here on every log line is the screen's to show, including the MCP connection warnings
     // that fire while the session is still being assembled: the screen drains the queue once it

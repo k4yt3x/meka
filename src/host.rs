@@ -213,8 +213,35 @@ pub(crate) fn spawn_expiry_sweeper(
     })
 }
 
-/// Wait for a termination signal: SIGTERM or Ctrl+C on Unix, Ctrl+C elsewhere. The one watch both
-/// servers drain on, so the two cannot differ about what ends a process.
+/// Wait for Windows to end the process through its console, and name what did: Ctrl+Break, the
+/// console closing, or the system shutting down, which reaches a process that runs as a service.
+/// Windows ends the process itself when its `HandlerRoutine` timeout passes, by default five
+/// seconds after a close and twenty after a service's shutdown, so what follows this has that long.
+///
+/// A logoff is left to the default handler: Windows sends one to every service when any user logs
+/// off, and a service does not end with a user's session.
+///
+/// Never resolves where the listeners cannot be installed, which the log says: resolving would end
+/// a process nothing asked to end.
+#[cfg(windows)]
+pub(crate) async fn wait_for_console_end() -> &'static str {
+    use tokio::signal::windows::{ctrl_break, ctrl_close, ctrl_shutdown};
+    let (Ok(mut on_break), Ok(mut on_close), Ok(mut on_shutdown)) =
+        (ctrl_break(), ctrl_close(), ctrl_shutdown())
+    else {
+        tracing::warn!("failed to listen for Ctrl+Break, a closing console and a system shutdown");
+        return std::future::pending().await;
+    };
+    tokio::select! {
+        _ = on_break.recv() => "Ctrl+Break",
+        _ = on_close.recv() => "console close",
+        _ = on_shutdown.recv() => "system shutdown",
+    }
+}
+
+/// Wait for a termination signal: SIGTERM or Ctrl+C on Unix; on Windows Ctrl+C, or what
+/// `wait_for_console_end` waits for. The one watch both servers drain on, so the two cannot
+/// differ about what ends a process.
 pub(crate) async fn wait_for_shutdown_signal() {
     #[cfg(unix)]
     {
@@ -236,12 +263,17 @@ pub(crate) async fn wait_for_shutdown_signal() {
             _ = term.recv() => tracing::info!("SIGTERM received, draining"),
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            tracing::warn!("failed to listen for Ctrl+C: {error}");
+        tokio::select! {
+            listened = tokio::signal::ctrl_c() => {
+                if let Err(error) = listened {
+                    tracing::warn!("failed to listen for Ctrl+C: {error}");
+                }
+                tracing::info!("Ctrl+C received, draining");
+            }
+            event = wait_for_console_end() => tracing::info!("{event} received, draining"),
         }
-        tracing::info!("Ctrl+C received, draining");
     }
 }
 

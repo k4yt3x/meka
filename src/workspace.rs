@@ -1053,6 +1053,17 @@ pub(crate) fn strip_verbatim(path: PathBuf) -> PathBuf {
     path
 }
 
+/// Whether a directory's path is valid Unicode, which a working directory's has to be. The session
+/// row, the prompt and every client carry a directory as text, so one whose path is not text would
+/// be recorded, and told to the model, as a different directory that is not there.
+pub(crate) fn is_unicode(path: &Path) -> bool {
+    path.to_str().is_some()
+}
+
+/// Why a directory [`is_unicode`] does not hold for is refused, worded to follow the path as
+/// [`judge_directory`]'s other reasons are.
+const NOT_UNICODE: &str = "resolves to a path that is not valid Unicode";
+
 /// Admit a working directory named from outside the process: an HTTP `working_directory`, an ACP
 /// `cwd`, a `/cd` argument. Returns the canonical spelling, which is what the session row records
 /// and what the write fence, the prompt and every relative tool path are then derived from.
@@ -1066,8 +1077,9 @@ pub(crate) fn accept_cwd(path: &Path) -> crate::error::Result<PathBuf> {
     })
 }
 
-/// Whether `path` names a directory that is there, and its canonical spelling when it does; the
-/// failure is the reason, worded to follow the path, so each door prefixes its own noun.
+/// Whether `path` names a directory that is there and that [`is_unicode`] holds for, and its
+/// canonical spelling when it does; the failure is the reason, worded to follow the path, so each
+/// door prefixes its own noun.
 ///
 /// What [`accept_cwd`] asks of a working directory, [`accept_worker_scope`] of every directory a
 /// sub-agent holds and an import of every directory an archive names, so a list entry is judged
@@ -1091,7 +1103,28 @@ pub(crate) fn judge_directory(path: &Path) -> Result<PathBuf, String> {
     if !canonical.is_dir() {
         return Err("is not a directory".to_string());
     }
+    if !is_unicode(&canonical) {
+        return Err(NOT_UNICODE.to_string());
+    }
     Ok(canonical)
+}
+
+/// Where Meka was launched, which a new session of the screen or of a one-shot run opens in and a
+/// bare `/cd` returns to: the process directory as the shell gave it, `.` with a warning when it
+/// cannot be read. Refused when its path is not valid Unicode, as [`judge_directory`] refuses a
+/// directory named from outside.
+pub(crate) fn launch_directory() -> crate::error::Result<PathBuf> {
+    let directory = std::env::current_dir().unwrap_or_else(|error| {
+        tracing::warn!("failed to read the process working directory at startup: {error}");
+        PathBuf::from(".")
+    });
+    if !is_unicode(&directory) {
+        return Err(crate::error::MekaError::Usage(format!(
+            "working directory '{}' {NOT_UNICODE}",
+            directory.display()
+        )));
+    }
+    Ok(directory)
 }
 
 /// The spelling to match a recorded working directory against when a listing is filtered by one:
@@ -1825,6 +1858,51 @@ mod tests {
         assert!(refused(&temp.path().join("missing")).contains("does not exist"));
         assert!(refused(&file).contains("is not a directory"));
         assert!(refused(&temp.path().join("with\0nul")).contains("contains a NUL byte"));
+    }
+
+    /// A directory name that is not valid Unicode, as each system spells one: a byte that is not
+    /// UTF-8 on Linux, half of a surrogate pair on Windows. APFS refuses to make one, so the test
+    /// that needs one does not run on macOS.
+    #[cfg(any(target_os = "linux", windows))]
+    fn not_unicode_name() -> std::ffi::OsString {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            std::ffi::OsString::from_vec(b"work-\xff".to_vec())
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            std::ffi::OsString::from_wide(&[0x77, 0x6f, 0x72, 0x6b, 0x2d, 0xD800])
+        }
+    }
+
+    /// A directory whose path is not valid Unicode is refused, by its own name, beneath one so
+    /// named, or through a link whose own name is fine: the row and the prompt would name a
+    /// directory that is not there.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn a_working_directory_whose_path_is_not_unicode_is_refused() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let directory = temp.path().join(not_unicode_name());
+        let beneath = directory.join("project");
+        std::fs::create_dir_all(&beneath).expect("mkdir");
+
+        let refusal = accept_cwd(&directory).expect_err("refused").to_string();
+        assert!(
+            refusal.contains("resolves to a path that is not valid Unicode"),
+            "{refusal}"
+        );
+        assert!(
+            accept_cwd(&beneath).is_err(),
+            "its path holds the same name"
+        );
+        #[cfg(unix)]
+        {
+            let link = temp.path().join("link");
+            std::os::unix::fs::symlink(&directory, &link).expect("symlink");
+            assert!(accept_cwd(&link).is_err(), "what is recorded is the target");
+        }
     }
 
     /// A directory named through a symlink is recorded as the directory itself, and a listing

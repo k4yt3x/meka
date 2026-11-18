@@ -10,6 +10,10 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 Meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.95 to 0.96
+
+**A working directory whose path is not valid Unicode is refused.** That is a path holding bytes that are not UTF-8, or on Windows an unpaired surrogate; any other name, in any script, is unaffected. Meka used to run there and record a different directory, with the unreadable part replaced, which it then told the model and every client. Now the screen and a one-shot run do not start in such a directory or beneath one, `/cd`, an editor's `cwd` and the HTTP API's `working_directory` refuse one, and a `meka serve` started there refuses a session that names no directory. Rename the directory, or start Meka from one outside it. A session recorded there earlier names a directory that does not exist, and a resume opens it where Meka is launched, with the warning a removed directory gets.
+
 ## 0.94 to 0.95
 
 Two keys of `config.toml` change: `[schedule].max_jobs` is `max_schedules` and

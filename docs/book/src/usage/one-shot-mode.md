@@ -57,8 +57,9 @@ meka --oneshot -r 550e8400 -p "summarize what we decided"
 `--format json` keeps stdout empty during the turn and prints one object when it ends, so a script
 reads the whole turn at once rather than parsing a stream. Errors still go to stderr and the exit
 code; no object is printed for a turn that failed. A turn interrupted with Ctrl+C, SIGHUP or
-SIGTERM is reported, not failed: its object is printed with `stop_reason` set to `interrupted`, and
-the run exits 130 as it does without `--format json`.
+SIGTERM, or on Windows with Ctrl+Break or by its console closing, is reported, not failed: its
+object is printed with `stop_reason` set to `interrupted`, and the run exits 130 as it does
+without `--format json`.
 
 ```bash
 meka --oneshot -p "how many files are here?" --format json

@@ -1766,7 +1766,7 @@ When `true`, idle-evicted sessions also have their SQLite row deleted, unless a 
 
 ### `serve.shutdown_drain_timeout`
 
-Maximum time to wait for in-flight turns, tasks and writes to finish during graceful shutdown (`SIGTERM` / `SIGINT`). After this timeout, remaining tasks are aborted and the process exits.
+Maximum time to wait for in-flight turns, tasks and writes to finish during a [graceful shutdown](../usage/http-api.md#graceful-shutdown). After this timeout, remaining tasks are aborted and the process exits.
 
 | Type | Default |
 |------|---------|

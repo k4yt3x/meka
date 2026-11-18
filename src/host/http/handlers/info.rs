@@ -10,6 +10,7 @@ use utoipa::ToSchema;
 
 use crate::{
     host::http::{
+        auth::Principal,
         errors::{ErrorKind, ProblemDetail},
         scope::{self},
         state::ServerState,
@@ -32,6 +33,39 @@ pub(crate) struct InfoResponse {
     /// The scopes the calling token holds, sorted. A client otherwise learns what it may do by
     /// collecting 403s.
     pub(crate) scopes: Vec<String>,
+    /// The directory a session works in when `POST /v1/sessions` names none: the server process's
+    /// own. Stated to a token that holds a `sessions` scope, as a session's own directory is;
+    /// omitted for any other token, and when the server cannot determine it or its name is not
+    /// UTF-8.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) default_working_directory: Option<String>,
+}
+
+/// The default directory as the answer states it: left out, and said in the log, when the server
+/// cannot determine it and when its name is not UTF-8, which JSON cannot carry. Left a path, it
+/// would fail the whole answer for a server started in such a directory.
+fn stated_directory(directory: std::io::Result<std::path::PathBuf>) -> Option<String> {
+    match directory.map(|directory| directory.into_os_string().into_string()) {
+        Ok(Ok(directory)) => Some(directory),
+        Ok(Err(directory)) => {
+            let directory = directory.to_string_lossy();
+            tracing::warn!(
+                "the server's working directory is not UTF-8 and is left out of `/v1/info`: \
+                 {directory}"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::warn!("failed to determine the server's working directory: {error}");
+            None
+        }
+    }
+}
+
+/// Whether `principal` is shown where sessions work: either `sessions` scope shows a session's own
+/// directory, on its record or on the answer to creating it.
+fn sees_session_directories(principal: &Principal) -> bool {
+    principal.has_scope("sessions:r") || principal.has_scope("sessions:w")
 }
 
 /// `when` as the wire carries a time.
@@ -72,6 +106,9 @@ pub(crate) async fn info(
     let config = &state.shared.config;
     let mut scopes: Vec<String> = scoped.principal.scopes.to_vec();
     scopes.sort_unstable();
+    let default_working_directory = sees_session_directories(&scoped.principal)
+        .then(super::sessions::default_working_directory)
+        .and_then(stated_directory);
     Ok(Json(InfoResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         default_permission: config.permission.to_string(),
@@ -81,6 +118,7 @@ pub(crate) async fn info(
             .map(|p| p.to_string())
             .collect(),
         scopes,
+        default_working_directory,
     }))
 }
 
@@ -377,4 +415,48 @@ pub(crate) async fn mcp_reconnect(
         server: name,
         state: resolved.label().to_string(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn principal(scopes: &[&str]) -> Principal {
+        Principal {
+            token_id: "token".to_string(),
+            scopes: scopes.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    /// The directory is stated when its name is text, and left out when the server cannot determine
+    /// it or JSON cannot carry it, so neither fails the answer.
+    #[test]
+    fn a_directory_is_stated_only_as_text() {
+        let work = std::path::PathBuf::from("/work");
+        assert_eq!(stated_directory(Ok(work)).as_deref(), Some("/work"));
+        assert_eq!(stated_directory(Err(std::io::Error::other("gone"))), None);
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let not_text = std::ffi::OsString::from_vec(b"/work-\xff".to_vec());
+            assert_eq!(stated_directory(Ok(not_text.into())), None);
+        }
+    }
+
+    /// Either `sessions` scope shows where sessions work, and no other scope does.
+    #[test]
+    fn only_a_sessions_scope_shows_where_sessions_work() {
+        assert!(sees_session_directories(&principal(&["sessions:r"])));
+        assert!(sees_session_directories(&principal(&[
+            "mcp:r",
+            "sessions:w"
+        ])));
+        assert!(!sees_session_directories(&principal(&[
+            "config:r",
+            "mcp:r",
+            "memory:r",
+            "schedule:r",
+            "skills:r",
+        ])));
+    }
 }

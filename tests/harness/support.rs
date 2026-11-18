@@ -177,6 +177,47 @@ pub(crate) fn ephemeral_port() -> u16 {
     port
 }
 
+/// A directory name that is not valid Unicode, as each system spells one: a byte that is not UTF-8
+/// on Linux, half of a surrogate pair on Windows. APFS refuses to make one, so a test that needs
+/// one does not run on macOS.
+#[cfg(any(target_os = "linux", windows))]
+pub(crate) fn not_unicode_name() -> std::ffi::OsString {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(b"work-\xff".to_vec())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        std::ffi::OsString::from_wide(&[0x77, 0x6f, 0x72, 0x6b, 0x2d, 0xD800])
+    }
+}
+
+/// Start `command`'s process leading a console process group of its own, so [`send_ctrl_break`]
+/// reaches it and nothing else on the console.
+#[cfg(windows)]
+pub(crate) fn in_own_console_group(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
+}
+
+/// Send Ctrl+Break to the console process group `child` leads. Only for a child started through
+/// [`in_own_console_group`]: given the id of a process that leads no group, Windows sends the event
+/// to every process on the console, the test runner among them.
+#[cfg(windows)]
+pub(crate) fn send_ctrl_break(child: &Child) {
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+    // SAFETY: the call takes no pointer, and the id names a process group this test started.
+    let sent = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.id()) };
+    assert_ne!(
+        sent,
+        0,
+        "failed to send Ctrl+Break: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
 /// Read one of a child's pipes to EOF on its own thread, so it cannot fill and block the process
 /// writing to it. The thread hands back everything it read, for a failure message.
 pub(crate) fn drain(pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {

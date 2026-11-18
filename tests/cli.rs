@@ -1518,6 +1518,122 @@ fn an_interrupted_wait_stops_the_background_task_it_was_waiting_for() {
     );
 }
 
+/// A run launched in a directory whose path is not valid Unicode is refused before a session
+/// exists: its row and its prompt would name a directory that is not there.
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+fn a_run_launched_in_a_directory_that_is_not_unicode_is_refused() {
+    let install = Install::new();
+    install.write_config(
+        "default_profile = \"mock\"\n\n[accounts.mock]\nbackend = \"anthropic-messages\"\n\n\
+         [profiles.mock]\naccount = \"mock\"\nmodel = \"claude-sonnet-4-5\"\n",
+    );
+    install.write_script(serde_json::json!([
+        [
+            { "type": "text", "text": "never reached" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]));
+    let directory = install.root().join(support::not_unicode_name());
+    std::fs::create_dir(&directory).expect("mkdir");
+    let output = install
+        .meka(&["--oneshot", "-p", "hello"])
+        .current_dir(&directory)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run Meka");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "the run is refused: {stderr}");
+    assert!(
+        stderr.contains("resolves to a path that is not valid Unicode"),
+        "{stderr}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "no turn ran: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let sessions: i64 = if install.database().exists() {
+        store(&install)
+            .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+            .expect("count the sessions")
+    } else {
+        0
+    };
+    assert_eq!(sessions, 0, "nothing is recorded under such a directory");
+}
+
+/// On Windows a one-shot run sent Ctrl+Break leaves as a terminated one does elsewhere: the turn is
+/// stopped and its row closed as stopped by the run leaving, the report is printed, and the process
+/// exits 130. The event is sent once the turn's row is open, so it lands on a running turn; the run
+/// leads a console process group of its own, so nothing else receives it.
+#[cfg(windows)]
+#[test]
+fn a_oneshot_run_sent_ctrl_break_closes_its_turn() {
+    let install = Install::new();
+    install.write_config(
+        "default_profile = \"mock\"\n\n[accounts.mock]\nbackend = \"anthropic-messages\"\n\n\
+         [profiles.mock]\naccount = \"mock\"\nmodel = \"claude-sonnet-4-5\"\n\n[permissions]\n\
+         default = \"unrestricted\"\nenabled = [\"read\", \"unrestricted\"]\n",
+    );
+    install.write_script(serde_json::json!([
+        [
+            { "type": "sleep", "ms": 60000 },
+            { "type": "text", "text": "never reached" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]));
+    let mut command = install.meka(&["--oneshot", "--format", "json", "-p", "wait"]);
+    command
+        .current_dir(install.work_dir())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    support::in_own_console_group(&mut command);
+    let child = command.spawn().expect("spawn Meka");
+    support::wait_until(
+        "the turn's open row",
+        std::time::Duration::from_secs(20),
+        || {
+            // Read-only, so a look ahead of the run's own first open cannot create the file.
+            rusqlite::Connection::open_with_flags(
+                install.database(),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .and_then(|store| {
+                store.query_row(
+                    "SELECT count(*) FROM turns WHERE ended_at IS NULL",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .is_ok_and(|open| open == 1)
+        },
+    );
+    support::send_ctrl_break(&child);
+    let output = child.wait_with_output().expect("wait for Meka");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "the run exits as an interrupted one: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|error| panic!("one object on stdout ({error}): {stdout:?}"));
+    assert_eq!(report["stop_reason"], "interrupted");
+    let (status, reason, ended): (Option<String>, Option<String>, Option<String>) = store(&install)
+        .query_row(
+            "SELECT status, cancel_reason, ended_at FROM turns",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("the one turn row");
+    assert_eq!(status.as_deref(), Some("canceled"), "{stderr}");
+    assert_eq!(reason.as_deref(), Some("server_shutdown"));
+    assert!(ended.is_some(), "the turn's row is closed");
+}
+
 /// A one-shot run told to terminate leaves the way an interrupted one does: the turn stops its
 /// command and everything the command started, keeps what it had, closes its row as stopped by
 /// the run leaving, prints its report, and the process exits 130. The signal is sent once the

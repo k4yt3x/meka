@@ -296,11 +296,12 @@ apply:
 - Must **exist** on the server's filesystem.
 - Must be a **directory** (not a file, device, or socket).
 - Must not contain **null bytes** (which cause kernel/userspace path mismatch).
+- Must resolve to a path that is **valid Unicode**: the session's record, the model and every client carry the directory as text.
 - Is recorded, and echoed back, in its **canonical spelling**: symlinks resolved, `.` and `..`
   removed. Every host records the same spelling, so a `working_directory` filter on the listing finds a session
   however its directory was spelled.
 
-If `working_directory` is omitted, it defaults to the server process's current working directory.
+If `working_directory` is omitted, it defaults to the server process's current working directory, which [`GET /v1/info`](#discovery-endpoints) states as `default_working_directory`. A server started in a directory whose path is not valid Unicode has no default to give: `/v1/info` leaves the member out, and a creation that names no directory is a `500` saying so.
 
 Sessions persist server-side until explicitly deleted or evicted by the idle timeout GC (see [Session lifecycle](#session-lifecycle)).
 
@@ -1419,7 +1420,7 @@ These endpoints help clients inspect the server's capabilities at runtime.
 | `GET /v1/health/ready` | None | Readiness probe: 200 if the store is healthy, at least one profile is configured, and no `required` MCP server has failed. A failed *optional* server doesn't affect readiness, since it can't stop a turn either. Returns `status`, `session_db`, `profile_configured`, and `mcp_servers_healthy` (boolean, no server names). **`profile_configured` means a profile exists in `config.toml`, not that it has a usable credential**: a profile's credential is checked when a session first needs it, so a server can be ready and still answer 422 to `POST /v1/sessions`. |
 | `GET /v1/projects` | Any read scope | Projects, as `{"projects": [...]}`: every project, each with `name`, `created_at` (RFC 3339), `memories` (in its tier) and `sessions` (root sessions on it). `POST /v1/projects` adds one, `PATCH /v1/projects/{name}` renames one and `DELETE /v1/projects/{name}` removes one, under `memory:w`; see [Projects](projects.md#defining-a-project) |
 | `GET /v1/profiles` | Any read scope | Configured profiles, as `{"profiles": [...]}`. Each carries `name`, `account`, `backend` (omitted when the profile names an account that is not configured), `model` (omitted when the profile names none), `fallbacks`, the profiles a turn moves to when this one cannot serve it (omitted when it names none), `vision`, whether a session on it accepts [image attachments](#image-attachments), and `default: true` on the one a session gets when it names none. `POST`, `PATCH` and `DELETE` on `/v1/profiles` manage them under `config:w`; see [Managing the installation](#managing-the-installation) |
-| `GET /v1/info` | Any read scope | Server version and permission surface, and `scopes`, the ones the calling token holds, so a client can show only the controls it may use. Where the installation is, and whether it awaits a reload or a restart, is `GET /v1/config`'s, under `config:r` (see [Managing the installation](#managing-the-installation)). Carries no profile, model or capability of one: `GET /v1/profiles` reports those per profile and marks the default with `default` |
+| `GET /v1/info` | Any read scope | Server version and permission surface, and `scopes`, the ones the calling token holds, so a client can show only the controls it may use. `default_working_directory` is the directory a session works in when its creation names none; it is stated to a token holding `sessions:r` or `sessions:w` and omitted for any other. Where the installation is, and whether it awaits a reload or a restart, is `GET /v1/config`'s, under `config:r` (see [Managing the installation](#managing-the-installation)). Carries no profile, model or capability of one: `GET /v1/profiles` reports those per profile and marks the default with `default` |
 | `GET /v1/skills` | Any read scope | Installed skills |
 | `GET /v1/mcp` | Any read scope | MCP server connection status, with the protocol version a connected one speaks, and `orphaned_credentials` |
 | `GET /v1/openapi.json` | None, and off unless `[serve].docs` is set | OpenAPI 3 spec |
@@ -1465,7 +1466,7 @@ A session is never evicted while a turn is in flight, while a compaction holds i
 
 ### Graceful shutdown
 
-`meka serve` handles `SIGTERM` / `SIGINT` with a controlled drain:
+`meka serve` answers a request to stop with a controlled drain:
 
 1. Stop accepting new connections.
 2. Cancel all in-flight turns (same mechanism as `POST /cancel`).
@@ -1482,6 +1483,14 @@ A session is never evicted while a turn is in flight, while a compaction holds i
 [serve]
 shutdown_drain_timeout = "30s"
 ```
+
+What asks the server to stop:
+
+- `SIGTERM` or `SIGINT` on Linux and macOS.
+- On Windows, Ctrl+C, Ctrl+Break, its console closing, and a system shutdown when the server runs as a service. Windows ends the process itself about five seconds after its console closes, whatever `shutdown_drain_timeout` says.
+- With `--exit-on-stdin-close`, the end of its standard input.
+
+A program that starts `meka serve` and manages it passes `--exit-on-stdin-close` and holds a pipe to the server's standard input. Closing the pipe is the request to stop, the same on every system, and when the program ends without closing it the operating system does, so the server does not outlive its parent. Nothing written to the pipe is read. Without the flag the server never reads its standard input, so one started with none, as a service manager starts it, is unaffected.
 
 ## Concurrency
 
@@ -1698,7 +1707,7 @@ Key points:
 |--------|------|------|-------------|
 | GET | `/v1/health/live` | None | Liveness probe |
 | GET | `/v1/health/ready` | None | Readiness probe |
-| GET | `/v1/info` | read | Server version, permission surface and the caller's scopes |
+| GET | `/v1/info` | read | Server version, permission surface, the caller's scopes and the default working directory |
 | GET | `/v1/skills` | read | Installed skills |
 | GET | `/v1/mcp` | read | `servers`, each with `state` and `protocol_version` while `connected`; `orphaned_credentials` when a credential is stored under a name no entry claims |
 | POST | `/v1/sessions` | `sessions:w` | Create session |

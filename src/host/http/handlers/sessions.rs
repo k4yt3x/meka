@@ -291,6 +291,20 @@ pub(crate) struct ListedSession {
     pub(crate) excerpt_position: Option<i64>,
 }
 
+/// The directory a session works in when nothing names one: the server process's own, refused when
+/// its path is not valid Unicode as any working directory's is. One definition, so what `GET
+/// /v1/info` states is what a creation takes.
+pub(crate) fn default_working_directory() -> std::io::Result<std::path::PathBuf> {
+    let directory = std::env::current_dir()?;
+    if !crate::workspace::is_unicode(&directory) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "its path is not valid Unicode",
+        ));
+    }
+    Ok(directory)
+}
+
 /// A caller's `cwd` through the one acceptor, refused as a 422 like every other field of the body.
 fn accepted_cwd(path: &std::path::Path) -> Result<std::path::PathBuf, ProblemDetail> {
     // A cwd refusal carries no provider text, so the relay flag has nothing to decide.
@@ -328,7 +342,7 @@ pub(crate) async fn create_session(
         Some(path) => accepted_cwd(&path)?,
         // Propagate `current_dir()` failure as 500 rather than falling back to a relative
         // path, which would surprise tools that resolve paths absolutely.
-        None => std::env::current_dir().map_err(|error| {
+        None => default_working_directory().map_err(|error| {
             ProblemDetail::new(
                 ErrorKind::Internal,
                 StatusCode::INTERNAL_SERVER_ERROR,

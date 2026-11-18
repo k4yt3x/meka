@@ -135,14 +135,41 @@ pub(crate) fn background_cancellation_notice(signaled: usize) -> Option<String> 
         )
     })
 }
-/// Start the process's single SIGINT listener, and on Unix the SIGHUP and SIGTERM listeners with
-/// it. Idempotent; every turn path calls it, and only the first call spawns. `announce` says what a
-/// press did where the host shows such things, and `leave` is how the host leaves on the ladder's
-/// last press, once the canceled work has had its moment: the one-shot exits on the spot, while the
-/// screen has a terminal to give back first and goes through its own exit. `leave_on_signal` is how
-/// the host leaves on a hangup or a termination, once the turn and the background tasks have been
-/// stopped: the screen as on the last press, the one-shot through its run's own exit path, which
-/// waits for the stopped turn to be saved.
+/// Wait to be told to leave with no ladder: a hangup or a termination on Unix, and on Windows what
+/// `crate::host::wait_for_console_end` waits for. Never resolves where the listeners cannot be
+/// installed, which the log says.
+async fn wait_for_hangup_or_termination() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(mut hangup), Ok(mut terminate)) = (
+            signal(SignalKind::hangup()),
+            signal(SignalKind::terminate()),
+        ) else {
+            tracing::warn!("failed to listen for SIGHUP and SIGTERM");
+            return std::future::pending().await;
+        };
+        tokio::select! {
+            _ = hangup.recv() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(windows)]
+    {
+        let event = crate::host::wait_for_console_end().await;
+        tracing::info!("{event} received, leaving");
+    }
+}
+
+/// Start the process's single SIGINT listener, and with it the listener for a hangup or a
+/// termination, which is [`wait_for_hangup_or_termination`]'s. Idempotent; every turn path calls
+/// it, and only the first call spawns. `announce` says what a press did where the host shows such
+/// things, and `leave` is how the host leaves on the ladder's last press, once the canceled work
+/// has had its moment: the one-shot exits on the spot, while the screen has a terminal to give back
+/// first and goes through its own exit. `leave_on_signal` is how the host leaves on a hangup or a
+/// termination, once the turn and the background tasks have been stopped: the screen as on the last
+/// press, the one-shot through its run's own exit path, which waits for the stopped turn to be
+/// saved.
 ///
 /// `tasks` names the background tasks a stop reaches, asked at each stop since the session a screen
 /// shows can change under the listeners; `store` is where the stop is recorded.
@@ -152,13 +179,6 @@ pub(crate) fn install_interrupt_handler(
     tasks: impl Fn() -> crate::background::BackgroundTasks + Send + Sync + 'static,
     announce: impl Fn(&str) + Send + Sync + 'static,
     leave: impl Fn() + Send + Sync + 'static,
-    #[cfg_attr(
-        not(unix),
-        allow(
-            unused_variables,
-            reason = "only Unix listens for a hangup or a termination"
-        )
-    )]
     leave_on_signal: impl Fn() + Send + Sync + 'static,
 ) {
     static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
@@ -171,24 +191,12 @@ pub(crate) fn install_interrupt_handler(
     // stopped, and the background tasks with it, whose process groups would otherwise outlive the
     // exit untracked; then the host leaves through its own exit path, which lets the stopped turn
     // unwind, kills a `!command` still running and gives the terminal back where there is one.
-    #[cfg(unix)]
     tokio::spawn({
         let cancel = cancel.clone();
         let tasks = Arc::clone(&tasks);
         let store = store.clone();
         async move {
-            use tokio::signal::unix::{SignalKind, signal};
-            let (Ok(mut hangup), Ok(mut terminate)) = (
-                signal(SignalKind::hangup()),
-                signal(SignalKind::terminate()),
-            ) else {
-                tracing::warn!("failed to listen for SIGHUP and SIGTERM");
-                return;
-            };
-            tokio::select! {
-                _ = hangup.recv() => {}
-                _ = terminate.recv() => {}
-            }
+            wait_for_hangup_or_termination().await;
             INTERRUPT_RELAY
                 .told_to_leave
                 .store(true, std::sync::atomic::Ordering::SeqCst);
