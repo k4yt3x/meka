@@ -5733,6 +5733,16 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         let child = child.expect("the worker's row appears while it runs");
+        // The row is there before the worker's turn opens, and a steer written ahead of the
+        // opening is part of it, which no round boundary then carries. So the steer waits for the
+        // first request to be out, where the gate holds it.
+        for _ in 0..250 {
+            if !mock.streams().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(mock.streams().len(), 1, "the worker's first request is out");
         let steer = AgentSteerTool {
             tool_builder_params: params.clone(),
         };
