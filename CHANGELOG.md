@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Answers stream as they are written on endpoints that close reasoning late, such as llama.cpp.
+
 ## [0.95.0] - 2026-11-16
 
 ### Added

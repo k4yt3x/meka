@@ -522,8 +522,10 @@ pub(crate) enum FrontendEvent {
     /// what lets each frontend pick a lane once and hold it: a consumer either renders the deltas
     /// or renders the block, and never has to remember which of the two a given block produced.
     ThinkingDelta(String),
-    /// A complete thinking block, as text to show. Emitted after the provider's `ThinkingComplete`
-    /// stream event, and always preceded by the [`Self::ThinkingDelta`]s carrying the same text.
+    /// A thought as it ended, as text to show: the thinking block whole when the provider's
+    /// `ThinkingComplete` stream event closes it, or what a block still open has shown when another
+    /// part of the reply overtakes it, after which the block's own end carries only what it showed
+    /// since. Always preceded by the [`Self::ThinkingDelta`]s carrying the same text.
     ///
     /// Still emitted for a consumer that wants reasoning whole -- ACP thought chunks, the blocking
     /// HTTP response, the screen's collapsed thinking row -- and as the end-of-block marker for

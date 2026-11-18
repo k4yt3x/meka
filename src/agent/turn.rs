@@ -3438,7 +3438,7 @@ impl Agent {
             // What the user sees is decided here, event by event, while the accumulator holds the
             // part as it stood when the event arrived; what the conversation keeps is the
             // accumulator's one answer, shared with every other reader of a stream.
-            let (drawn, closes) = match &event {
+            let drawn = match &event {
                 StreamEvent::ThinkingDelta(text) => {
                     // Each part is recorded as its own; a reader sees them a blank line apart, as
                     // the block reads whole.
@@ -3447,82 +3447,57 @@ impl Agent {
                     } else {
                         text.clone()
                     };
-                    (Some(FrontendEvent::ThinkingDelta(text)), false)
+                    Some(FrontendEvent::ThinkingDelta(text))
                 }
-                StreamEvent::ThinkingProgress { estimated_tokens } => (
+                StreamEvent::ThinkingProgress { estimated_tokens } => {
                     Some(FrontendEvent::ThinkingProgress {
                         estimated_tokens: *estimated_tokens,
-                    }),
-                    false,
-                ),
+                    })
+                }
+                // The deltas above are not asked whether they show anything: whitespace is content
+                // mid-block, so the question can only be asked once the block is whole, which is
+                // here. Whether the block is *kept* is the accumulator's answer, and asks the raw
+                // text: what the provider will accept back is not a question about what is worth
+                // showing.
                 StreamEvent::ThinkingComplete { .. } => {
-                    let content = accumulator.pending_thinking();
-                    // Whether there is anything to *show*, which is the question
-                    // `render::render_message_history` asks of the same block on replay, so a
-                    // resumed transcript cannot gain or lose a block against the live turn.
-                    //
-                    // The deltas above are not held to it: whitespace is content mid-block, so the
-                    // question can only be asked once the block is whole, which is here. Whether
-                    // the block is *kept* is the accumulator's answer, and asks the raw text: what
-                    // the provider will accept back is not a question about what is worth showing.
-                    //
-                    // Nothing to render still ends the block, so a frontend showing a live
-                    // indicator can close it here instead of holding the line open for an event
-                    // that may never come.
-                    let drawn = if content.trim().is_empty() {
-                        FrontendEvent::ThinkingEnded
-                    } else {
-                        FrontendEvent::ThinkingBlock { content }
-                    };
-                    (Some(drawn), true)
+                    Some(thought_end(accumulator.pending_thinking()))
                 }
-                StreamEvent::RedactedThinking { .. } => {
-                    (Some(FrontendEvent::RedactedThinking), true)
-                }
+                StreamEvent::RedactedThinking { .. } => Some(FrontendEvent::RedactedThinking),
                 // A refusal's words are the model's, shown as it streams them.
                 StreamEvent::TextDelta(text) | StreamEvent::RefusalDelta(text) => {
-                    (Some(FrontendEvent::AssistantTextDelta(text.clone())), false)
+                    Some(FrontendEvent::AssistantTextDelta(text.clone()))
                 }
-                // The end of a part changes nothing on screen.
-                StreamEvent::TextEnd { .. } => (None, true),
-                StreamEvent::ToolUseStart { id, name } => (
-                    Some(FrontendEvent::ToolCallComposing {
-                        id: id.clone(),
-                        name: name.clone(),
-                    }),
-                    false,
-                ),
+                StreamEvent::ToolUseStart { id, name } => Some(FrontendEvent::ToolCallComposing {
+                    id: id.clone(),
+                    name: name.clone(),
+                }),
                 StreamEvent::ToolUseEnd {
                     id, name, input, ..
-                } => (
-                    Some(FrontendEvent::ToolCallStarted {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: input.clone(),
-                        display_summary: crate::tools::resolve_primary_param(name, input),
-                        unparsed: None,
-                    }),
-                    true,
-                ),
+                } => Some(FrontendEvent::ToolCallStarted {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                    display_summary: crate::tools::resolve_primary_param(name, input),
+                    unparsed: None,
+                }),
                 // A malformed call arrived. The accumulator keeps a `ToolUse` block with `{}` for
                 // its arguments and what the model sent beside it, so the assistant message stays
                 // valid for the round trip and dispatch refuses the call rather than run it on
                 // arguments the model did not give. Shown the same way.
                 StreamEvent::ToolCallRefused {
                     id, name, unparsed, ..
-                } => (
-                    Some(FrontendEvent::ToolCallStarted {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: serde_json::json!({}),
-                        display_summary: None,
-                        unparsed: Some(unparsed.clone()),
-                    }),
-                    true,
-                ),
-                // What Meka reads nothing from is kept, not shown, and a call's arguments are drawn
-                // whole, when the call starts.
+                } => Some(FrontendEvent::ToolCallStarted {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: serde_json::json!({}),
+                    display_summary: None,
+                    unparsed: Some(unparsed.clone()),
+                }),
+                // The end of a part of the answer changes nothing on screen, what Meka reads
+                // nothing from is kept, not shown, and a call's arguments are drawn whole, when the
+                // call starts.
                 StreamEvent::Place(_)
+                | StreamEvent::TextEnd { .. }
                 | StreamEvent::ThinkingPart { .. }
                 | StreamEvent::ContentPart(_)
                 | StreamEvent::Unrecognized(_)
@@ -3531,7 +3506,7 @@ impl Agent {
                 | StreamEvent::Model(_)
                 | StreamEvent::MessageFields(_)
                 | StreamEvent::ResponseFields(_)
-                | StreamEvent::Usage(_) => (None, false),
+                | StreamEvent::Usage(_) => None,
                 StreamEvent::Notice(notice) => {
                     // Provider advisories (image redaction) are emitted inline so the user sees
                     // them in order with the assistant text that follows.
@@ -3542,7 +3517,7 @@ impl Agent {
                     // even sent, so marking it would disable retry for the whole turn from the
                     // first event onward; `forward_notice` drops the advisory a retry repeats.
                     self.forward_notice(notice.clone()).await;
-                    (None, false)
+                    None
                 }
                 StreamEvent::Error(error) => {
                     // No return: every producer of this event sends it ahead of its own typed
@@ -3561,20 +3536,15 @@ impl Agent {
                     self.cells.frontend.emit(FrontendEvent::ThinkingEnded).await;
                     tracing::debug!("stream error: {error}");
                     failed = true;
-                    (None, false)
+                    None
                 }
             };
-            for drawn in order.arrive(accumulator.place(), drawn, closes) {
-                self.draw(drawn, progress).await;
+            if let Some(drawn) = drawn {
+                for drawn in order.arrive(accumulator.place(), drawn) {
+                    self.draw(drawn, progress).await;
+                }
             }
             accumulator.push(event);
-        }
-        // What waited for a part that never closed is drawn once the reply has ended; what waited
-        // when the stream failed is held with the attempt's partial reply and never shown.
-        if !failed {
-            for drawn in order.finish() {
-                self.draw(drawn, progress).await;
-            }
         }
 
         match stream_handle.await {
@@ -3643,61 +3613,100 @@ impl Agent {
     }
 }
 
+/// How a thought ends on the surfaces: as a block when it has `words` to show, else as the end of
+/// one that showed none.
+///
+/// Whether there is anything to *show* is the question `render::render_message_history` asks of the
+/// same block on replay, so a resumed transcript cannot gain or lose a block against the live turn.
+/// Nothing to render still ends the thought, so a frontend showing a live indicator can close it
+/// instead of holding the line open for an event that may never come.
+fn thought_end(words: String) -> FrontendEvent {
+    if words.trim().is_empty() {
+        FrontendEvent::ThinkingEnded
+    } else {
+        FrontendEvent::ThinkingBlock { content: words }
+    }
+}
+
 /// The order a reply's parts reach the surfaces: each as it arrives, one part at a time.
 ///
 /// Every surface draws one stream of words, one thought or one call at a time (the screen's live
-/// row, an editor's chunks, the feed's deltas), and a stream may open a part before an earlier
-/// one stops (OpenRouter overlaps Claude's blocks). A part that has drawn holds the surfaces until
-/// it closes; what other parts draw meanwhile waits, and follows in their places' order.
+/// row, an editor's chunks, the feed's deltas), and a stream may open a part before an earlier one
+/// closes: the Responses spec orders no item's `done` against the next item's `added`, llama.cpp
+/// closes every item and every Claude block when the reply ends, and OpenRouter closes a Claude
+/// block after the blocks inside it. A part held until the one before it closed would wait as long
+/// as that close is late, the whole answer on such an endpoint, so no part waits for another. A
+/// thought another part overtakes is ended on the surfaces as it stands, and its own end, when it
+/// arrives, ends only what it has drawn since.
 #[derive(Default)]
 struct DrawOrder {
-    /// The place of the part on the surfaces now: it has drawn and not closed.
-    drawing: Option<u64>,
-    /// What other parts drew while one held the surfaces, by place, and whether each has closed.
-    waiting: std::collections::BTreeMap<u64, (Vec<FrontendEvent>, bool)>,
+    /// The thought open on the surfaces: its place, and the words it has drawn since it opened
+    /// there.
+    thought: Option<(u64, String)>,
+    /// The places whose thought the surfaces ended ahead of its own end.
+    overtaken: std::collections::BTreeSet<u64>,
 }
 
 impl DrawOrder {
-    /// What to draw now that the part at `place` arrived with `drawn`, closing it when `closes`.
-    fn arrive(
-        &mut self,
-        place: u64,
-        drawn: Option<FrontendEvent>,
-        closes: bool,
-    ) -> Vec<FrontendEvent> {
-        if self.drawing.is_some_and(|holder| holder != place) {
-            if drawn.is_some() || closes {
-                let (events, closed) = self.waiting.entry(place).or_default();
-                events.extend(drawn);
-                *closed |= closes;
+    /// What to draw now that the part at `place` arrived with `drawn`.
+    fn arrive(&mut self, place: u64, drawn: FrontendEvent) -> Vec<FrontendEvent> {
+        let open_here = self
+            .thought
+            .as_ref()
+            .is_some_and(|(open, _)| *open == place);
+        if matches!(
+            drawn,
+            FrontendEvent::ThinkingBlock { .. } | FrontendEvent::ThinkingEnded
+        ) {
+            let overtaken = self.overtaken.remove(&place);
+            // A thought's end ends what that thought has open. One the surfaces ended when it was
+            // overtaken has only what it has drawn since to end.
+            if open_here {
+                let (_, words) = self.thought.take().unwrap_or_default();
+                return vec![if overtaken { thought_end(words) } else { drawn }];
             }
-            return Vec::new();
+            // With nothing of its own open, an end draws nothing: the surfaces have ended an
+            // overtaken thought, and the end of one that showed nothing would end the thought
+            // another part has open.
+            if overtaken
+                || (self.thought.is_some() && matches!(drawn, FrontendEvent::ThinkingEnded))
+            {
+                return Vec::new();
+            }
         }
+        // Whatever else arrives overtakes the thought open on the surfaces, that thought's own
+        // words and progress aside.
+        let continues = open_here
+            && matches!(
+                drawn,
+                FrontendEvent::ThinkingDelta(_)
+                    | FrontendEvent::ThinkingProgress { .. }
+                    | FrontendEvent::RedactedThinking
+            );
         let mut now = Vec::new();
-        if let Some(event) = drawn {
-            now.push(event);
-            self.drawing = Some(place);
+        if !continues && let Some((open, words)) = self.thought.take() {
+            now.push(thought_end(words));
+            self.overtaken.insert(open);
         }
-        if closes && self.drawing == Some(place) {
-            self.drawing = None;
-            while let Some((place, (events, closed))) = self.waiting.pop_first() {
-                let drew = !events.is_empty();
-                now.extend(events);
-                if drew && !closed {
-                    self.drawing = Some(place);
-                    break;
-                }
+        match &drawn {
+            FrontendEvent::ThinkingDelta(text) => self
+                .thought
+                .get_or_insert_with(|| (place, String::new()))
+                .1
+                .push_str(text),
+            FrontendEvent::ThinkingProgress { .. } => {
+                self.thought.get_or_insert_with(|| (place, String::new()));
             }
+            // A withheld block is said by its end alone, so that end is drawn whether or not the
+            // block was overtaken while it counted.
+            FrontendEvent::RedactedThinking => {
+                self.thought = None;
+                self.overtaken.remove(&place);
+            }
+            _ => {}
         }
+        now.push(drawn);
         now
-    }
-
-    /// Everything still waiting, in place order, once the reply has ended.
-    fn finish(self) -> Vec<FrontendEvent> {
-        self.waiting
-            .into_values()
-            .flat_map(|(events, _)| events)
-            .collect()
     }
 }
 
@@ -5448,47 +5457,265 @@ mod tests {
         );
     }
 
-    /// Words of parts open at once are drawn one part at a time: a part that has drawn holds the
-    /// surfaces until it closes, a part that has drawn nothing holds nothing, and what waited
-    /// follows in place order up to the next part still open; what waits on a part that never
-    /// closes is drawn when the reply ends.
-    #[test]
-    fn parts_that_overlap_are_drawn_one_at_a_time_in_place_order() {
-        let text = |words: &str| Some(FrontendEvent::AssistantTextDelta(words.to_string()));
-        let words = |events: Vec<FrontendEvent>| -> Vec<String> {
-            events
-                .into_iter()
-                .map(|event| match event {
-                    FrontendEvent::AssistantTextDelta(words) => words,
-                    other => format!("{other:?}"),
-                })
-                .collect()
-        };
-        let mut order = DrawOrder::default();
-        assert!(order.arrive(0, None, false).is_empty());
-        assert_eq!(words(order.arrive(2, text("two "), false)), ["two "]);
-        assert!(order.arrive(1, text("one "), false).is_empty());
-        assert!(order.arrive(0, text("zero "), false).is_empty());
-        assert!(order.arrive(1, None, true).is_empty());
-        assert_eq!(words(order.arrive(2, text("more"), false)), ["more"]);
-        assert_eq!(words(order.arrive(2, None, true)), ["zero "]);
-        assert_eq!(words(order.arrive(0, None, true)), ["one "]);
-        assert_eq!(words(order.arrive(3, text("three"), false)), ["three"]);
-        assert!(order.finish().is_empty());
-
-        let mut order = DrawOrder::default();
-        assert_eq!(words(order.arrive(0, text("open"), false)), ["open"]);
-        assert!(order.arrive(1, text("after"), false).is_empty());
-        assert_eq!(words(order.finish()), ["after"]);
+    /// What a draw order shows of `events`, one word per event.
+    fn shown(events: Vec<FrontendEvent>) -> Vec<String> {
+        events
+            .into_iter()
+            .map(|event| match event {
+                FrontendEvent::ThinkingProgress { .. } => "progress".to_string(),
+                FrontendEvent::ThinkingDelta(words) => format!("thinking:{words}"),
+                FrontendEvent::ThinkingBlock { content } => format!("thought:{content}"),
+                FrontendEvent::ThinkingEnded => "ended".to_string(),
+                FrontendEvent::RedactedThinking => "redacted".to_string(),
+                FrontendEvent::AssistantTextDelta(words) => format!("text:{words}"),
+                FrontendEvent::ToolCallComposing { id, .. } => format!("composing:{id}"),
+                FrontendEvent::ToolCallStarted { id, .. } => format!("started:{id}"),
+                other => format!("{other:?}"),
+            })
+            .collect()
     }
 
-    /// A part that opens inside another on the stream (OpenRouter's `redacted_thinking` inside the
-    /// thinking it follows) is drawn once the other closes, rather than over its live row, and the
+    /// Every part is drawn as it arrives, whichever parts before it are still open, as on an
+    /// endpoint that closes each part when the reply ends: the answer overtakes the thought before
+    /// it, which is ended on the surfaces first, and each call is announced and started as it
+    /// comes. The ends that arrive last draw nothing a surface has already shown.
+    #[test]
+    fn a_part_is_drawn_as_it_arrives_and_ends_the_thought_it_overtakes() {
+        let thinking = |words: &str| FrontendEvent::ThinkingDelta(words.to_string());
+        let thought = |words: &str| FrontendEvent::ThinkingBlock {
+            content: words.to_string(),
+        };
+        let text = |words: &str| FrontendEvent::AssistantTextDelta(words.to_string());
+        let progress = || FrontendEvent::ThinkingProgress {
+            estimated_tokens: None,
+        };
+        let composing = |id: &str| FrontendEvent::ToolCallComposing {
+            id: id.to_string(),
+            name: "file_read".to_string(),
+        };
+        let started = |id: &str| FrontendEvent::ToolCallStarted {
+            id: id.to_string(),
+            name: "file_read".to_string(),
+            input: serde_json::json!({}),
+            display_summary: None,
+            unparsed: None,
+        };
+        let mut order = DrawOrder::default();
+        assert_eq!(shown(order.arrive(0, thinking("plan"))), ["thinking:plan"]);
+        assert_eq!(shown(order.arrive(0, thinking(" it"))), ["thinking: it"]);
+        assert_eq!(shown(order.arrive(1, text("The "))), [
+            "thought:plan it",
+            "text:The "
+        ]);
+        assert_eq!(shown(order.arrive(1, text("answer"))), ["text:answer"]);
+        assert_eq!(shown(order.arrive(2, composing("a"))), ["composing:a"]);
+        assert_eq!(shown(order.arrive(3, composing("b"))), ["composing:b"]);
+        assert!(order.arrive(0, thought("plan it")).is_empty());
+        assert_eq!(shown(order.arrive(2, started("a"))), ["started:a"]);
+        assert_eq!(shown(order.arrive(3, started("b"))), ["started:b"]);
+
+        // A call overtakes a thought as the answer does.
+        let mut order = DrawOrder::default();
+        assert_eq!(shown(order.arrive(0, thinking("plan"))), ["thinking:plan"]);
+        assert_eq!(shown(order.arrive(1, composing("a"))), [
+            "thought:plan",
+            "composing:a"
+        ]);
+
+        // A thought nothing overtakes ends as its block reads.
+        let mut order = DrawOrder::default();
+        assert_eq!(shown(order.arrive(0, thinking("plan"))), ["thinking:plan"]);
+        assert_eq!(shown(order.arrive(0, thought("the plan"))), [
+            "thought:the plan"
+        ]);
+        assert_eq!(shown(order.arrive(1, text("answer"))), ["text:answer"]);
+
+        // A thought's own words and progress keep it open, and the answer overtakes it at its own
+        // place as at any other.
+        let mut order = DrawOrder::default();
+        assert_eq!(shown(order.arrive(0, thinking("plan"))), ["thinking:plan"]);
+        assert_eq!(shown(order.arrive(0, progress())), ["progress"]);
+        assert_eq!(shown(order.arrive(0, thinking(" it"))), ["thinking: it"]);
+        assert_eq!(shown(order.arrive(0, text("answer"))), [
+            "thought:plan it",
+            "text:answer"
+        ]);
+        assert!(order.arrive(0, thought("plan it")).is_empty());
+    }
+
+    /// The end of a thought ends that thought alone: the late end of one that was overtaken, and
+    /// the end of one that showed nothing, leave the thought of another part open. With no thought
+    /// open, the end of one that showed nothing is passed on as it came.
+    #[test]
+    fn the_end_of_a_thought_ends_no_other_part_s_thought() {
+        let thinking = |words: &str| FrontendEvent::ThinkingDelta(words.to_string());
+        let thought = |words: &str| FrontendEvent::ThinkingBlock {
+            content: words.to_string(),
+        };
+        let mut order = DrawOrder::default();
+        assert_eq!(shown(order.arrive(0, thinking("first"))), [
+            "thinking:first"
+        ]);
+        assert_eq!(shown(order.arrive(2, thinking("second"))), [
+            "thought:first",
+            "thinking:second"
+        ]);
+        assert!(order.arrive(0, thought("first")).is_empty());
+        assert!(order.arrive(1, FrontendEvent::ThinkingEnded).is_empty());
+        assert_eq!(shown(order.arrive(2, thinking(" more"))), [
+            "thinking: more"
+        ]);
+        assert_eq!(shown(order.arrive(2, thought("second more"))), [
+            "thought:second more"
+        ]);
+        assert_eq!(shown(order.arrive(3, FrontendEvent::ThinkingEnded)), [
+            "ended"
+        ]);
+    }
+
+    /// A thought that was overtaken ends once: its own end draws only the words it drew after, and
+    /// nothing when it drew none. A thought that showed no words ends as one, and the withheld
+    /// block it stood for is still said when its end arrives.
+    #[test]
+    fn an_overtaken_thought_ends_once_and_then_for_what_it_drew_since() {
+        let thinking = |words: &str| FrontendEvent::ThinkingDelta(words.to_string());
+        let thought = |words: &str| FrontendEvent::ThinkingBlock {
+            content: words.to_string(),
+        };
+        let text = |words: &str| FrontendEvent::AssistantTextDelta(words.to_string());
+        let mut order = DrawOrder::default();
+        assert_eq!(shown(order.arrive(0, thinking("first"))), [
+            "thinking:first"
+        ]);
+        assert_eq!(shown(order.arrive(1, text("answer"))), [
+            "thought:first",
+            "text:answer"
+        ]);
+        assert_eq!(shown(order.arrive(0, thinking(" second"))), [
+            "thinking: second"
+        ]);
+        assert_eq!(shown(order.arrive(1, text(" more"))), [
+            "thought: second",
+            "text: more"
+        ]);
+        assert_eq!(shown(order.arrive(0, thinking(" third"))), [
+            "thinking: third"
+        ]);
+        assert_eq!(shown(order.arrive(0, thought("first second third"))), [
+            "thought: third"
+        ]);
+        // Its end was its own, so the next thought at the place ends as any other.
+        assert_eq!(shown(order.arrive(0, thinking("again"))), [
+            "thinking:again"
+        ]);
+        assert_eq!(shown(order.arrive(0, thought("again"))), ["thought:again"]);
+
+        let mut order = DrawOrder::default();
+        let progress = FrontendEvent::ThinkingProgress {
+            estimated_tokens: None,
+        };
+        assert_eq!(shown(order.arrive(0, progress)), ["progress"]);
+        assert_eq!(shown(order.arrive(1, text("answer"))), [
+            "ended",
+            "text:answer"
+        ]);
+        assert_eq!(shown(order.arrive(0, FrontendEvent::RedactedThinking)), [
+            "redacted"
+        ]);
+    }
+
+    /// What a reply of `events` drew of its reasoning and its answer, one word per event, and the
+    /// blocks it recorded.
+    async fn drawn_and_recorded(events: Vec<MockEvent>) -> (Vec<String>, Vec<ContentBlock>) {
+        let (agent, _provider, _store, _session_id, frontend) =
+            agent_with_session(vec![events]).await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the turn");
+        let drawn = frontend
+            .events()
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    FrontendEvent::ThinkingProgress { .. }
+                        | FrontendEvent::ThinkingDelta(_)
+                        | FrontendEvent::ThinkingBlock { .. }
+                        | FrontendEvent::ThinkingEnded
+                        | FrontendEvent::RedactedThinking
+                        | FrontendEvent::AssistantTextDelta(_)
+                )
+            })
+            .collect();
+        let reply = messages
+            .iter()
+            .find(|message| message.role == Role::Assistant)
+            .expect("the reply")
+            .content
+            .clone();
+        (shown(drawn), reply)
+    }
+
+    /// An answer streams while the reasoning before it is still open, as llama.cpp sends a reply:
+    /// the thought ends on the surfaces when the answer starts, each of the answer's words is drawn
+    /// as it arrives, the block's own end at the reply's end draws no second thought, and the
     /// record keeps each part in its place.
     #[tokio::test]
-    async fn a_part_that_opens_inside_another_is_drawn_once_the_other_closes() {
+    async fn an_answer_streams_while_the_reasoning_before_it_is_still_open() {
         use crate::provider::mock::MockStopReason;
-        let (agent, _provider, _store, _session_id, frontend) = agent_with_session(vec![vec![
+        let (drawn, reply) = drawn_and_recorded(vec![
+            MockEvent::ThinkingProgress {
+                estimated_tokens: None,
+            },
+            MockEvent::ThinkingDelta {
+                text: "pondering".to_string(),
+            },
+            MockEvent::Place { place: 1 },
+            MockEvent::Text {
+                text: "The ".to_string(),
+            },
+            MockEvent::Text {
+                text: "answer.".to_string(),
+            },
+            MockEvent::Place { place: 0 },
+            MockEvent::ThinkingComplete { opaque: None },
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::EndTurn,
+            },
+        ])
+        .await;
+        assert_eq!(drawn, [
+            "progress",
+            "thinking:pondering",
+            "thought:pondering",
+            "text:The ",
+            "text:answer."
+        ]);
+        let [
+            ContentBlock::Thinking { parts, .. },
+            ContentBlock::Text { text, .. },
+        ] = reply.as_slice()
+        else {
+            panic!("{reply:?}");
+        };
+        assert_eq!(crate::conversation::reasoning_text(parts), "pondering");
+        assert_eq!(text, "The answer.");
+    }
+
+    /// A part that opens inside a thought on the stream (OpenRouter's `redacted_thinking` inside
+    /// the thinking it follows) is drawn after the thought has ended on the surfaces, rather than
+    /// over its live row, and the record keeps each part in its place.
+    #[tokio::test]
+    async fn a_part_that_opens_inside_a_thought_is_drawn_after_the_thought_ends() {
+        use crate::provider::mock::MockStopReason;
+        let (drawn, reply) = drawn_and_recorded(vec![
             MockEvent::ThinkingProgress {
                 estimated_tokens: None,
             },
@@ -5496,13 +5723,13 @@ mod tests {
                 text: "summary".to_string(),
             },
             MockEvent::Place { place: 1 },
+            MockEvent::ThinkingProgress {
+                estimated_tokens: None,
+            },
             MockEvent::RedactedThinking {
                 data: "SEALED".to_string(),
             },
             MockEvent::Place { place: 0 },
-            MockEvent::ThinkingDelta {
-                text: " more".to_string(),
-            },
             MockEvent::ThinkingComplete {
                 opaque: Some(crate::conversation::OpaqueReasoning::Signed {
                     signature: "S".to_string(),
@@ -5515,102 +5742,24 @@ mod tests {
             MockEvent::MessageEnd {
                 stop_reason: MockStopReason::EndTurn,
             },
-        ]])
+        ])
         .await;
-        let mut messages = Conversation::new();
-        agent
-            .run_turn(
-                &mut messages,
-                crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
-                    .expect("a prompt"),
-                crate::agent::TurnCancellation::new(),
-            )
-            .await
-            .expect("the turn");
-        let drawn: Vec<String> = frontend
-            .events()
-            .iter()
-            .filter_map(|event| match event {
-                FrontendEvent::ThinkingProgress { .. } => Some("progress".to_string()),
-                FrontendEvent::ThinkingDelta(text) => Some(format!("thinking:{text}")),
-                FrontendEvent::ThinkingBlock { .. } => Some("thought".to_string()),
-                FrontendEvent::RedactedThinking => Some("redacted".to_string()),
-                FrontendEvent::AssistantTextDelta(text) => Some(format!("text:{text}")),
-                _ => None,
-            })
-            .collect();
         assert_eq!(drawn, [
             "progress",
             "thinking:summary",
-            "thinking: more",
-            "thought",
+            "thought:summary",
+            "progress",
             "redacted",
             "text:899"
         ]);
-        let reply = messages
-            .iter()
-            .find(|message| message.role == Role::Assistant)
-            .expect("the reply");
         assert!(
-            matches!(reply.content.as_slice(), [
+            matches!(reply.as_slice(), [
                 ContentBlock::Thinking { .. },
                 ContentBlock::RedactedThinking { .. },
                 ContentBlock::Text { .. },
             ]),
-            "{:?}",
-            reply.content
+            "{reply:?}"
         );
-    }
-
-    /// What a part drew while another held the surfaces was never shown, so a stream that fails
-    /// before the other closes leaves the retry the failure allows, and the retry's answer is the
-    /// one drawn.
-    #[tokio::test]
-    async fn a_part_that_waited_for_another_does_not_refuse_the_retry() {
-        use crate::provider::mock::MockStopReason;
-        let (agent, _provider, _store, _session_id, frontend) = agent_with_session(vec![
-            vec![
-                MockEvent::ToolUseStart {
-                    id: "call-open".to_string(),
-                    name: "file_read".to_string(),
-                },
-                MockEvent::Place { place: 1 },
-                MockEvent::Text {
-                    text: "waited".to_string(),
-                },
-                MockEvent::FailStream {
-                    message: "connection reset".to_string(),
-                },
-            ],
-            vec![
-                MockEvent::Text {
-                    text: "answered on the retry".to_string(),
-                },
-                MockEvent::MessageEnd {
-                    stop_reason: MockStopReason::EndTurn,
-                },
-            ],
-        ])
-        .await;
-        let mut messages = Conversation::new();
-        agent
-            .run_turn(
-                &mut messages,
-                crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
-                    .expect("a prompt"),
-                crate::agent::TurnCancellation::new(),
-            )
-            .await
-            .expect("the retry carries the turn");
-        let words: Vec<String> = frontend
-            .events()
-            .into_iter()
-            .filter_map(|event| match event {
-                FrontendEvent::AssistantTextDelta(text) => Some(text),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(words, ["answered on the retry"]);
     }
 
     /// A reply stopped mid-stream is recorded whole, its reasoning and the call it made included,
