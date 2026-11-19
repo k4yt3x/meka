@@ -482,7 +482,8 @@ struct Screen {
     drawn: ratatui::buffer::Buffer,
     /// The transcript's area in the last frame, for mapping a click.
     transcript_area: Rect,
-    /// The back-to-bottom pill in the last frame, when one was drawn.
+    /// The cells of the back-to-bottom pill in the last frame, its foot's among them, when one
+    /// was drawn.
     pill: Option<Rect>,
     /// The overlay's area in the last frame, when one was drawn.
     overlay_area: Option<Rect>,
@@ -3157,6 +3158,13 @@ impl Screen {
             0
         };
         let chrome_rows = 2 * padding;
+        // Whether the composer's block stands under the gap and starts half a row down its first
+        // row. The completion list sits on the block's top edge, so the row under it stays whole
+        // rather than leaving the terminal's half between the two.
+        let half_row_above = self.overlay.is_none()
+            && prompt_padding == PromptPadding::Half
+            && padding > 0
+            && self.composer.focus() != Focus::Completion;
         let gap = if fits(gap, padding) {
             gap
         } else if fits(1, padding) {
@@ -3231,15 +3239,19 @@ impl Screen {
             taken =
                 view::draw_working_row(frame, pill_row, activity, *elapsed, self.shown_working.1);
         }
-        let pointer = self.pointer;
         self.pill = (gap > 0 && !self.viewport.is_following()).then(|| {
-            let pill = view::draw_back_to_bottom(frame, pill_row, taken, false);
-            if pointer.is_some_and(|((column, row), _)| view::is_on_pill(Some(pill), column, row)) {
-                view::draw_back_to_bottom(frame, pill_row, taken, true)
-            } else {
-                pill
-            }
+            let mut pill = view::draw_back_to_bottom(frame, pill_row, taken, false);
+            // Over a block that starts half a row down, the cells under the pill are its foot,
+            // and the pointer and a press there are on the pill.
+            pill.height += u16::from(half_row_above);
+            pill
         });
+        let pill_hovered = self
+            .pointer
+            .is_some_and(|((column, row), _)| view::is_on_pill(self.pill, column, row));
+        if pill_hovered {
+            view::draw_back_to_bottom(frame, pill_row, taken, true);
+        }
         // On the same row, clear of the status row's readings, and of whatever panel or question
         // stands in the composer's place.
         if let Some((hint, _)) = self.hint.as_ref().filter(|_| gap > 0) {
@@ -3314,12 +3326,13 @@ impl Screen {
                         (composer_area.y + composer_area.height).saturating_sub(1),
                     );
                     barred.height = barred.height.saturating_sub(padding);
-                    // The completion list sits on the block's top edge, so the row under it stays
-                    // whole rather than leaving the terminal's half between the two.
-                    if self.composer.focus() != Focus::Completion {
+                    if half_row_above {
                         half_row(view::PaddingSide::Above, composer_area.y);
                         barred.y += padding;
                         barred.height = barred.height.saturating_sub(padding);
+                        if let Some(pill) = self.pill {
+                            view::draw_pill_foot(frame, pill, pill_hovered);
+                        }
                     }
                 }
                 let field = Rect {

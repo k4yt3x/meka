@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.96.1] - 2026-11-19
+
+### Fixed
+
+- `back to bottom` stands on the composer at the default padding, not half a row above it.
+
 ## [0.96.0] - 2026-11-18
 
 ### Added
@@ -3406,7 +3412,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.96.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.96.1...HEAD
+[0.96.1]: https://github.com/k4yt3x/meka/compare/0.96.0...0.96.1
 [0.96.0]: https://github.com/k4yt3x/meka/compare/0.95.0...0.96.0
 [0.95.0]: https://github.com/k4yt3x/meka/compare/0.94.0...0.95.0
 [0.94.0]: https://github.com/k4yt3x/meka/compare/0.93.0...0.94.0

@@ -11,7 +11,7 @@ use std::{
 use ratatui::{
     Frame,
     buffer::{Buffer, Cell, CellDiffOption},
-    layout::Rect,
+    layout::{Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Clear, Paragraph},
@@ -2253,13 +2253,38 @@ pub(crate) fn draw_back_to_bottom(
         width: label_width,
         height: 1.min(area.height),
     };
-    let style = if hovered {
-        Style::default().fg(COMPOSER_BACKGROUND).bg(draw::WHITE)
-    } else {
-        Style::default().fg(draw::WHITE).bg(COMPOSER_BACKGROUND)
-    };
+    let (background, words) = pill_colors(hovered);
+    let style = Style::default().fg(words).bg(background);
     frame.render_widget(Paragraph::new(Line::from(Span::styled(label, style))), pill);
     pill
+}
+
+/// The pill's background and the color of its words: the composer's gray under white, and the two
+/// swapped while `hovered`.
+fn pill_colors(hovered: bool) -> (Color, Color) {
+    if hovered {
+        (draw::WHITE, COMPOSER_BACKGROUND)
+    } else {
+        (COMPOSER_BACKGROUND, draw::WHITE)
+    }
+}
+
+/// The pill's foot, where the composer's block starts half a row under the pill's words: the
+/// terminal's half of each cell under them takes the pill's color, so the pill stands on the
+/// block with none of the terminal's background between the two. `pill` is the cells the pill
+/// covers, its rows past the first being the foot's, each a half padding row as drawn; a pill of
+/// one row has none.
+pub(crate) fn draw_pill_foot(frame: &mut Frame<'_>, pill: Rect, hovered: bool) {
+    let foot = Rect {
+        y: pill.y.saturating_add(1),
+        height: pill.height.saturating_sub(1),
+        ..pill
+    };
+    let (background, _) = pill_colors(hovered);
+    frame.render_widget(
+        ratatui::widgets::Block::new().style(Style::default().bg(background)),
+        foot,
+    );
 }
 
 /// The thumb of a scroll bar down `rows` rows that show part of a text, `above` of its rows out
@@ -2304,9 +2329,7 @@ pub(crate) fn draw_scroll_thumb(frame: &mut Frame<'_>, column: Rect, above: usiz
 /// Whether the cell at `column`, `row` is on `pill`, the back-to-bottom pill of the last frame:
 /// what a press there and the pointer over it both ask.
 pub(crate) fn is_on_pill(pill: Option<Rect>, column: u16, row: u16) -> bool {
-    pill.is_some_and(|pill| {
-        row == pill.y && column >= pill.x && column < pill.x.saturating_add(pill.width)
-    })
+    pill.is_some_and(|pill| pill.contains(Position::new(column, row)))
 }
 
 /// A question drawn where the composer was: who asks, what it asks, then the prompt line with
@@ -4944,6 +4967,64 @@ mod tests {
         assert!(!is_on_pill(Some(pill), pill.x.saturating_sub(1), 0));
         assert!(!is_on_pill(Some(pill), pill.x, 1));
         assert!(!is_on_pill(None, pill.x, 0));
+    }
+
+    /// Over a half padding row the pill's foot fills the upper half of the cells under it with
+    /// the pill's color, the block's gray staying in the lower: gray on gray, so the two are one
+    /// shape, and white on gray while the pill is lit. The pointer on the foot is on the pill,
+    /// and a pill of one row has no foot.
+    #[test]
+    fn the_pill_s_foot_joins_it_to_a_half_padding_row() {
+        let backend = ratatui::backend::TestBackend::new(60, 2);
+        let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
+        let mut drawn = |rows: u16, hovered: bool| -> (Rect, Buffer) {
+            let mut pill = Rect::default();
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    pill = draw_back_to_bottom(frame, Rect { height: 1, ..area }, 0, hovered);
+                    pill.height = rows;
+                    frame.render_widget(
+                        Paragraph::new(half_padding_row(PaddingSide::Above, 60)),
+                        Rect {
+                            y: 1,
+                            height: 1,
+                            ..area
+                        },
+                    );
+                    draw_pill_foot(frame, pill, hovered);
+                })
+                .expect("a frame");
+            (pill, terminal.backend().buffer().clone())
+        };
+        let colors = |buffer: &Buffer, x: u16| {
+            let cell = &buffer[(x, 1)];
+            (cell.symbol().to_string(), cell.fg, cell.bg)
+        };
+        let half = |upper: Color| (HALF_PADDING_ABOVE.to_string(), COMPOSER_BACKGROUND, upper);
+
+        let (pill, buffer) = drawn(2, false);
+        for x in pill.x..pill.x + pill.width {
+            assert_eq!(colors(&buffer, x), half(COMPOSER_BACKGROUND), "column {x}");
+        }
+        for x in [pill.x - 1, pill.x + pill.width] {
+            assert_eq!(colors(&buffer, x), half(Color::Reset), "column {x}");
+        }
+        assert!(is_on_pill(Some(pill), pill.x, 1));
+        assert!(!is_on_pill(Some(pill), pill.x - 1, 1));
+        assert!(!is_on_pill(Some(pill), pill.x, 2));
+
+        let (pill, buffer) = drawn(2, true);
+        for x in pill.x..pill.x + pill.width {
+            assert_eq!(colors(&buffer, x), half(draw::WHITE), "column {x}, lit");
+        }
+
+        let (pill, buffer) = drawn(1, true);
+        assert_eq!(
+            colors(&buffer, pill.x),
+            half(Color::Reset),
+            "a pill of one row leaves the row under it alone"
+        );
     }
 
     /// The working row names what the agent is doing, with the seconds and the stop key after

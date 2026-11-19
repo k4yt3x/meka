@@ -97,9 +97,9 @@ fn drive(install: &Install, inputs: &[&str]) -> Screens {
 /// What one driven session came to.
 struct Run {
     screens: Screens,
-    /// The color of each row's first cell as each of `screens` stood, which is where the
-    /// transcript's glyphs are: a row lit under the pointer has its glyph in white.
-    glyph_colors: Vec<Vec<vt100::Color>>,
+    /// The terminal as each of `screens` stood, for what a row's text does not say: the colors of
+    /// its cells.
+    terminals: Vec<vt100::Screen>,
     /// The status the child exited with on its own by the time the driver gave up on it, or
     /// `None` when it had to be killed.
     exit: Option<i32>,
@@ -300,7 +300,7 @@ impl PreparedExec {
 fn pump(master: RawFd, inputs: &[&str], kitty: bool, columns: u16) -> Run {
     let mut parser = vt100::Parser::new(screen_size(ROWS), screen_size(columns), 0);
     let mut screens = Vec::new();
-    let mut glyph_colors = Vec::new();
+    let mut terminals = Vec::new();
     let mut enhanced = false;
     let mut raw: Vec<u8> = Vec::new();
     let mut pending: Vec<&str> = inputs.to_vec();
@@ -365,7 +365,7 @@ fn pump(master: RawFd, inputs: &[&str], kitty: bool, columns: u16) -> Run {
             match pending.pop() {
                 Some(line) => {
                     screens.push(rows_of(&parser));
-                    glyph_colors.push(glyph_colors_of(&parser));
+                    terminals.push(parser.screen().clone());
                     let line = awaited(line).map_or(line, |(_, keys)| keys);
                     let (line, keys_only) = match line.strip_suffix(KEYS_ONLY) {
                         Some(keys) => (keys, true),
@@ -392,7 +392,7 @@ fn pump(master: RawFd, inputs: &[&str], kitty: bool, columns: u16) -> Run {
     }
     Run {
         screens,
-        glyph_colors,
+        terminals,
         exit: None,
         enhanced,
         clipboard: last_clipboard_write(&raw),
@@ -442,18 +442,6 @@ fn is_working_row(row: &str) -> bool {
             .chars()
             .next()
             .is_some_and(|glyph| "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(glyph))
-}
-
-/// The color of the first cell of every row.
-fn glyph_colors_of(parser: &vt100::Parser) -> Vec<vt100::Color> {
-    (0..ROWS)
-        .map(|row| {
-            parser
-                .screen()
-                .cell(row, 0)
-                .map_or(vt100::Color::Default, vt100::Cell::fgcolor)
-        })
-        .collect()
 }
 
 fn rows_of(parser: &vt100::Parser) -> Vec<String> {
@@ -1421,7 +1409,7 @@ fn a_block_s_light_goes_out_when_the_mouse_rests_or_the_focus_goes() {
   {"type":"message_end","stop_reason":"end_turn"}]
 ]"#;
     // The thinking row is the fifth of the screen: the prompt's three rows and a blank above it.
-    const THINKING_ROW: usize = 4;
+    const THINKING_ROW: u16 = 4;
     const LIT: vt100::Color = vt100::Color::Rgb(255, 255, 255);
     let onto_the_row = format!("\x1b[<35;10;{}M", THINKING_ROW + 1);
     let moved = format!("{onto_the_row}{KEYS_ONLY}");
@@ -1446,19 +1434,20 @@ fn a_block_s_light_goes_out_when_the_mouse_rests_or_the_focus_goes() {
     );
     for screen in [4, 5] {
         assert!(
-            run.screens[screen][THINKING_ROW].starts_with("• Thinking · Reading"),
+            run.screens[screen][usize::from(THINKING_ROW)].starts_with("• Thinking · Reading"),
             "the thinking row is where the pointer was sent: {:#?}",
             run.screens[screen]
         );
     }
-    assert_ne!(
-        run.glyph_colors[4][THINKING_ROW], LIT,
-        "a pointer at rest lights nothing"
-    );
-    assert_ne!(
-        run.glyph_colors[5][THINKING_ROW], LIT,
-        "nor does one the focus left with"
-    );
+    // The row's glyph is its first cell, white while the row is lit.
+    let glyph_color = |screen: usize| {
+        run.terminals[screen]
+            .cell(THINKING_ROW, 0)
+            .expect("a cell of the screen")
+            .fgcolor()
+    };
+    assert_ne!(glyph_color(4), LIT, "a pointer at rest lights nothing");
+    assert_ne!(glyph_color(5), LIT, "nor does one the focus left with");
     let last = |mode: &[u8]| {
         run.output
             .windows(mode.len())
@@ -4344,6 +4333,99 @@ fn scrolling_up_shows_the_pill_and_esc_returns_to_the_bottom() {
         rows.iter().any(|row| row == "  line 60"),
         "the end of the answer is back in view: {rows:#?}"
     );
+}
+
+/// At the default half padding the pill stands on the composer's block: the cells under it are
+/// the block's gray whole, where the rest of that row leaves its upper half to the terminal, and
+/// a click on them is a click on the pill. A whole padding row is the block's alone: the pill
+/// puts nothing on it, and a click there is the composer's.
+#[test]
+fn the_pill_stands_on_a_half_padding_row() {
+    const GRAY: vt100::Color = vt100::Color::Idx(234);
+    // The composer's top padding row, counted from 1 as a mouse report counts: the status row is
+    // the screen's last, and the bottom padding and the row of text stand over it.
+    const PADDING_ROW: u16 = ROWS - 3;
+    let long: String = (1..=60)
+        .map(|n| format!("line {n}\\n\\n"))
+        .collect::<String>();
+    let script = format!(
+        r#"[[{{"type":"text","text":"{long}"}},{{"type":"message_end","stop_reason":"end_turn"}}]]"#
+    );
+    let page_up = format!("\x1b[5~{KEYS_ONLY}");
+    // A press and its release on the padding row, at the middle of the screen, where the pill is.
+    let click = format!(
+        "\x1b[<0;{column};{PADDING_ROW}M\x1b[<0;{column};{PADDING_ROW}m{KEYS_ONLY}",
+        column = COLUMNS / 2
+    );
+    for (display, footed) in [("", true), ("prompt_padding = \"full\"", false)] {
+        let install = screen_install("read", display, "");
+        install.write_script(&script);
+        let run = drive_run(&install, &["hi", &page_up, &click, "/exit"], false);
+        let scrolled = &run.screens[2];
+        let pill_row = scrolled
+            .iter()
+            .position(|row| row.contains("↓ back to bottom"))
+            .unwrap_or_else(|| panic!("the pill is shown while scrolled up: {scrolled:#?}"));
+        assert_eq!(
+            pill_row + 2,
+            usize::from(PADDING_ROW),
+            "{display:?}: the padding row is the one under the pill: {scrolled:#?}"
+        );
+        // The pill is its words and a cell of its gray on each side of them.
+        let first = scrolled[pill_row]
+            .chars()
+            .position(|character| character == '↓')
+            .expect("the pill's arrow")
+            - 1;
+        let past = first + "↓ back to bottom".chars().count() + 2;
+        let cell = |column: usize| {
+            run.terminals[2]
+                .cell(
+                    PADDING_ROW - 1,
+                    u16::try_from(column).expect("a column of the screen"),
+                )
+                .expect("a cell of the screen")
+        };
+        let after_the_click = &run.screens[3];
+        let pill_stands = after_the_click
+            .iter()
+            .any(|row| row.contains("↓ back to bottom"));
+        if footed {
+            assert_eq!(
+                scrolled[pill_row + 1],
+                half_row_above(),
+                "the padding row is half a row of the block: {scrolled:#?}"
+            );
+            for column in first..past {
+                assert_eq!(
+                    (cell(column).fgcolor(), cell(column).bgcolor()),
+                    (GRAY, GRAY),
+                    "column {column}, under the pill, is the block's gray whole"
+                );
+            }
+            for column in [first - 1, past] {
+                assert_eq!(
+                    (cell(column).fgcolor(), cell(column).bgcolor()),
+                    (GRAY, vt100::Color::Default),
+                    "column {column}, beside the pill, leaves its upper half to the terminal"
+                );
+            }
+            assert!(
+                !pill_stands && after_the_click.iter().any(|row| row == "  line 60"),
+                "a click under the pill's words went back to the bottom: {after_the_click:#?}"
+            );
+        } else {
+            assert_eq!(
+                scrolled[pill_row + 1],
+                "▎",
+                "a whole padding row carries nothing of the pill: {scrolled:#?}"
+            );
+            assert!(
+                pill_stands,
+                "a click on a whole padding row is the composer's: {after_the_click:#?}"
+            );
+        }
+    }
 }
 
 /// A resumed session opens on the end of its log and reads the rest as the view scrolls up: the
