@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.96.2] - 2026-11-22
+
+### Security
+
+- RUSTSEC-2026-0592: stack overflow on deeply nested `blob:` URLs (`url` 2.5.9).
+
 ## [0.96.1] - 2026-11-19
 
 ### Fixed
@@ -216,7 +222,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- RUSTSEC-2026-0459 (CVE-2026-119375): the bundled SQLite is 3.54.1.
+- RUSTSEC-2026-0459 (CVE-2026-119375): memory disclosure via a crafted `-wal` file (SQLite 3.54.1).
 
 ## [0.91.0] - 2026-11-08
 
@@ -349,7 +355,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- RUSTSEC-2026-0433: `pulldown-cmark` moves to 0.13.6.
+- RUSTSEC-2026-0433: quadratic parsing of nested image wikilinks (`pulldown-cmark` 0.13.6).
 
 ## [0.87.0] - 2026-10-31
 
@@ -435,7 +441,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- RUSTSEC-2026-0414: `pulldown-cmark` moves to 0.13.5.
+- RUSTSEC-2026-0414: exponential output growth on empty-text wikilinks (`pulldown-cmark` 0.13.5).
 
 ## [0.85.0] - 2026-10-28
 
@@ -542,7 +548,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- RUSTSEC-2026-0385 and 0386: `ctutils` moves to 0.4.5 and `tokio` to 1.54.1.
+- RUSTSEC-2026-0385: non-constant-time mask generation and `u128` comparisons (`ctutils` 0.4.5).
+- RUSTSEC-2026-0386: I/O safety violation in `AsyncFd` constructors (`tokio` 1.54.1).
 
 ## [0.83.0] - 2026-10-21
 
@@ -569,7 +576,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- RUSTSEC-2026-0382 and 0383: `rustls-webpki` moves to 0.103.16 and `webpki-root-certs` to 1.0.10.
+- RUSTSEC-2026-0382: trust in distrusted emSign intermediates (`rustls-webpki` 0.103.16).
+- RUSTSEC-2026-0383: an emSign root allowing distrusted intermediates (`webpki-root-certs` 1.0.10).
 
 ## [0.82.0] - 2026-10-19
 
@@ -579,7 +587,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- RUSTSEC-2026-0367 through 0369: the build no longer pulls in `zip` 8.x.
+- RUSTSEC-2026-0367 through 0369: unsafe permissions and symlinks on extraction (`zip` removed).
 
 ## [0.81.0] - 2026-10-18
 
@@ -729,7 +737,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- RUSTSEC-2026-0346 through 0349: `rustls` moves to 0.23.46, past four TLS advisories.
+- RUSTSEC-2026-0346 through 0349: four TLS flaws, including a downgrade attack (`rustls` 0.23.46).
 
 ## [0.75.0] - 2026-10-14
 
@@ -2028,7 +2036,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Streamed model output, MCP text and prompts drop escapes, bidi overrides and carriage returns.
 - Skill writes refuse a symlinked path instead of writing outside the store.
 - `event-listener` and `memmap2` move to patched releases, and the audit ignore list is gone.
-- RUSTSEC-2026-0258: `h2` moves to 0.4.19, past an unbounded empty-DATA-frame denial of service.
+- RUSTSEC-2026-0258: unbounded queueing of empty HTTP/2 DATA frames (`h2` 0.4.19).
 - **Known limitation:** a Windows `workspace` command can read meka's memory, credentials included.
 
 ## [0.41.0] - 2026-08-13
@@ -3412,7 +3420,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.96.1...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.96.2...HEAD
+[0.96.2]: https://github.com/k4yt3x/meka/compare/0.96.1...0.96.2
 [0.96.1]: https://github.com/k4yt3x/meka/compare/0.96.0...0.96.1
 [0.96.0]: https://github.com/k4yt3x/meka/compare/0.95.0...0.96.0
 [0.95.0]: https://github.com/k4yt3x/meka/compare/0.94.0...0.95.0
